@@ -50,15 +50,21 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
 
 - **Genres** tab: clicking a genre plays only that genre. Tick several genres and
   use "Play selected (n)". **All** plays the whole library.
-  Only the 192 ID3v1 genres are listed, named as in Wikipedia's
+  Only genres from Wikipedia's
   [List of ID3v1 genres](https://en.wikipedia.org/wiki/List_of_ID3v1_genres)
-  (matched without regard to case or punctuation, with a few aliases such as
-  "DnB" for "Drum & bass"). A few common subgenres go to their parent, e.g.
-  "Deep House" to "House" (see `crates/core/src/genre.rs`). Tracks with no known
-  genre in the tag or in the top folder name, or tagged "Other", are under
-  **Unknown**.
-  Right-click (or ⋯) on a genre: "Merge into…" picks another known genre from a
-  filterable list.
+  are listed, with its names: the list has 192 codes (0–191), and 190 of them
+  count as genres ("Other", code 12, and code 133, an offensive term, do not).
+  Names are matched without regard to case or punctuation, with a few aliases
+  such as "DnB" for "Drum & bass", and ID3 codes such as "(31)" or "(17)Rock"
+  are read as their names. A few common subgenres go to their parent, e.g.
+  "Deep House" to "House" (see `crates/core/src/genre.rs`). Tag values are split
+  at `;`, `/` and ` | `, so "Rap/Hip-Hop" counts as Rap and Hip-hop.
+  A track whose tag has no known genre (no genre, "Other", or only unknown
+  names) takes the genre its top folder is named after, if that is a known
+  genre (e.g. `DnB/…` gives Drum & bass); otherwise it is under **Unknown**.
+  Right-click (or ⋯) on a genre: "Merge into…" lists the genres that have
+  tracks; typing in its search field also finds the other known genres.
+  Merging a genre also moves the subgenres filed under it.
 - **Artists** tab: search for an artist, click it to list the albums, click an
   album to play it in order.
 - Window controls: ⏯ pause, ⏭ next, 🚫 "never play this track again" (asks for
