@@ -12,9 +12,10 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use smp_core::catalog::Catalog;
-use smp_core::scan::scan;
+use smp_core::scan::{scan, scan_with, ScanOptions};
 use smp_core::source::smb::{SmbConfig, SmbSource};
 use smp_core::source::{FileEntry, MusicSource, SourceError};
 use smp_core::Error;
@@ -144,9 +145,14 @@ fn live_wrong_password_is_auth_error() {
 fn live_scan_reads_tags_sample() {
     for cfg in servers() {
         let src = connect(&cfg);
-        // Scan the folder two levels above a sample file (enough to pass 200
-        // files) so the test does not walk the whole collection.
-        let first = sample_file(&src, 1);
+        // Scan the folder two levels above a file at least three levels deep
+        // (enough to pass 200 files) so the test does not walk the whole
+        // collection. The walk is concurrent, so shallow files come first.
+        let first = src
+            .walk_limited(1, &mut |e| e.rel_path.matches('/').count() >= 2)
+            .expect("walk failed")
+            .pop()
+            .expect("no audio file three levels deep");
         let parent = |p: &str| {
             p.rsplit_once('/')
                 .map_or(String::new(), |(d, _)| d.to_string())
@@ -217,4 +223,67 @@ fn live_sample_paths_exist_on_both_servers() {
         secondary.host
     );
     assert!(missing.is_empty(), "missing on secondary: {missing:?}");
+}
+
+/// The first ~500 files of the primary share, served by a real SMB source but
+/// listed from a fixed sample so the test never walks the whole collection.
+struct Sample<'a> {
+    src: &'a SmbSource,
+    files: Vec<FileEntry>,
+}
+
+impl MusicSource for Sample<'_> {
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
+        self.files.iter().cloned().for_each(on_entry);
+        Ok(())
+    }
+    fn open(&self, rel_path: &str) -> Result<Box<dyn smp_core::source::ReadSeek>, SourceError> {
+        self.src.open(rel_path)
+    }
+    fn describe(&self) -> String {
+        self.src.describe()
+    }
+}
+
+/// Times a first scan of ~500 files with one worker and with eight; the
+/// parallel scan must not be slower. Prints only durations and counts.
+#[test]
+#[ignore]
+fn live_scan_timing() {
+    let cfg = &servers()[0];
+    let src = connect(cfg);
+    let started = Instant::now();
+    let files = src.walk_limited(500, &mut |_| true).unwrap();
+    println!(
+        "{}: listed {} files in {:?} (concurrent walk)",
+        cfg.host,
+        files.len(),
+        started.elapsed()
+    );
+    let sample = Sample { src: &src, files };
+    let time = |workers: usize| -> Duration {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let started = Instant::now();
+        let report = scan_with(
+            &sample,
+            &mut cat,
+            &mut |_| {},
+            &AtomicBool::new(false),
+            &ScanOptions { workers },
+        )
+        .unwrap();
+        let took = started.elapsed();
+        println!("{}: workers={workers}: {took:?}, {report:?}", cfg.host);
+        assert_eq!(report.read, sample.files.len());
+        took
+    };
+    // Parallel first, so any server-side caching favours the sequential run.
+    let parallel = time(8);
+    let sequential = time(1);
+    println!(
+        "{}: speed-up {:.1}x",
+        cfg.host,
+        sequential.as_secs_f64() / parallel.as_secs_f64()
+    );
+    assert!(parallel <= sequential, "{parallel:?} > {sequential:?}");
 }

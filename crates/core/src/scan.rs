@@ -1,6 +1,7 @@
 //! Incremental scanner: walks a source and keeps the catalog in sync.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, TrackMeta};
@@ -56,17 +57,42 @@ fn is_network_io(e: &std::io::Error) -> bool {
     )
 }
 
-/// Syncs `catalog` with `source`: unchanged files are only marked seen, new or
-/// modified ones are tagged and upserted, vanished ones are removed. A file whose
-/// tags cannot be read stays in the catalog with empty metadata and counts as failed;
-/// if opening or reading it failed because of a network problem, it is stored with
-/// size/mtime 0 so the next scan retries it.
-/// On cancel the walk stops and nothing is removed (`finish_scan` is skipped).
+/// How [`scan_with`] runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanOptions {
+    /// Threads opening and tagging new or modified files at once (at least 1).
+    pub workers: usize,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self { workers: 8 }
+    }
+}
+
+/// [`scan_with`] using [`ScanOptions::default`].
 pub fn scan(
     source: &dyn MusicSource,
     catalog: &mut Catalog,
     progress: &mut dyn FnMut(&ScanProgress),
     cancel: &AtomicBool,
+) -> Result<ScanReport> {
+    scan_with(source, catalog, progress, cancel, &ScanOptions::default())
+}
+
+/// Syncs `catalog` with `source`: unchanged files are only marked seen, new or
+/// modified ones are tagged and upserted, vanished ones are removed. A file whose
+/// tags cannot be read stays in the catalog with empty metadata and counts as failed;
+/// if opening or reading it failed because of a network problem, it is stored with
+/// size/mtime 0 so the next scan retries it.
+/// Tagging runs on `opts.workers` threads; only the calling thread writes to the catalog.
+/// On cancel the walk stops and nothing is removed (`finish_scan` is skipped).
+pub fn scan_with(
+    source: &dyn MusicSource,
+    catalog: &mut Catalog,
+    progress: &mut dyn FnMut(&ScanProgress),
+    cancel: &AtomicBool,
+    opts: &ScanOptions,
 ) -> Result<ScanReport> {
     catalog.begin_scan()?;
 
@@ -87,6 +113,8 @@ pub fn scan(
         last: None,
     };
 
+    // Unchanged files only need marking; the rest go to the workers.
+    let mut to_read = Vec::new();
     'chunks: for chunk in entries.chunks(CHUNK) {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -96,42 +124,42 @@ pub fn scan(
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                rep.state.seen += 1;
-                rep.state.current.clone_from(&e.rel_path);
                 if c.file_unchanged(&e.rel_path, e.size, e.mtime)? {
                     c.mark_seen(&e.rel_path)?;
                     report.unchanged += 1;
+                    rep.state.seen += 1;
+                    rep.state.current.clone_from(&e.rel_path);
+                    rep.tick();
                 } else {
-                    let ext = e.rel_path.rsplit_once('.').map_or("", |(_, x)| x);
-                    let (meta, size, mtime) = match source.open(&e.rel_path) {
-                        Ok(mut r) => match read_meta(&mut *r, ext) {
-                            Ok(meta) => (Some(meta), e.size, e.mtime),
-                            // Connection trouble while reading: retry next scan.
-                            Err(Error::Io(io)) if is_network_io(&io) => (None, 0, 0),
-                            Err(_) => (None, e.size, e.mtime),
-                        },
-                        // Network trouble: store size/mtime 0 so the next scan retries it.
-                        Err(
-                            SourceError::Unreachable | SourceError::Timeout | SourceError::Io(_),
-                        ) => (None, 0, 0),
-                        Err(_) => (None, e.size, e.mtime),
-                    };
-                    let meta = meta.unwrap_or_else(|| {
-                        report.failed += 1;
-                        rep.state.failed += 1;
-                        TrackMeta::default()
-                    });
-                    c.upsert_track(&e.rel_path, size, mtime, &meta)?;
-                    report.read += 1;
-                    rep.state.read += 1;
+                    to_read.push(e);
                 }
-                rep.tick();
             }
             Ok(())
         })?;
         if cancel.load(Ordering::Relaxed) {
             break 'chunks;
         }
+    }
+
+    if !cancel.load(Ordering::Relaxed) {
+        read_parallel(
+            source,
+            catalog,
+            &to_read,
+            opts.workers,
+            cancel,
+            |e, failed| {
+                report.read += 1;
+                rep.state.read += 1;
+                if failed {
+                    report.failed += 1;
+                    rep.state.failed += 1;
+                }
+                rep.state.seen += 1;
+                rep.state.current.clone_from(&e.rel_path);
+                rep.tick();
+            },
+        )?;
     }
 
     if cancel.load(Ordering::Relaxed) {
@@ -144,12 +172,103 @@ pub fn scan(
     Ok(report)
 }
 
+/// Outcome of opening and tagging one file: `None` meta means it failed.
+struct ReadResult {
+    index: usize,
+    meta: Option<TrackMeta>,
+    size: u64,
+    mtime: i64,
+}
+
+/// Opens and tags `entry`, classifying failures (see [`scan_with`]).
+fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult {
+    let ext = e.rel_path.rsplit_once('.').map_or("", |(_, x)| x);
+    let (meta, size, mtime) = match source.open(&e.rel_path) {
+        Ok(mut r) => match read_meta(&mut *r, ext) {
+            Ok(meta) => (Some(meta), e.size, e.mtime),
+            // Connection trouble while reading: retry next scan.
+            Err(Error::Io(io)) if is_network_io(&io) => (None, 0, 0),
+            Err(_) => (None, e.size, e.mtime),
+        },
+        // Network trouble: store size/mtime 0 so the next scan retries it.
+        Err(SourceError::Unreachable | SourceError::Timeout | SourceError::Io(_)) => (None, 0, 0),
+        Err(_) => (None, e.size, e.mtime),
+    };
+    ReadResult {
+        index,
+        meta,
+        size,
+        mtime,
+    }
+}
+
+/// Tags `files` on `workers` threads and upserts the results from the calling
+/// thread in transactions of [`CHUNK`]. `on_written(entry, failed)` runs after
+/// each upsert. Stops early (keeping what was written) when `cancel` is set.
+fn read_parallel(
+    source: &dyn MusicSource,
+    catalog: &mut Catalog,
+    files: &[&FileEntry],
+    workers: usize,
+    cancel: &AtomicBool,
+    mut on_written: impl FnMut(&FileEntry, bool),
+) -> Result<()> {
+    let next = AtomicUsize::new(0);
+    // Set when the writer gives up, so workers stop picking new files.
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<ReadResult>();
+    std::thread::scope(|s| {
+        for _ in 0..workers.max(1).min(files.len()) {
+            let (tx, next, stop) = (tx.clone(), &next, &stop);
+            s.spawn(move || {
+                while !cancel.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(e) = files.get(i) else { break };
+                    if tx.send(read_one(source, i, e)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let result = (|| {
+            let mut finished = false;
+            while !finished && !cancel.load(Ordering::Relaxed) {
+                catalog.transaction(|c| {
+                    for _ in 0..CHUNK {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let Ok(r) = rx.recv() else {
+                            finished = true;
+                            break;
+                        };
+                        let e = files[r.index];
+                        let failed = r.meta.is_none();
+                        let meta = r.meta.unwrap_or_default();
+                        c.upsert_track(&e.rel_path, r.size, r.mtime, &meta)?;
+                        on_written(e, failed);
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })();
+        // Let workers finish the file in hand and exit.
+        stop.store(true, Ordering::Relaxed);
+        drop(rx);
+        result
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::source::{LocalSource, ReadSeek};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicI64;
     use std::time::SystemTime;
 
     fn fixtures() -> PathBuf {
@@ -345,6 +464,181 @@ mod tests {
         }
         let second = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((second.read, second.unchanged), (6, 2));
+    }
+
+    /// Tempdir with `copies` copies of the four fixtures spread over nested folders.
+    fn nested_music_dir(copies: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..copies {
+            let sub = dir.path().join(format!("g{}/album{i}", i % 5));
+            fs::create_dir_all(&sub).unwrap();
+            for name in ["tone.mp3", "tone.flac", "tone.ogg", "broken.mp3"] {
+                fs::copy(fixtures().join(name), sub.join(name)).unwrap();
+            }
+        }
+        dir
+    }
+
+    fn scan_workers(src: &dyn MusicSource, cat: &mut Catalog, workers: usize) -> ScanReport {
+        let opts = ScanOptions { workers };
+        scan_with(src, cat, &mut |_| {}, &AtomicBool::new(false), &opts).unwrap()
+    }
+
+    /// Track rows keyed by path, without the insertion-order-dependent id.
+    fn rows_by_path(cat: &Catalog) -> std::collections::BTreeMap<String, (TrackMeta, Option<f32>)> {
+        cat.playable_tracks(&[])
+            .unwrap()
+            .into_iter()
+            .map(|id| {
+                let r = cat.track(id).unwrap();
+                (r.rel_path, (r.meta, r.measured_lufs))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_options_use_eight_workers() {
+        assert_eq!(ScanOptions::default().workers, 8);
+    }
+
+    #[test]
+    fn parallel_scan_matches_sequential() {
+        let dir = nested_music_dir(60);
+        let src = LocalSource::new(dir.path());
+        let (mut a, mut b) = (
+            Catalog::open_in_memory().unwrap(),
+            Catalog::open_in_memory().unwrap(),
+        );
+        let ra = scan_workers(&src, &mut a, 1);
+        let rb = scan_workers(&src, &mut b, 8);
+        assert_eq!(ra, rb);
+        assert_eq!((ra.total, ra.read, ra.failed), (240, 240, 60));
+        assert_eq!(rows_by_path(&a), rows_by_path(&b));
+        assert_eq!(rows_by_path(&a).len(), 240);
+        let mut entries = Vec::new();
+        src.walk(&mut |e| entries.push(e)).unwrap();
+        for e in &entries {
+            assert!(
+                a.file_unchanged(&e.rel_path, e.size, e.mtime).unwrap(),
+                "{}",
+                e.rel_path
+            );
+            assert!(
+                b.file_unchanged(&e.rel_path, e.size, e.mtime).unwrap(),
+                "{}",
+                e.rel_path
+            );
+        }
+        assert_eq!(a.genres().unwrap(), b.genres().unwrap());
+        assert!(!a.genres().unwrap().is_empty());
+    }
+
+    /// Source of `files` fixture-tone MP3s; `open` sleeps `delay` and records
+    /// the peak number of concurrent opens. Only the first `visible` files are
+    /// listed, all with modification time `mtime`.
+    struct SlowSource {
+        files: usize,
+        visible: AtomicUsize,
+        mtime: AtomicI64,
+        delay: Duration,
+        bytes: Vec<u8>,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl SlowSource {
+        fn new(files: usize, delay: Duration) -> Self {
+            Self {
+                files,
+                visible: AtomicUsize::new(files),
+                mtime: AtomicI64::new(1_700_000_000),
+                delay,
+                bytes: fs::read(fixtures().join("tone.mp3")).unwrap(),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl MusicSource for SlowSource {
+        fn walk(
+            &self,
+            on_entry: &mut dyn FnMut(FileEntry),
+        ) -> std::result::Result<(), SourceError> {
+            let n = self.visible.load(Ordering::SeqCst).min(self.files);
+            for i in 0..n {
+                on_entry(FileEntry {
+                    rel_path: format!("d{}/f{i}.mp3", i % 4),
+                    size: self.bytes.len() as u64,
+                    mtime: self.mtime.load(Ordering::SeqCst),
+                });
+            }
+            Ok(())
+        }
+        fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+        }
+        fn describe(&self) -> String {
+            "slow".into()
+        }
+    }
+
+    #[test]
+    fn parallel_scan_uses_multiple_workers() {
+        let src = SlowSource::new(40, Duration::from_millis(50));
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let started = Instant::now();
+        let r = scan_workers(&src, &mut cat, 8);
+        let elapsed = started.elapsed();
+        assert_eq!((r.read, r.failed), (40, 0));
+        let peak = src.peak.load(Ordering::SeqCst);
+        assert!(peak >= 4, "peak concurrency {peak}");
+        assert!(
+            elapsed < Duration::from_millis(40 * 50 / 3),
+            "took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn single_worker_opens_one_at_a_time() {
+        let src = SlowSource::new(10, Duration::from_millis(5));
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let r = scan_workers(&src, &mut cat, 1);
+        assert_eq!(r.read, 10);
+        assert_eq!(src.peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancel_mid_scan_keeps_catalog() {
+        let src = SlowSource::new(40, Duration::from_millis(20));
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let no = AtomicBool::new(false);
+        let full = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
+        assert_eq!(full.read, 40);
+
+        // Rescan where every listed file changed and ten files vanished; cancel
+        // from the first progress report.
+        src.mtime.store(1_800_000_000, Ordering::SeqCst);
+        src.visible.store(30, Ordering::SeqCst);
+        let cancel = AtomicBool::new(false);
+        let r = scan(
+            &src,
+            &mut cat,
+            &mut |p| {
+                if p.seen > 0 {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            },
+            &cancel,
+        )
+        .unwrap();
+        assert!(r.read < 30, "{r:?}");
+        assert_eq!(r.removed, 0);
+        assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 40);
     }
 
     #[test]

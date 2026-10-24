@@ -43,6 +43,13 @@ Ostalo:
   nestala, I/O greška) se preskače uz log. Prekid veze ili timeout prekida cijeli
   obilazak greškom, inače bi skener obrisao pjesme iz neobiđenih mapa. Greška je
   i kad se ne može izlistati korijen.
+- Obilazak izlistava do 8 mapa istodobno na istoj vezi (svaka na svojoj
+  dretvi), pa redoslijed pronađenih datoteka nije određen. Pravila za greške
+  iznad vrijede jednako.
+- Skener (`scan`) otvara i čita tagove novih/promijenjenih datoteka u 8
+  paralelnih dretvi (`ScanOptions { workers }`); u katalog piše samo pozivajuća
+  dretva, u transakcijama po 500. Mjereno na `10.111.100.2`, prvo skeniranje
+  500 datoteka: 30,5 s s jednom dretvom, 12,7 s s osam (2,4×).
 
 Live testovi (samo čitanje, ništa se ne piše na servere):
 
