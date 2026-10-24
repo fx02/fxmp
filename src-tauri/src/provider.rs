@@ -285,13 +285,13 @@ mod tests {
         let (fx, _) = Fx::with_genres();
         let mut p = fx.shuffle(&["jazz".to_string()]);
         let item = p.next_track().unwrap();
-        p.on_failed(item.id, &Failure::new(FailCode::Timeout, "timed out"));
+        p.on_failed(item.id, &Failure::new(FailCode::NotFound, "not found"));
         fx.flush();
         let u = fx.query.unreadable().unwrap();
         assert_eq!(u.len(), 1);
         assert_eq!(u[0].id, item.id);
-        assert_eq!(u[0].code.as_deref(), Some("timeout"));
-        assert_eq!(u[0].message.as_deref(), Some("timed out"));
+        assert_eq!(u[0].code.as_deref(), Some("not_found"));
+        assert_eq!(u[0].message.as_deref(), Some("not found"));
         assert_eq!(u[0].server, Some(Which::Secondary));
     }
 

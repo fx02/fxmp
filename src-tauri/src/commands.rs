@@ -89,8 +89,10 @@ pub struct Album {
 #[derive(Debug, Clone, Serialize)]
 pub struct UnreadableRow {
     pub id: TrackId,
-    /// `smb://host/share/path/to/file.mp3`, without username or password.
+    /// `smb://host/share/path/to/file.mp3` as read (not encoded), for the eye.
     pub path: String,
+    /// The same as a valid, percent-encoded URL, for "Copy path".
+    pub url: String,
     /// Failure code (`not_found`, `timeout`, …); none if not recorded.
     pub code: Option<String>,
     pub message: Option<String>,
@@ -101,21 +103,47 @@ pub struct UnreadableRow {
     pub excluded: bool,
 }
 
+/// Where a track lives, as a readable path and as a URL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileLocation {
+    pub path: String,
+    pub url: String,
+}
+
+/// Percent-encodes a URL path segment: everything but RFC 3986 `pchar`s
+/// (unreserved, sub-delims, `:` and `@`) as UTF-8 bytes.
+fn encode_segment(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    for b in seg.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Where a track lives: `smb://host/share/root/rel_path` on the server the failure
 /// came from (the configured primary when unknown or no backup is set up). Never
-/// holds a username or password.
-pub fn file_url(settings: &Settings, server: Option<Which>, rel_path: &str) -> String {
+/// holds a username or password, even one typed into the server field.
+pub fn file_location(settings: &Settings, server: Option<Which>, rel_path: &str) -> FileLocation {
     let cfg = match (server, &settings.secondary) {
         (Some(Which::Secondary), Some(secondary)) => secondary,
         _ => &settings.primary,
     };
-    let path = [cfg.host.trim(), cfg.share.trim(), cfg.root.trim(), rel_path]
+    let host = cfg.host.trim();
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+    let segments: Vec<&str> = [cfg.share.trim(), cfg.root.trim(), rel_path]
         .iter()
         .flat_map(|part| part.split('/'))
         .filter(|seg| !seg.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    format!("smb://{path}")
+        .collect();
+    let encoded: Vec<String> = segments.iter().map(|s| encode_segment(s)).collect();
+    FileLocation {
+        path: format!("smb://{host}/{}", segments.join("/")),
+        url: format!("smb://{host}/{}", encoded.join("/")),
+    }
 }
 
 /// Resets the settings (see [`Settings::reset`]) and saves them at once; with
@@ -513,9 +541,14 @@ pub async fn list_unreadable(app: AppHandle) -> CmdResult<Vec<UnreadableRow>> {
         let settings = st.settings.get();
         Ok(rows
             .into_iter()
-            .map(|t| UnreadableRow {
+            .map(|t| {
+                let loc = file_location(&settings, t.server, &t.rel_path);
+                (t, loc)
+            })
+            .map(|(t, loc)| UnreadableRow {
                 id: t.id,
-                path: file_url(&settings, t.server, &t.rel_path),
+                path: loc.path,
+                url: loc.url,
                 code: t.code,
                 message: t.message,
                 fail_count: t.fail_count,
@@ -624,30 +657,57 @@ mod tests {
     }
 
     #[test]
-    fn file_url_uses_the_failing_server_and_no_credentials() {
+    fn file_location_uses_the_failing_server_and_no_credentials() {
         let s = two_servers();
+        let loc = |s: &Settings, w, p| file_location(s, w, p);
         assert_eq!(
-            file_url(&s, None, "Rock/A b.mp3"),
+            loc(&s, None, "Rock/A b.mp3").path,
             "smb://10.111.100.2/F/MP3/Rock/A b.mp3"
         );
         assert_eq!(
-            file_url(&s, Some(Which::Primary), "x.mp3"),
+            loc(&s, Some(Which::Primary), "x.mp3").url,
             "smb://10.111.100.2/F/MP3/x.mp3"
         );
         assert_eq!(
-            file_url(&s, Some(Which::Secondary), "x.mp3"),
+            loc(&s, Some(Which::Secondary), "x.mp3").url,
             "smb://10.111.0.2/F/x.mp3"
         );
         let one = Settings {
             secondary: None,
-            ..s
+            ..s.clone()
         };
         assert_eq!(
-            file_url(&one, Some(Which::Secondary), "x.mp3"),
+            loc(&one, Some(Which::Secondary), "x.mp3").url,
             "smb://10.111.100.2/F/MP3/x.mp3",
             "falls back to the primary"
         );
-        assert!(!file_url(&one, None, "x.mp3").contains("music"));
+        let both = loc(&one, None, "x.mp3");
+        assert!(!both.url.contains("music") && !both.path.contains("music"));
+        // A username typed into the server field is left out too.
+        let typed = Settings {
+            primary: ServerConfig {
+                host: "music:pw@10.0.0.1".into(),
+                ..s.primary.clone()
+            },
+            ..s
+        };
+        let l = loc(&typed, None, "x.mp3");
+        assert_eq!(l.url, "smb://10.0.0.1/F/MP3/x.mp3");
+        assert_eq!(l.path, "smb://10.0.0.1/F/MP3/x.mp3");
+    }
+
+    #[test]
+    fn file_url_is_percent_encoded_and_the_path_readable() {
+        let s = two_servers();
+        let l = file_location(&s, None, "Rock & Roll/A b#1 100%?ž.mp3");
+        assert_eq!(
+            l.url,
+            "smb://10.111.100.2/F/MP3/Rock%20&%20Roll/A%20b%231%20100%25%3F%C5%BE.mp3"
+        );
+        assert_eq!(
+            l.path,
+            "smb://10.111.100.2/F/MP3/Rock & Roll/A b#1 100%?ž.mp3"
+        );
     }
 
     #[test]

@@ -151,5 +151,6 @@
   "err.keychain": "Cannot save the password in the keychain: {error}",
   "err.keychain_delete": "Cannot delete the password from the keychain: {error}",
   "err.clear_busy": "The scan did not stop, so the library was not cleared. Try again.",
+  "err.clearing": "The library is being cleared.",
   "err.language": "Unknown language: {code}"
 }

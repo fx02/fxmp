@@ -79,12 +79,13 @@ test("unreadable: reasons, tab label and the copy-all text", () => {
   assert.equal(unreadableTabLabel(1234, en), `Unreadable (1${NB}234)`);
   assert.equal(unreadableTabLabel(3, hr), "Nečitljivo (3)");
   const rows = [
-    { path: "smb://h/F/MP3/a b.mp3", code: "not_found", message: "source error: not found" },
-    { path: "smb://h/F/MP3/c.flac", code: null, message: null },
+    { path: "smb://h/F/MP3/a b.mp3", url: "smb://h/F/MP3/a%20b.mp3", code: "not_found", message: "source error: not found" },
+    { path: "smb://h/F/MP3/c.flac", url: "smb://h/F/MP3/c.flac", code: null, message: null },
   ];
+  // The valid URL is copied, not the readable path.
   assert.equal(
     copyAllText(rows, en),
-    "smb://h/F/MP3/a b.mp3\tFile not found (source error: not found)\nsmb://h/F/MP3/c.flac\tUnknown reason",
+    "smb://h/F/MP3/a%20b.mp3\tFile not found (source error: not found)\nsmb://h/F/MP3/c.flac\tUnknown reason",
   );
   assert.equal(copyAllText([], en), "");
 });

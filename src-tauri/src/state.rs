@@ -108,6 +108,8 @@ pub struct AppState {
     wake_monitor: Mutex<Sender<()>>,
     pub now_playing: Mutex<Option<NowPlaying>>,
     scanning: AtomicBool,
+    /// "Clear library" holds the scan slot: shown as such, not as a scan.
+    clearing: AtomicBool,
     cancel_scan: Arc<AtomicBool>,
     cancel_reason: Mutex<Option<String>>,
     scan_progress: Mutex<Option<ScanProgressPayload>>,
@@ -173,6 +175,7 @@ impl AppState {
             wake_monitor: Mutex::new(wake_tx),
             now_playing: Mutex::new(None),
             scanning: AtomicBool::new(false),
+            clearing: AtomicBool::new(false),
             cancel_scan: Arc::new(AtomicBool::new(false)),
             cancel_reason: Mutex::new(None),
             scan_progress: Mutex::new(None),
@@ -279,7 +282,8 @@ impl AppState {
     }
 
     pub fn scan_status(&self) -> ScanStatus {
-        let scanning = self.scanning.load(Ordering::SeqCst);
+        let scanning =
+            self.scanning.load(Ordering::SeqCst) && !self.clearing.load(Ordering::SeqCst);
         ScanStatus {
             scanning,
             progress: lock(&self.scan_progress).clone().filter(|_| scanning),
@@ -407,8 +411,15 @@ pub fn start_scan(app: &AppHandle) -> Result<(), String> {
     if st.source.servers().is_none() {
         return Err(i18n::t("err.save_first"));
     }
+    if st.clearing.load(Ordering::SeqCst) {
+        return Err(i18n::t("err.clearing"));
+    }
     if st.scanning.swap(true, Ordering::SeqCst) {
-        return Err(i18n::t("err.scan_running"));
+        return Err(if st.clearing.load(Ordering::SeqCst) {
+            i18n::t("err.clearing")
+        } else {
+            i18n::t("err.scan_running")
+        });
     }
     st.cancel_scan.store(false, Ordering::SeqCst);
     *lock(&st.cancel_reason) = None;
@@ -514,7 +525,29 @@ fn run_scan(app: &AppHandle) {
     st.unreadable_changed();
 }
 
-/// Clears the scan flag when dropped (also on an early return).
+/// Takes the scan slot (`scanning`) for the caller, calling `cancel` while a scan
+/// still holds it; `None` if it is not free within `wait`. No scan can start while
+/// the returned slot is held.
+fn take_scan_slot<'a>(
+    scanning: &'a AtomicBool,
+    cancel: impl Fn(),
+    wait: Duration,
+) -> Option<ScanSlot<'a>> {
+    let deadline = Instant::now() + wait;
+    while scanning
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        cancel();
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(ScanSlot(scanning))
+}
+
+/// Clears the flag when dropped (also on an early return).
 struct ScanSlot<'a>(&'a AtomicBool);
 
 impl Drop for ScanSlot<'_> {
@@ -529,19 +562,17 @@ impl Drop for ScanSlot<'_> {
 /// only the last genre selection is forgotten.
 pub fn clear_library(app: &AppHandle) -> Result<(), String> {
     let st = app.state::<AppState>();
-    let deadline = Instant::now() + CLEAR_SCAN_WAIT;
-    while st
-        .scanning
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        cancel_scan(&st, Some(&i18n::t("scan.cancelled_clear")));
-        if Instant::now() >= deadline {
-            return Err(i18n::t("err.clear_busy"));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _slot = ScanSlot(&st.scanning);
+    st.clearing.store(true, Ordering::SeqCst);
+    let _clearing = ScanSlot(&st.clearing);
+    let reason = i18n::t("scan.cancelled_clear");
+    let _slot = take_scan_slot(
+        &st.scanning,
+        || {
+            cancel_scan(&st, Some(&reason));
+        },
+        CLEAR_SCAN_WAIT,
+    )
+    .ok_or_else(|| i18n::t("err.clear_busy"))?;
     st.player.send(Command::Stop);
     let cleared = st.writer.call(|c| c.clear());
     lock(&st.banned).clear();
@@ -585,6 +616,85 @@ mod tests {
         assert_eq!(np.genre_display, "Chillout, Trance");
         assert_eq!(np.year, Some(1997));
         assert!(np.paused);
+    }
+
+    /// A scan of a slow source on its own thread, keeping `scanning` the way
+    /// `start_scan`/`run_scan` do.
+    #[test]
+    fn taking_the_scan_slot_cancels_a_running_scan_and_keeps_new_ones_out() {
+        use smp_core::source::{FileEntry, ReadSeek};
+        use std::sync::atomic::AtomicUsize;
+
+        struct Slow {
+            bytes: Vec<u8>,
+            opened: AtomicUsize,
+        }
+        impl MusicSource for Slow {
+            fn walk(&self, f: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
+                for i in 0..200 {
+                    f(FileEntry {
+                        rel_path: format!("Rock/{i}.mp3"),
+                        size: self.bytes.len() as u64,
+                        mtime: 1,
+                    });
+                }
+                Ok(())
+            }
+            fn open(&self, _: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
+                self.opened.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+            }
+            fn describe(&self) -> String {
+                "slow".into()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let writer = CatalogWriter::spawn(Catalog::open(&db).unwrap()).unwrap();
+        let src = Slow {
+            bytes: std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../crates/core/tests/fixtures/tone.mp3"),
+            )
+            .unwrap(),
+            opened: AtomicUsize::new(0),
+        };
+        let scanning = AtomicBool::new(true);
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let scan = s.spawn(|| {
+                let mut cat = Catalog::open(&db).unwrap();
+                let opts = ScanOptions {
+                    workers: 2,
+                    ..ScanOptions::default()
+                };
+                let r = scan_with(&src, &mut cat, &mut |_| {}, &cancel, &opts);
+                scanning.store(false, Ordering::SeqCst);
+                r.unwrap()
+            });
+            while src.opened.load(Ordering::SeqCst) < 20 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let slot = take_scan_slot(
+                &scanning,
+                || cancel.store(true, Ordering::SeqCst),
+                Duration::from_secs(10),
+            )
+            .expect("the scan stops");
+            let report = scan.join().unwrap();
+            assert!(report.read < 200, "cancelled: {report:?}");
+            assert!(
+                take_scan_slot(&scanning, || {}, Duration::from_millis(50)).is_none(),
+                "held: no second taker"
+            );
+            writer.call(|c| c.clear()).unwrap();
+            drop(slot);
+        });
+        assert!(!scanning.load(Ordering::SeqCst), "released");
+        let cat = Catalog::open(&db).unwrap();
+        assert!(cat.is_empty().unwrap(), "nothing written after the clear");
     }
 
     #[test]

@@ -199,12 +199,12 @@ export function unreadableTabLabel(n, t) {
   return n ? t("tabs.unreadable_n", { n }) : t("tabs.unreadable");
 }
 
-/** "Copy all": one line per file, "path<TAB>reason (message)". */
+/** "Copy all": one line per file, "url<TAB>reason (message)" (the encoded URL). */
 export function copyAllText(rows, t) {
   return rows
     .map((r) => {
       const reason = reasonText(r.code, t);
-      return `${r.path}\t${r.message ? `${reason} (${r.message})` : reason}`;
+      return `${r.url}\t${r.message ? `${reason} (${r.message})` : reason}`;
     })
     .join("\n");
 }

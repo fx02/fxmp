@@ -77,10 +77,17 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
   the username or password), the reason (file not found, timed out, server
   unreachable, cannot decode, unsupported format, tags unreadable, read error),
   how often it failed and when. "Copy path" / "Copy all" (one line per file:
-  path, tab, reason) put it on the clipboard; "Retry" / "Retry all" let the
-  files play again. A track that failed 3 times in a row is skipped until the
-  next refresh; the list keeps it until it plays, is retried or its file
-  changes. Banned tracks are not listed there (see Settings).
+  URL, tab, reason) put a valid, percent-encoded `smb://` URL on the
+  clipboard; "Retry" / "Retry all" let the files play again. A track that
+  failed 3 times in a row is skipped until the next refresh; the list keeps it
+  until it plays, is retried, or a refresh reads it fine. Network trouble
+  (timeouts, an unreachable server, a rejected password) is not the file's
+  fault: it is not counted against the track and not listed. Banned tracks
+  are not listed there (see Settings).
+- A file whose tags cannot be read during a refresh keeps the tags, loudness
+  and everything else it had. After network trouble (or a read error, or the
+  file not being found) the next refresh tries it again; a file whose tags or
+  audio are broken waits until it changes.
 - Window controls: ⏯ pause, ⏭ next, 🚫 "never play this track again" (asks for
   confirmation: click again within 3 s), and a volume slider. Banned tracks come
   back with the **Restore** button in Settings.

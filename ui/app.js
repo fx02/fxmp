@@ -955,7 +955,7 @@ function wire() {
     if (!li || e.target.tagName !== "BUTTON") return;
     const row = (state.unreadable || []).find((r) => r.id === Number(li.dataset.id));
     if (!row) return;
-    if (e.target.classList.contains("copy")) copyAndTell(row.path);
+    if (e.target.classList.contains("copy")) copyAndTell(row.url);
     else if (e.target.classList.contains("retry")) retryUnreadable(row.id);
   });
   $("btn-copy-all").addEventListener("click", () => copyAndTell(copyAllText(state.unreadable || [], t)));

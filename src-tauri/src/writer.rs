@@ -86,6 +86,13 @@ mod tests {
     #[test]
     fn jobs_run_in_order_and_call_returns_results() {
         let w = CatalogWriter::spawn(Catalog::open_in_memory().unwrap()).unwrap();
+        w.call(|c| {
+            for p in ["1.mp3", "2.mp3"] {
+                c.upsert_track(p, 1, 1, &smp_core::catalog::TrackMeta::default())?;
+            }
+            Ok(())
+        })
+        .unwrap();
         w.send("first", |c| c.set_last_first("k", 1));
         w.send("second", |c| c.set_last_first("k", 2));
         assert_eq!(w.call(|c| c.last_first("k")).unwrap(), Some(2));

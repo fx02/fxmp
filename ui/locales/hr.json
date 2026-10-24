@@ -153,5 +153,6 @@
   "err.keychain": "Lozinku nije moguće spremiti u keychain: {error}",
   "err.keychain_delete": "Lozinku nije moguće obrisati iz keychaina: {error}",
   "err.clear_busy": "Skeniranje se nije zaustavilo pa biblioteka nije ispražnjena. Pokušaj ponovno.",
+  "err.clearing": "Biblioteka se prazni.",
   "err.language": "Nepoznat jezik: {code}"
 }
