@@ -1,5 +1,6 @@
 //! Incremental scanner: walks a source and keeps the catalog in sync.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::catalog::{Catalog, TrackMeta};
 use crate::source::{FileEntry, MusicSource, SourceError};
 use crate::tags::read_meta;
-use crate::{Error, Result};
+use crate::{Error, Result, SetOnDrop};
 
 /// Files committed per catalog transaction.
 const CHUNK: usize = 500;
@@ -62,11 +63,17 @@ fn is_network_io(e: &std::io::Error) -> bool {
 pub struct ScanOptions {
     /// Threads opening and tagging new or modified files at once (at least 1).
     pub workers: usize,
+    /// Rebuild genres after this many newly committed files, so a long first
+    /// scan becomes playable before it ends (`usize::MAX` = only at the end).
+    pub rebuild_every: usize,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { workers: 8 }
+        Self {
+            workers: 8,
+            rebuild_every: 5000,
+        }
     }
 }
 
@@ -142,24 +149,17 @@ pub fn scan_with(
     }
 
     if !cancel.load(Ordering::Relaxed) {
-        read_parallel(
-            source,
-            catalog,
-            &to_read,
-            opts.workers,
-            cancel,
-            |e, failed| {
-                report.read += 1;
-                rep.state.read += 1;
-                if failed {
-                    report.failed += 1;
-                    rep.state.failed += 1;
-                }
-                rep.state.seen += 1;
-                rep.state.current.clone_from(&e.rel_path);
-                rep.tick();
-            },
-        )?;
+        read_parallel(source, catalog, &to_read, opts, cancel, |e, failed| {
+            report.read += 1;
+            rep.state.read += 1;
+            if failed {
+                report.failed += 1;
+                rep.state.failed += 1;
+            }
+            rep.state.seen += 1;
+            rep.state.current.clone_from(&e.rel_path);
+            rep.tick();
+        })?;
     }
 
     if cancel.load(Ordering::Relaxed) {
@@ -180,10 +180,11 @@ struct ReadResult {
     mtime: i64,
 }
 
-/// Opens and tags `entry`, classifying failures (see [`scan_with`]).
+/// Opens and tags `entry`, classifying failures (see [`scan_with`]). A panic
+/// while doing so (a tag-parser bug, say) counts as an undecodable file.
 fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult {
     let ext = e.rel_path.rsplit_once('.').map_or("", |(_, x)| x);
-    let (meta, size, mtime) = match source.open(&e.rel_path) {
+    let read = || match source.open(&e.rel_path) {
         Ok(mut r) => match read_meta(&mut *r, ext) {
             Ok(meta) => (Some(meta), e.size, e.mtime),
             // Connection trouble while reading: retry next scan.
@@ -194,6 +195,11 @@ fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult
         Err(SourceError::Unreachable | SourceError::Timeout | SourceError::Io(_)) => (None, 0, 0),
         Err(_) => (None, e.size, e.mtime),
     };
+    let (meta, size, mtime) =
+        std::panic::catch_unwind(AssertUnwindSafe(read)).unwrap_or_else(|_| {
+            log::warn!("scan: reading tags of '{}' panicked", e.rel_path);
+            (None, e.size, e.mtime)
+        });
     ReadResult {
         index,
         meta,
@@ -202,14 +208,15 @@ fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult
     }
 }
 
-/// Tags `files` on `workers` threads and upserts the results from the calling
-/// thread in transactions of [`CHUNK`]. `on_written(entry, failed)` runs after
+/// Tags `files` on `opts.workers` threads and upserts the results from the
+/// calling thread in transactions of [`CHUNK`], rebuilding genres after every
+/// `opts.rebuild_every` committed files. `on_written(entry, failed)` runs after
 /// each upsert. Stops early (keeping what was written) when `cancel` is set.
 fn read_parallel(
     source: &dyn MusicSource,
     catalog: &mut Catalog,
     files: &[&FileEntry],
-    workers: usize,
+    opts: &ScanOptions,
     cancel: &AtomicBool,
     mut on_written: impl FnMut(&FileEntry, bool),
 ) -> Result<()> {
@@ -218,7 +225,7 @@ fn read_parallel(
     let stop = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel::<ReadResult>();
     std::thread::scope(|s| {
-        for _ in 0..workers.max(1).min(files.len()) {
+        for _ in 0..opts.workers.max(1).min(files.len()) {
             let (tx, next, stop) = (tx.clone(), &next, &stop);
             s.spawn(move || {
                 while !cancel.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
@@ -231,34 +238,40 @@ fn read_parallel(
             });
         }
         drop(tx);
+        // On return or panic, workers finish the file in hand and exit.
+        let _stop_on_exit = SetOnDrop(&stop);
 
-        let result = (|| {
-            let mut finished = false;
-            while !finished && !cancel.load(Ordering::Relaxed) {
-                catalog.transaction(|c| {
-                    for _ in 0..CHUNK {
-                        if cancel.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let Ok(r) = rx.recv() else {
-                            finished = true;
-                            break;
-                        };
-                        let e = files[r.index];
-                        let failed = r.meta.is_none();
-                        let meta = r.meta.unwrap_or_default();
-                        c.upsert_track(&e.rel_path, r.size, r.mtime, &meta)?;
-                        on_written(e, failed);
+        let mut finished = false;
+        let mut since_rebuild = 0;
+        while !finished && !cancel.load(Ordering::Relaxed) {
+            let written = catalog.transaction(|c| {
+                let mut written = 0;
+                for _ in 0..CHUNK {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
                     }
-                    Ok(())
-                })?;
+                    let Ok(r) = rx.recv() else {
+                        finished = true;
+                        break;
+                    };
+                    let e = files[r.index];
+                    let failed = r.meta.is_none();
+                    let meta = r.meta.unwrap_or_default();
+                    c.upsert_track(&e.rel_path, r.size, r.mtime, &meta)?;
+                    on_written(e, failed);
+                    written += 1;
+                }
+                Ok(written)
+            })?;
+            // Keep a long first scan playable. Not needed once all files are
+            // in: the caller rebuilds after `finish_scan`. Never deletes tracks.
+            since_rebuild += written;
+            if since_rebuild >= opts.rebuild_every && !finished {
+                catalog.rebuild_genres()?;
+                since_rebuild = 0;
             }
-            Ok(())
-        })();
-        // Let workers finish the file in hand and exit.
-        stop.store(true, Ordering::Relaxed);
-        drop(rx);
-        result
+        }
+        Ok(())
     })
 }
 
@@ -363,6 +376,23 @@ mod tests {
         /// Opens, but every read fails with this kind (as SmbReader's `to_io` produces).
         ReadFails(std::io::ErrorKind),
         Garbage,
+        /// Opens, but the first read panics (a bug in a tag parser, say).
+        ReadPanics,
+    }
+
+    /// Reader that panics when read.
+    struct PanickingReader;
+
+    impl std::io::Read for PanickingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("simulated parser bug");
+        }
+    }
+
+    impl std::io::Seek for PanickingReader {
+        fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
     }
 
     /// Reader whose reads always fail.
@@ -397,6 +427,7 @@ mod tests {
                 Behaviour::OpenFails(err) => Err(err),
                 Behaviour::ReadFails(kind) => Ok(Box::new(FailingReader(kind))),
                 Behaviour::Garbage => Ok(Box::new(std::io::Cursor::new(b"not audio".to_vec()))),
+                Behaviour::ReadPanics => Ok(Box::new(PanickingReader)),
             }
         }
         fn describe(&self) -> String {
@@ -480,7 +511,10 @@ mod tests {
     }
 
     fn scan_workers(src: &dyn MusicSource, cat: &mut Catalog, workers: usize) -> ScanReport {
-        let opts = ScanOptions { workers };
+        let opts = ScanOptions {
+            workers,
+            ..Default::default()
+        };
         scan_with(src, cat, &mut |_| {}, &AtomicBool::new(false), &opts).unwrap()
     }
 
@@ -601,6 +635,96 @@ mod tests {
             elapsed < Duration::from_millis(40 * 50 / 3),
             "took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn panicking_reader_counts_as_decode_failure() {
+        let entry = |name: &str| FileEntry {
+            rel_path: name.into(),
+            size: 1000,
+            mtime: 1_700_000_000,
+        };
+        let src = FlakySource(vec![
+            (entry("panics.mp3"), Behaviour::ReadPanics),
+            (entry("garbage.mp3"), Behaviour::Garbage),
+        ]);
+        for workers in [1, 8] {
+            let mut cat = Catalog::open_in_memory().unwrap();
+            let r = scan_workers(&src, &mut cat, workers);
+            assert_eq!((r.read, r.failed), (2, 2));
+            // Real size/mtime kept: not retried until the file changes.
+            assert!(cat
+                .file_unchanged("panics.mp3", 1000, 1_700_000_000)
+                .unwrap());
+            assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 2);
+        }
+    }
+
+    /// In-memory source of `files` tone MP3s that sets `cancel` when file
+    /// number `cancel_after` is opened.
+    struct CancellingSource<'a> {
+        files: usize,
+        cancel_after: usize,
+        opens: AtomicUsize,
+        cancel: &'a AtomicBool,
+        bytes: Vec<u8>,
+    }
+
+    impl MusicSource for CancellingSource<'_> {
+        fn walk(
+            &self,
+            on_entry: &mut dyn FnMut(FileEntry),
+        ) -> std::result::Result<(), SourceError> {
+            for i in 0..self.files {
+                on_entry(FileEntry {
+                    rel_path: format!("Rock/f{i}.mp3"),
+                    size: self.bytes.len() as u64,
+                    mtime: 1_700_000_000,
+                });
+            }
+            Ok(())
+        }
+        fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+            if self.opens.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_after {
+                // Workers run ahead of the writer; let it commit what was read.
+                std::thread::sleep(Duration::from_millis(500));
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+        }
+        fn describe(&self) -> String {
+            "cancelling".into()
+        }
+    }
+
+    /// First scan of 1200 files cancelled after ~700 opens: chunks of 500 commit
+    /// before the cancel, so genres exist only if rebuilt periodically.
+    fn cancelled_first_scan_genres(rebuild_every: usize) -> Vec<crate::catalog::GenreCount> {
+        let cancel = AtomicBool::new(false);
+        let src = CancellingSource {
+            files: 1200,
+            cancel_after: 700,
+            opens: AtomicUsize::new(0),
+            cancel: &cancel,
+            bytes: fs::read(fixtures().join("tone.mp3")).unwrap(),
+        };
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let opts = ScanOptions {
+            workers: 1,
+            rebuild_every,
+        };
+        let r = scan_with(&src, &mut cat, &mut |_| {}, &cancel, &opts).unwrap();
+        assert!(r.read >= 500 && r.read < 1200, "{r:?}");
+        assert_eq!(r.removed, 0);
+        cat.genres().unwrap()
+    }
+
+    #[test]
+    fn genres_rebuilt_periodically_during_first_scan() {
+        assert_eq!(ScanOptions::default().rebuild_every, 5000);
+        assert!(!cancelled_first_scan_genres(500).is_empty());
+        // Control: without a periodic rebuild a cancelled first scan has no genres.
+        assert!(cancelled_first_scan_genres(usize::MAX).is_empty());
     }
 
     #[test]

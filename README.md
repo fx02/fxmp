@@ -36,7 +36,8 @@ Usput pronađena dva problema u crateu i kako su riješena:
 Ostalo:
 - Čitanje ide u komadima od 256 KiB (read-ahead buffer po otvorenoj datoteci),
   nikad se ne skida cijela datoteka.
-- Svaka mrežna operacija ima timeout 10 s (`SourceError::Timeout`). Nakon
+- Svaka mrežna operacija ima timeout 10 s (`SourceError::Timeout`), osim
+  izlistavanja mape, koje ima 30 s. Nakon
   prekinute veze ili timeouta veza se jednom ponovno uspostavi (npr. poluotvorena
   veza nakon spavanja), a tek onda se vraća greška.
 - Podmapa koja se ne može izlistati zbog vlastitog razloga (pristup odbijen,
@@ -50,6 +51,15 @@ Ostalo:
   paralelnih dretvi (`ScanOptions { workers }`); u katalog piše samo pozivajuća
   dretva, u transakcijama po 500. Mjereno na `10.111.100.2`, prvo skeniranje
   500 datoteka: 30,5 s s jednom dretvom, 12,7 s s osam (2,4×).
+  Tijekom skeniranja žanrovi se ponovno grade nakon svakih 5000 novih
+  datoteka, pa je knjižnica upotrebljiva i prije kraja prvog skeniranja.
+- **Poznat problem u crateu (nije zakrpan):** `Directory::query` stream u
+  `smb` 0.12.1 ponekad izgubi buđenje (`notify_waiters` umjesto
+  `notify_one` u `poll_next`) i čeka do timeouta, nakon čega slijedi
+  ponovno spajanje i ponovni pokušaj. Izlistavanje je zato povremeno sporo, a
+  na Sambi (`10.111.0.2`) puni obilazak zna završiti greškom `Timeout`.
+  Provjereno: s tom jednom promjenom puni obilazak Sambe traje ~38 s bez
+  greške.
 
 Live testovi (samo čitanje, ništa se ne piše na servere):
 

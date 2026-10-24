@@ -2,7 +2,8 @@
 //! driven from a private tokio runtime, so the [`MusicSource`] API stays blocking.
 //! One authenticated connection is shared by the walk and all open files; a
 //! dropped connection is re-established once per operation before the error is
-//! returned. Every network operation is capped at [`NET_TIMEOUT`].
+//! returned. Every network operation is capped at [`NET_TIMEOUT`], except
+//! folder listings, which get [`LIST_TIMEOUT`].
 //!
 //! The blocking methods must not be called from inside an async runtime
 //! (use `spawn_blocking` there).
@@ -23,9 +24,12 @@ use smb::{
 use tokio::runtime::Runtime;
 
 use super::{is_supported, FileEntry, MusicSource, ReadSeek, SourceError};
+use crate::SetOnDrop;
 
-/// Timeout for every network operation (connect, list a folder, read a chunk).
+/// Timeout for every network operation (connect, open, read a chunk) except listing.
 const NET_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout for listing one folder: big folders on a busy server answer slowly.
+const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Folders listed at once during a walk (on the one shared connection).
 const WALK_CONCURRENCY: usize = 8;
 /// Bytes requested per SMB READ and kept in the reader's buffer.
@@ -82,12 +86,20 @@ fn runtime() -> &'static Runtime {
 
 /// Runs `fut` to completion with the [`NET_TIMEOUT`] cap.
 fn block_on<T>(fut: impl Future<Output = smb::Result<T>>) -> smb::Result<T> {
+    block_on_within(NET_TIMEOUT, fut)
+}
+
+/// Runs `fut` to completion, failing with a timeout after `limit`.
+fn block_on_within<T>(
+    limit: Duration,
+    fut: impl Future<Output = smb::Result<T>>,
+) -> smb::Result<T> {
     runtime().block_on(async {
-        tokio::time::timeout(NET_TIMEOUT, fut)
+        tokio::time::timeout(limit, fut)
             .await
             .unwrap_or(Err(smb::Error::OperationTimeout(
                 smb::error::TimedOutTask::ReceiveNextMessage,
-                NET_TIMEOUT,
+                limit,
             )))
     })
 }
@@ -186,7 +198,7 @@ impl SmbSource {
         let args = FileCreateArgs::make_open_existing(access.into());
         let (path, args) = (&path, &args);
         self.shared
-            .with_retry(|conn| async move {
+            .with_retry(LIST_TIMEOUT, |conn| async move {
                 let dir = match conn.client().create_file(path, args).await? {
                     Resource::Directory(dir) => Arc::new(dir),
                     other => {
@@ -271,8 +283,11 @@ fn walk_tree(
         drop(done_tx);
         // Owned here so an unwinding caller disconnects the workers before joining them.
         let job_tx = job_tx;
+        // Dropped before `job_tx` (on return or panic): workers finish the
+        // listing in hand, skip what is queued and exit.
+        let _stop_on_exit = SetOnDrop(&stop);
 
-        let result = (|| {
+        (|| {
             job_tx.send(String::new()).expect("workers alive");
             let mut pending = 1usize;
             while pending > 0 {
@@ -313,11 +328,7 @@ fn walk_tree(
                 }
             }
             Ok(true)
-        })();
-        // Workers finish the listing in hand, skip what is queued and exit.
-        stop.store(true, Ordering::Relaxed);
-        drop(job_tx);
-        result
+        })()
     })
 }
 
@@ -351,17 +362,18 @@ impl Shared {
     /// Runs `op` on the shared connection; if the connection was lost or timed
     /// out (e.g. half-open after sleep), reconnects once and retries.
     /// Returns the generation of the connection that produced the result.
-    fn with_retry<T, F, Fut>(&self, op: F) -> Result<(u64, T), SourceError>
+    /// Each attempt is capped at `limit`.
+    fn with_retry<T, F, Fut>(&self, limit: Duration, op: F) -> Result<(u64, T), SourceError>
     where
         F: Fn(Arc<Conn>) -> Fut,
         Fut: Future<Output = smb::Result<T>>,
     {
         let (generation, conn) = self.current();
-        match block_on(op(conn)).map_err(|e| map_err(&e)) {
+        match block_on_within(limit, op(conn)).map_err(|e| map_err(&e)) {
             Ok(v) => Ok((generation, v)),
             Err(e) if needs_reconnect(&e) => {
                 let (generation, conn) = self.reconnect(generation)?;
-                let v = block_on(op(conn)).map_err(|e| map_err(&e))?;
+                let v = block_on_within(limit, op(conn)).map_err(|e| map_err(&e))?;
                 Ok((generation, v))
             }
             Err(e) => Err(e),
@@ -374,7 +386,7 @@ impl Shared {
         let args =
             FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
         let (path, args) = (&path, &args);
-        let (generation, (file, size)) = self.with_retry(|conn| async move {
+        let (generation, (file, size)) = self.with_retry(NET_TIMEOUT, |conn| async move {
             match conn.client().create_file(path, args).await? {
                 Resource::File(f) => match f.get_len().await {
                     Ok(size) => Ok((f, size)),
@@ -396,7 +408,9 @@ impl Shared {
 fn open_conn(cfg: &SmbConfig, share: &UncPath) -> Result<Conn, SourceError> {
     let client = Client::new(ClientConfig {
         connection: ConnectionConfig {
-            timeout: Some(NET_TIMEOUT),
+            // The library's own per-response cap; must allow the longest
+            // operation. Shorter ones are capped by `block_on_within`.
+            timeout: Some(LIST_TIMEOUT),
             ..Default::default()
         },
         ..Default::default()
@@ -927,6 +941,42 @@ mod tests {
         });
         assert_eq!(res, Ok(false));
         assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn walk_panic_stops_queued_listings() {
+        let listed = AtomicUsize::new(0);
+        let list = |rel: &str| -> Result<Vec<DirItem>, SourceError> {
+            listed.fetch_add(1, Ordering::SeqCst);
+            match rel {
+                "" => Ok((0..50).map(|i| item(&format!("d{i}"), true)).collect()),
+                "d0" => panic!("simulated lister bug"),
+                _ => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    Ok(vec![])
+                }
+            }
+        };
+        let res = std::panic::catch_unwind(AssertUnwindSafe(|| walk_tree(&list, 2, &mut |_| true)));
+        assert!(res.is_err(), "panic must propagate");
+        // Root + d0 + at most the folders in hand / just picked up; not all 50.
+        let n = listed.load(Ordering::SeqCst);
+        assert!(n < 10, "listed {n} folders after the panic");
+    }
+
+    #[test]
+    fn listing_gets_a_longer_timeout_than_file_ops() {
+        assert_eq!(LIST_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(NET_TIMEOUT, Duration::from_secs(10));
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        };
+        assert!(matches!(
+            block_on_within(Duration::from_millis(20), slow()),
+            Err(smb::Error::OperationTimeout(..))
+        ));
+        assert!(block_on_within(Duration::from_millis(500), slow()).is_ok());
     }
 
     #[test]

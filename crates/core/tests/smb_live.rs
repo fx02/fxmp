@@ -269,7 +269,10 @@ fn live_scan_timing() {
             &mut cat,
             &mut |_| {},
             &AtomicBool::new(false),
-            &ScanOptions { workers },
+            &ScanOptions {
+                workers,
+                ..Default::default()
+            },
         )
         .unwrap();
         let took = started.elapsed();

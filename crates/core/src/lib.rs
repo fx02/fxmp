@@ -23,3 +23,12 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Sets the flag when dropped, including while unwinding from a panic.
+pub(crate) struct SetOnDrop<'a>(pub(crate) &'a std::sync::atomic::AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
