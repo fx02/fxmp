@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod catalog;
 pub mod genre;
 pub mod scan;
