@@ -843,7 +843,9 @@ mod tests {
 
     #[test]
     fn cancel_mid_scan_keeps_catalog() {
-        let src = SlowSource::new(40, Duration::from_millis(20));
+        // Slow enough that the 30 rescanned files do not all arrive within one
+        // BATCH_WINDOW: progress is only reported after a batch is written.
+        let src = SlowSource::new(40, Duration::from_millis(60));
         let mut cat = Catalog::open_in_memory().unwrap();
         let no = AtomicBool::new(false);
         let full = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
