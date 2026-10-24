@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, TrackMeta};
-use crate::source::{FileEntry, MusicSource};
+use crate::source::{FileEntry, MusicSource, SourceError};
 use crate::tags::read_meta;
-use crate::{Error, Result};
+use crate::Result;
 
 /// Files committed per catalog transaction.
 const CHUNK: usize = 500;
@@ -48,7 +48,9 @@ impl Reporter<'_> {
 
 /// Syncs `catalog` with `source`: unchanged files are only marked seen, new or
 /// modified ones are tagged and upserted, vanished ones are removed. A file whose
-/// tags cannot be read stays in the catalog with empty metadata and counts as failed.
+/// tags cannot be read stays in the catalog with empty metadata and counts as failed;
+/// if it could not even be opened because of a network problem, it is stored with
+/// size/mtime 0 so the next scan retries it.
 /// On cancel the walk stops and nothing is removed (`finish_scan` is skipped).
 pub fn scan(
     source: &dyn MusicSource,
@@ -84,16 +86,20 @@ pub fn scan(
                     report.unchanged += 1;
                 } else {
                     let ext = e.rel_path.rsplit_once('.').map_or("", |(_, x)| x);
-                    let meta = source
-                        .open(&e.rel_path)
-                        .map_err(Error::from)
-                        .and_then(|mut r| read_meta(&mut *r, ext));
-                    let meta = meta.unwrap_or_else(|_| {
+                    let (meta, size, mtime) = match source.open(&e.rel_path) {
+                        Ok(mut r) => (read_meta(&mut *r, ext).ok(), e.size, e.mtime),
+                        // Network trouble: store size/mtime 0 so the next scan retries it.
+                        Err(
+                            SourceError::Unreachable | SourceError::Timeout | SourceError::Io(_),
+                        ) => (None, 0, 0),
+                        Err(_) => (None, e.size, e.mtime),
+                    };
+                    let meta = meta.unwrap_or_else(|| {
                         report.failed += 1;
                         rep.state.failed += 1;
                         TrackMeta::default()
                     });
-                    c.upsert_track(&e.rel_path, e.size, e.mtime, &meta)?;
+                    c.upsert_track(&e.rel_path, size, mtime, &meta)?;
                     report.read += 1;
                     rep.state.read += 1;
                 }
@@ -119,7 +125,7 @@ pub fn scan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::LocalSource;
+    use crate::source::{LocalSource, ReadSeek};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
@@ -203,6 +209,50 @@ mod tests {
         assert_eq!(r.total, 4);
         // still in the catalog
         assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 4);
+    }
+
+    /// Source whose files fail to open with a per-file error (or decode as garbage).
+    struct FlakySource(Vec<(FileEntry, Option<SourceError>)>);
+
+    impl MusicSource for FlakySource {
+        fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> std::result::Result<(), SourceError> {
+            self.0.iter().for_each(|(e, _)| on_entry(e.clone()));
+            Ok(())
+        }
+        fn open(&self, rel_path: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+            let (_, err) = self.0.iter().find(|(e, _)| e.rel_path == rel_path).unwrap();
+            match err {
+                Some(err) => Err(err.clone()),
+                None => Ok(Box::new(std::io::Cursor::new(b"not audio".to_vec()))),
+            }
+        }
+        fn describe(&self) -> String {
+            "flaky".into()
+        }
+    }
+
+    #[test]
+    fn network_failures_are_retried_next_scan() {
+        let entry = |name: &str| FileEntry { rel_path: name.into(), size: 1000, mtime: 1_700_000_000 };
+        let src = FlakySource(vec![
+            (entry("timeout.mp3"), Some(SourceError::Timeout)),
+            (entry("unreachable.mp3"), Some(SourceError::Unreachable)),
+            (entry("io.mp3"), Some(SourceError::Io("reset".into()))),
+            (entry("missing.mp3"), Some(SourceError::NotFound)),
+            (entry("garbage.mp3"), None),
+        ]);
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let no = AtomicBool::new(false);
+        let first = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
+        assert_eq!((first.read, first.failed), (5, 5));
+        for name in ["timeout.mp3", "unreachable.mp3", "io.mp3"] {
+            assert!(!cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(), "{name}");
+        }
+        for name in ["missing.mp3", "garbage.mp3"] {
+            assert!(cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(), "{name}");
+        }
+        let second = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
+        assert_eq!((second.read, second.unchanged), (3, 2));
     }
 
     #[test]

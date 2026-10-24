@@ -1,10 +1,23 @@
 //! Abstraction over where music files live (local folder, SMB share).
 
 pub mod local;
+pub mod smb;
 
 pub use local::LocalSource;
+pub use smb::{SmbConfig, SmbSource};
 
 use std::io::{Read, Seek};
+use std::path::Path;
+
+const SUPPORTED_EXTS: [&str; 3] = ["mp3", "flac", "ogg"];
+
+/// True for `.mp3`/`.flac`/`.ogg` paths (case-insensitive).
+pub(crate) fn is_supported(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SUPPORTED_EXTS.iter().any(|s| e.eq_ignore_ascii_case(s)))
+}
 
 /// Errors a music source can report.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

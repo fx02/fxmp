@@ -8,6 +8,11 @@ lofty = "0.25.4"
 rand = "0.8"
 thiserror = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+log = "0.4"
+# Async mode on a private tokio runtime; see README "SMB klijent".
+smb = { version = "=0.12.1", default-features = false, features = ["async", "sign", "encrypt", "compress"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

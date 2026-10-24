@@ -5,9 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use super::{FileEntry, MusicSource, ReadSeek, SourceError};
-
-const SUPPORTED_EXTS: [&str; 3] = ["mp3", "flac", "ogg"];
+use super::{is_supported, FileEntry, MusicSource, ReadSeek, SourceError};
 
 pub struct LocalSource {
     root: PathBuf,
@@ -50,13 +48,6 @@ impl LocalSource {
         }
         Ok(())
     }
-}
-
-fn is_supported(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| SUPPORTED_EXTS.iter().any(|s| e.eq_ignore_ascii_case(s)))
 }
 
 fn map_io(e: io::Error) -> SourceError {
