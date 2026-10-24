@@ -2,11 +2,16 @@
 //! the settings; they live in the OS keychain (see `credentials`).
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 pub const FILE_NAME: &str = "settings.json";
+/// Quick successive changes (a volume slider) are written at most this often.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// One SMB server. `root` is the music folder inside the share.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +115,105 @@ impl Settings {
     }
 }
 
+/// The live settings plus their file. Small changes are saved in the background,
+/// debounced; [`SettingsStore::replace_and_save`] and [`SettingsStore::flush`] write
+/// at once. Every write happens under the settings lock, so the file never goes back
+/// to an older state.
+pub struct SettingsStore {
+    shared: Arc<Shared>,
+    dirty: Mutex<Sender<()>>,
+}
+
+struct Shared {
+    path: PathBuf,
+    current: Mutex<Settings>,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Settings> {
+        self.current.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn save_locked(&self, s: &Settings) -> io::Result<()> {
+        s.save(&self.path)
+    }
+}
+
+impl SettingsStore {
+    pub fn new(path: PathBuf, initial: Settings) -> io::Result<Self> {
+        let shared = Arc::new(Shared {
+            path,
+            current: Mutex::new(initial),
+        });
+        let (tx, rx) = mpsc::channel::<()>();
+        let saver = Arc::downgrade(&shared);
+        std::thread::Builder::new()
+            .name("settings-saver".into())
+            .spawn(move || {
+                while rx.recv().is_ok() {
+                    std::thread::sleep(SAVE_DEBOUNCE);
+                    while rx.try_recv().is_ok() {}
+                    let Some(shared) = saver.upgrade() else {
+                        return;
+                    };
+                    let s = shared.lock();
+                    if let Err(e) = shared.save_locked(&s) {
+                        log::warn!("cannot save settings: {e}");
+                    }
+                }
+            })?;
+        Ok(Self {
+            shared,
+            dirty: Mutex::new(tx),
+        })
+    }
+
+    pub fn get(&self) -> Settings {
+        self.shared.lock().clone()
+    }
+
+    /// Changes the settings, runs `apply` with the result while still holding the
+    /// lock (so whatever it applies happens in the same order as the changes), and
+    /// schedules a save.
+    pub fn update(
+        &self,
+        change: impl FnOnce(&mut Settings),
+        apply: impl FnOnce(&Settings),
+    ) -> Settings {
+        let mut s = self.shared.lock();
+        change(&mut s);
+        *s = s.clone().clamped();
+        apply(&s);
+        let _ = self
+            .dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(());
+        s.clone()
+    }
+
+    /// Replaces all settings and writes them now. `apply` runs under the lock with
+    /// the old and the new settings.
+    pub fn replace_and_save(
+        &self,
+        new: Settings,
+        apply: impl FnOnce(&Settings, &Settings),
+    ) -> io::Result<Settings> {
+        let mut s = self.shared.lock();
+        let new = new.clamped();
+        self.shared.save_locked(&new)?;
+        apply(&s, &new);
+        *s = new;
+        Ok(s.clone())
+    }
+
+    /// Writes the current settings now (e.g. on exit, ahead of a pending save).
+    pub fn flush(&self) -> io::Result<()> {
+        let s = self.shared.lock();
+        self.shared.save_locked(&s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +277,37 @@ mod tests {
         assert_eq!(s.primary.username, "u");
         assert_eq!(s.primary.host, "10.111.100.2");
         assert_eq!(s.crossfade_secs, 5);
+    }
+
+    #[test]
+    fn store_saves_debounced_and_flushes_on_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let store = SettingsStore::new(path.clone(), Settings::default()).unwrap();
+        let mut applied = Vec::new();
+        for i in 1..=50 {
+            store.update(|s| s.volume = i as f32 / 100.0, |s| applied.push(s.volume));
+        }
+        assert_eq!(applied.len(), 50);
+        assert_eq!(store.get().volume, 0.5);
+        assert!(!path.exists(), "slider ticks are not written one by one");
+        std::thread::sleep(SAVE_DEBOUNCE * 2);
+        assert_eq!(Settings::load(&path).unwrap().volume, 0.5);
+
+        store.update(|s| s.crossfade_secs = 99, |_| {});
+        assert_eq!(store.get().crossfade_secs, 10, "clamped");
+        store.flush().unwrap();
+        assert_eq!(Settings::load(&path).unwrap().crossfade_secs, 10);
+
+        let mut seen = None;
+        let new = Settings {
+            notify: true,
+            ..store.get()
+        };
+        store
+            .replace_and_save(new, |old, new| seen = Some((old.notify, new.notify)))
+            .unwrap();
+        assert_eq!(seen, Some((false, true)));
+        assert!(Settings::load(&path).unwrap().notify);
     }
 }

@@ -14,6 +14,8 @@ use crate::{Error, Result, SetOnDrop};
 const CHUNK: usize = 500;
 /// Minimum time between progress callbacks.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// Longest wait for tagged files before committing what has arrived.
+const BATCH_WINDOW: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanProgress {
@@ -209,7 +211,8 @@ fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult
 }
 
 /// Tags `files` on `opts.workers` threads and upserts the results from the
-/// calling thread in transactions of [`CHUNK`], rebuilding genres after every
+/// calling thread in transactions of at most [`CHUNK`] files (whatever arrived
+/// within [`BATCH_WINDOW`]), rebuilding genres after every
 /// `opts.rebuild_every` committed files. `on_written(entry, failed)` runs after
 /// each upsert. Stops early (keeping what was written) when `cancel` is set.
 fn read_parallel(
@@ -243,25 +246,34 @@ fn read_parallel(
 
         let mut finished = false;
         let mut since_rebuild = 0;
+        let mut batch: Vec<ReadResult> = Vec::with_capacity(CHUNK);
         while !finished && !cancel.load(Ordering::Relaxed) {
-            let written = catalog.transaction(|c| {
-                let mut written = 0;
-                for _ in 0..CHUNK {
-                    if cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let Ok(r) = rx.recv() else {
+            // Collect results first: a write transaction is never held while
+            // waiting on the network, so other connections can write meanwhile.
+            let until = Instant::now() + BATCH_WINDOW;
+            while batch.len() < CHUNK && !cancel.load(Ordering::Relaxed) {
+                match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                    Ok(r) => batch.push(r),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
                         finished = true;
                         break;
-                    };
+                    }
+                }
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            let written = batch.len();
+            catalog.transaction(|c| {
+                for r in batch.drain(..) {
                     let e = files[r.index];
                     let failed = r.meta.is_none();
                     let meta = r.meta.unwrap_or_default();
                     c.upsert_track(&e.rel_path, r.size, r.mtime, &meta)?;
                     on_written(e, failed);
-                    written += 1;
                 }
-                Ok(written)
+                Ok(())
             })?;
             // Keep a long first scan playable. Not needed once all files are
             // in: the caller rebuilds after `finish_scan`. Never deletes tracks.
@@ -774,5 +786,34 @@ mod tests {
         let r = run(dir.path(), &mut cat, &AtomicBool::new(true));
         assert_eq!(r.removed, 0);
         assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn scan_never_holds_write_lock_while_waiting_for_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let mut cat = Catalog::open(&db).unwrap();
+        let other = Catalog::open(&db).unwrap();
+        let src = SlowSource::new(8, Duration::from_millis(150));
+        let opts = ScanOptions {
+            workers: 1,
+            rebuild_every: usize::MAX,
+        };
+        let no = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let scan = s.spawn(|| scan_with(&src, &mut cat, &mut |_| {}, &no, &opts).unwrap());
+            let mut worst = Duration::ZERO;
+            while !scan.is_finished() {
+                let t = Instant::now();
+                other.set_last_first("probe", 1).unwrap();
+                worst = worst.max(t.elapsed());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(scan.join().unwrap().read, 8);
+            assert!(
+                worst < Duration::from_millis(100),
+                "a write waited {worst:?}"
+            );
+        });
     }
 }

@@ -8,10 +8,10 @@ use smp_core::audio::player::Command;
 use smp_core::TrackId;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::connection::{smb_config, status_of, test_server, ConnStatus, StatusPayload};
+use crate::connection::{status_of, test_server, test_target, ConnStatus, StatusPayload};
 use crate::provider::CatalogProvider;
-use crate::settings::Settings;
-use crate::state::{self, apply_player_settings, lock, AppState, NowPlaying};
+use crate::settings::{ServerConfig, Settings};
+use crate::state::{self, apply_player_settings, lock, AppState, NowPlaying, ScanStatus};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -53,7 +53,7 @@ pub struct BannedTrack {
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_settings(app: AppHandle) -> CmdResult<Settings> {
-    run(app, |_, st| Ok(lock(&st.settings).clone())).await
+    run(app, |_, st| Ok(st.settings.get())).await
 }
 
 /// Saves settings; a non-empty password goes to the keychain, an empty or missing
@@ -76,31 +76,60 @@ pub async fn save_settings(
         };
         store(Some(&settings.primary), primary_password)?;
         store(settings.secondary.as_ref(), secondary_password)?;
-        let saved = st.update_settings(|s| *s = settings)?;
-        apply_player_settings(&st.player, &saved);
+        let mut servers_changed = false;
+        let saved = st
+            .settings
+            .replace_and_save(settings, |old, new| {
+                servers_changed = old.primary != new.primary || old.secondary != new.secondary;
+                apply_player_settings(&st.player, new);
+            })
+            .map_err(|e| format!("Postavke nije moguće spremiti: {e}"))?;
+        if servers_changed {
+            state::cancel_scan(
+                st,
+                Some("Postavke servera su promijenjene pa je skeniranje prekinuto."),
+            );
+        }
         st.reconnect(&saved);
         Ok(())
     })
     .await
 }
 
-/// Connects once to the saved primary or secondary server: "ok", "auth" or "unreachable".
+/// Connects once to a server: "ok", "auth" or "unreachable". `server` and `password`
+/// are the form's unsaved values; without them the saved settings and the keychain
+/// password are used, and the live connection to that server forgets a rejected
+/// password and is re-checked.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn test_connection(app: AppHandle, which: String) -> CmdResult<ConnStatus> {
+pub async fn test_connection(
+    app: AppHandle,
+    which: String,
+    server: Option<ServerConfig>,
+    password: Option<String>,
+) -> CmdResult<ConnStatus> {
     run(app, move |_, st| {
-        let settings = lock(&st.settings).clone();
-        let server = match which.as_str() {
-            "primary" => settings.primary,
-            "secondary" => settings
-                .secondary
-                .ok_or("Rezervni server nije postavljen.")?,
-            other => return Err(format!("Nepoznat server: {other}")),
-        };
-        let password = st
-            .creds
-            .get(server.host.trim(), server.username.trim())
-            .unwrap_or_default();
-        Ok(status_of(test_server(smb_config(&server, password)), None))
+        let saved = server.is_none();
+        let cfg = test_target(
+            &st.settings.get(),
+            st.creds.as_ref(),
+            &which,
+            server,
+            password,
+        )?;
+        let status = status_of(test_server(cfg), None);
+        if saved {
+            if let Some(servers) = st.source.servers() {
+                let live = match which.as_str() {
+                    "primary" => Some(&servers.primary),
+                    _ => servers.secondary.as_ref(),
+                };
+                if let Some(live) = live {
+                    live.reconnect();
+                }
+                st.wake_monitor();
+            }
+        }
+        Ok(status)
     })
     .await
 }
@@ -122,16 +151,21 @@ pub async fn start_scan(app: AppHandle) -> CmdResult<()> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn cancel_scan(app: AppHandle) -> CmdResult<()> {
     run(app, |_, st| {
-        state::cancel_scan(st);
+        state::cancel_scan(st, None);
         Ok(())
     })
     .await
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn get_scan_status(app: AppHandle) -> CmdResult<ScanStatus> {
+    run(app, |_, st| Ok(st.scan_status())).await
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn get_genres(app: AppHandle) -> CmdResult<Vec<Genre>> {
     run(app, |_, st| {
-        let genres = lock(&st.catalog).genres().map_err(db_err)?;
+        let genres = lock(&st.query).genres().map_err(db_err)?;
         Ok(genres
             .into_iter()
             .map(|g| Genre {
@@ -148,10 +182,10 @@ pub async fn get_genres(app: AppHandle) -> CmdResult<Vec<Genre>> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn play_genres(app: AppHandle, keys: Vec<String>) -> CmdResult<()> {
     run(app, move |_, st| {
-        let provider = CatalogProvider::shuffle(st.catalog.clone(), st.banned.clone(), &keys)
-            .map_err(db_err)?;
+        let provider =
+            CatalogProvider::shuffle(&lock(&st.query), st.playback(), &keys).map_err(db_err)?;
         st.player.send(Command::Play(Box::new(provider)));
-        st.update_settings(|s| s.last_selection = keys)?;
+        st.settings.update(|s| s.last_selection = keys, |_| {});
         Ok(())
     })
     .await
@@ -160,9 +194,8 @@ pub async fn play_genres(app: AppHandle, keys: Vec<String>) -> CmdResult<()> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn play_album(app: AppHandle, artist: String, album: String) -> CmdResult<()> {
     run(app, move |_, st| {
-        let provider =
-            CatalogProvider::album(st.catalog.clone(), st.banned.clone(), &artist, &album)
-                .map_err(db_err)?;
+        let provider = CatalogProvider::album(&lock(&st.query), st.playback(), &artist, &album)
+            .map_err(db_err)?;
         st.player.send(Command::Play(Box::new(provider)));
         Ok(())
     })
@@ -190,8 +223,10 @@ pub async fn next(app: AppHandle) -> CmdResult<()> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn set_volume(app: AppHandle, v: f32) -> CmdResult<()> {
     run(app, move |_, st| {
-        let s = st.update_settings(|s| s.volume = v)?;
-        st.player.send(Command::SetVolume(s.volume));
+        st.settings.update(
+            |s| s.volume = v,
+            |s| st.player.send(Command::SetVolume(s.volume)),
+        );
         Ok(())
     })
     .await
@@ -206,8 +241,10 @@ pub async fn list_devices(app: AppHandle) -> CmdResult<Vec<String>> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn set_device(app: AppHandle, name: Option<String>) -> CmdResult<()> {
     run(app, move |_, st| {
-        st.update_settings(|s| s.device = name.clone())?;
-        st.player.send(Command::SetDevice(name));
+        st.settings.update(
+            |s| s.device = name,
+            |s| st.player.send(Command::SetDevice(s.device.clone())),
+        );
         Ok(())
     })
     .await
@@ -216,14 +253,18 @@ pub async fn set_device(app: AppHandle, name: Option<String>) -> CmdResult<()> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn set_crossfade(app: AppHandle, enabled: bool, secs: u8) -> CmdResult<()> {
     run(app, move |_, st| {
-        let s = st.update_settings(|s| {
-            s.crossfade_enabled = enabled;
-            s.crossfade_secs = secs;
-        })?;
-        st.player.send(Command::SetCrossfade {
-            enabled: s.crossfade_enabled,
-            secs: s.crossfade_secs,
-        });
+        st.settings.update(
+            |s| {
+                s.crossfade_enabled = enabled;
+                s.crossfade_secs = secs;
+            },
+            |s| {
+                st.player.send(Command::SetCrossfade {
+                    enabled: s.crossfade_enabled,
+                    secs: s.crossfade_secs,
+                })
+            },
+        );
         Ok(())
     })
     .await
@@ -232,8 +273,10 @@ pub async fn set_crossfade(app: AppHandle, enabled: bool, secs: u8) -> CmdResult
 #[tauri::command(rename_all = "snake_case")]
 pub async fn set_normalize(app: AppHandle, b: bool) -> CmdResult<()> {
     run(app, move |_, st| {
-        st.update_settings(|s| s.normalize = b)?;
-        st.player.send(Command::SetNormalize(b));
+        st.settings.update(
+            |s| s.normalize = b,
+            |s| st.player.send(Command::SetNormalize(s.normalize)),
+        );
         Ok(())
     })
     .await
@@ -247,8 +290,10 @@ pub async fn ban_current(app: AppHandle) -> CmdResult<()> {
             .as_ref()
             .map(|n| n.id)
             .ok_or("Ništa ne svira.")?;
-        lock(&st.catalog).set_banned(id, true).map_err(db_err)?;
         lock(&st.banned).insert(id);
+        st.writer
+            .call(move |c| c.set_banned(id, true))
+            .map_err(db_err)?;
         st.player.send(Command::Next);
         Ok(())
     })
@@ -258,7 +303,7 @@ pub async fn ban_current(app: AppHandle) -> CmdResult<()> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_banned(app: AppHandle) -> CmdResult<Vec<BannedTrack>> {
     run(app, |_, st| {
-        let rows = lock(&st.catalog).banned().map_err(db_err)?;
+        let rows = lock(&st.query).banned().map_err(db_err)?;
         Ok(rows
             .into_iter()
             .map(|t| BannedTrack {
@@ -275,7 +320,9 @@ pub async fn list_banned(app: AppHandle) -> CmdResult<Vec<BannedTrack>> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn unban(app: AppHandle, id: TrackId) -> CmdResult<()> {
     run(app, move |_, st| {
-        lock(&st.catalog).set_banned(id, false).map_err(db_err)?;
+        st.writer
+            .call(move |c| c.set_banned(id, false))
+            .map_err(db_err)?;
         lock(&st.banned).remove(&id);
         Ok(())
     })
@@ -286,12 +333,14 @@ pub async fn unban(app: AppHandle, id: TrackId) -> CmdResult<()> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn merge_genre(app: AppHandle, from_key: String, into_display: String) -> CmdResult<()> {
     run(app, move |app, st| {
-        let into = into_display.trim();
+        let into = into_display.trim().to_string();
         if into.is_empty() {
             return Err("Naziv žanra ne smije biti prazan.".into());
         }
-        lock(&st.catalog)
-            .add_genre_rule(&from_key, into)
+        // Rebuilds genres over the whole library: on the writer's connection, so
+        // playback and other queries are not held up.
+        st.writer
+            .call(move |c| c.add_genre_rule(&from_key, &into))
             .map_err(db_err)?;
         let _ = app.emit("genres-changed", ());
         Ok(())
@@ -301,13 +350,13 @@ pub async fn merge_genre(app: AppHandle, from_key: String, into_display: String)
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_artists(app: AppHandle) -> CmdResult<Vec<String>> {
-    run(app, |_, st| lock(&st.catalog).artists().map_err(db_err)).await
+    run(app, |_, st| lock(&st.query).artists().map_err(db_err)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_albums(app: AppHandle, artist: String) -> CmdResult<Vec<String>> {
     run(app, move |_, st| {
-        lock(&st.catalog).albums(&artist).map_err(db_err)
+        lock(&st.query).albums(&artist).map_err(db_err)
     })
     .await
 }

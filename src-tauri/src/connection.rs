@@ -101,17 +101,48 @@ pub fn smb_config(server: &ServerConfig, password: String) -> SmbConfig {
 
 /// Connects to a server once, as "Testiraj vezu" does.
 pub fn test_server(cfg: SmbConfig) -> Result<(), SourceError> {
-    SmbSource::connect(cfg).map(drop).map_err(source_error)
+    smb_connect(cfg).map(drop)
+}
+
+/// What "Testiraj vezu" checks for `which` ("primary"/"secondary"): the form's unsaved
+/// `server` when given, else the saved one; the form's `password` when non-empty,
+/// else the keychain's for that host and user.
+pub fn test_target(
+    settings: &Settings,
+    creds: &dyn CredentialStore,
+    which: &str,
+    server: Option<ServerConfig>,
+    password: Option<String>,
+) -> Result<SmbConfig, String> {
+    let server = match (which, server) {
+        ("primary" | "secondary", Some(s)) => s,
+        ("primary", None) => settings.primary.clone(),
+        ("secondary", None) => settings
+            .secondary
+            .clone()
+            .ok_or("Rezervni server nije postavljen.")?,
+        (other, _) => return Err(format!("Nepoznat server: {other}")),
+    };
+    let password = password
+        .filter(|p| !p.is_empty())
+        .or_else(|| creds.get(server.host.trim(), server.username.trim()))
+        .unwrap_or_default();
+    Ok(smb_config(&server, password))
 }
 
 /// An SMB server that connects on first use. After a failed attempt it reports the
 /// same error without touching the network until [`RETRY`] has passed, so a dead
-/// primary does not delay every track before the failover to the secondary.
+/// primary does not delay every track before the failover to the secondary. A wrong
+/// password is never retried on its own (that could lock the account): only after
+/// [`LazySmb::reconnect`].
 #[derive(Clone)]
 pub struct LazySmb(Arc<LazyInner>);
 
+type Connector = fn(SmbConfig) -> Result<SmbSource, SourceError>;
+
 struct LazyInner {
     cfg: SmbConfig,
+    connector: Connector,
     state: Mutex<LazyState>,
 }
 
@@ -121,10 +152,30 @@ struct LazyState {
     failed: Option<(Instant, SourceError)>,
 }
 
+impl LazyState {
+    /// The remembered failure, if it still stands.
+    fn standing_failure(&self, honour_retry: bool) -> Option<SourceError> {
+        match &self.failed {
+            Some((_, SourceError::Auth)) => Some(SourceError::Auth),
+            Some((at, e)) if honour_retry && at.elapsed() < RETRY => Some(e.clone()),
+            _ => None,
+        }
+    }
+}
+
+fn smb_connect(cfg: SmbConfig) -> Result<SmbSource, SourceError> {
+    SmbSource::connect(cfg).map_err(source_error)
+}
+
 impl LazySmb {
     pub fn new(cfg: SmbConfig) -> Self {
+        Self::with_connector(cfg, smb_connect)
+    }
+
+    fn with_connector(cfg: SmbConfig, connector: Connector) -> Self {
         Self(Arc::new(LazyInner {
             cfg,
+            connector,
             state: Mutex::default(),
         }))
     }
@@ -134,7 +185,7 @@ impl LazySmb {
     }
 
     fn connect(&self, st: &mut LazyState) -> Result<Arc<SmbSource>, SourceError> {
-        match SmbSource::connect(self.0.cfg.clone()) {
+        match (self.0.connector)(self.0.cfg.clone()) {
             Ok(src) => {
                 log::info!("connected to {}", src.describe());
                 let src = Arc::new(src);
@@ -143,7 +194,6 @@ impl LazySmb {
                 Ok(src)
             }
             Err(e) => {
-                let e = source_error(e);
                 log::warn!("cannot connect to {}: {e}", self.0.cfg.host);
                 st.failed = Some((Instant::now(), e.clone()));
                 Err(e)
@@ -156,21 +206,32 @@ impl LazySmb {
         if let Some(src) = &st.conn {
             return Ok(src.clone());
         }
-        if let Some((at, e)) = &st.failed {
-            if at.elapsed() < RETRY {
-                return Err(e.clone());
-            }
+        if let Some(e) = st.standing_failure(true) {
+            return Err(e);
         }
         self.connect(&mut st)
     }
 
-    /// Checks the server now: connects if not connected yet, otherwise looks for one file.
+    /// Checks the server now: connects if not connected yet (unless the password was
+    /// rejected), otherwise looks for one file.
     pub fn check(&self) -> Result<(), SourceError> {
         let existing = self.state().conn.clone();
         match existing {
             Some(src) => src.walk_limited(1, &mut |_| true).map(drop),
-            None => self.connect(&mut self.state()).map(drop),
+            None => {
+                let mut st = self.state();
+                if let Some(e) = st.standing_failure(false) {
+                    return Err(e);
+                }
+                self.connect(&mut st).map(drop)
+            }
         }
+    }
+
+    /// Forgets a remembered failure (including a rejected password), so the next use
+    /// connects again.
+    pub fn reconnect(&self) {
+        self.state().failed = None;
     }
 
     #[cfg(test)]
@@ -339,6 +400,108 @@ mod tests {
             status_of(Err(Unreachable), Some(Err(Auth))),
             ConnStatus::Auth
         );
+    }
+
+    fn cfg() -> SmbConfig {
+        smb_config(&ServerConfig::default(), String::new())
+    }
+
+    static AUTH_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn auth_fails(_: SmbConfig) -> Result<SmbSource, SourceError> {
+        AUTH_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SourceError::Auth)
+    }
+
+    #[test]
+    fn rejected_password_is_not_retried_until_reconnect() {
+        let calls = || AUTH_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let lazy = LazySmb::with_connector(cfg(), auth_fails);
+        assert_eq!(lazy.open("a.mp3").err(), Some(SourceError::Auth));
+        assert_eq!(lazy.open("a.mp3").err(), Some(SourceError::Auth));
+        assert_eq!(
+            lazy.check(),
+            Err(SourceError::Auth),
+            "a probe does not retry"
+        );
+        // Even after the retry interval.
+        lazy.state().failed = Some((Instant::now() - RETRY * 2, SourceError::Auth));
+        assert_eq!(lazy.walk(&mut |_| {}), Err(SourceError::Auth));
+        assert_eq!(calls(), 1);
+        lazy.reconnect();
+        assert_eq!(lazy.open("a.mp3").err(), Some(SourceError::Auth));
+        assert_eq!(calls(), 2);
+    }
+
+    static DOWN_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn unreachable(_: SmbConfig) -> Result<SmbSource, SourceError> {
+        DOWN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SourceError::Unreachable)
+    }
+
+    #[test]
+    fn unreachable_server_is_retried_after_interval_or_by_probe() {
+        let calls = || DOWN_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let lazy = LazySmb::with_connector(cfg(), unreachable);
+        assert_eq!(lazy.open("a.mp3").err(), Some(SourceError::Unreachable));
+        assert_eq!(lazy.open("a.mp3").err(), Some(SourceError::Unreachable));
+        assert_eq!(calls(), 1, "cached within the retry interval");
+        assert_eq!(lazy.check(), Err(SourceError::Unreachable));
+        assert_eq!(calls(), 2, "a probe retries");
+        lazy.state().failed = Some((Instant::now() - RETRY * 2, SourceError::Unreachable));
+        assert_eq!(lazy.open("a.mp3").err(), Some(SourceError::Unreachable));
+        assert_eq!(calls(), 3, "retried after the interval");
+    }
+
+    #[test]
+    fn test_target_uses_form_values_or_saved_settings() {
+        let creds = MemoryStore::default();
+        creds.set("10.111.100.2", "music", "saved-pw").unwrap();
+        let settings = Settings {
+            primary: ServerConfig {
+                username: "music".into(),
+                ..ServerConfig::default()
+            },
+            ..Settings::default()
+        };
+
+        // Saved settings, keychain password.
+        let t = test_target(&settings, &creds, "primary", None, None).unwrap();
+        assert_eq!(
+            (t.host.as_str(), t.password.as_str()),
+            ("10.111.100.2", "saved-pw")
+        );
+        let t = test_target(&settings, &creds, "primary", None, Some(String::new())).unwrap();
+        assert_eq!(
+            t.password, "saved-pw",
+            "an empty form password keeps the stored one"
+        );
+
+        // Unsaved form values, typed password.
+        let form = ServerConfig {
+            host: "10.111.0.2".into(),
+            share: "music".into(),
+            root: "MP3".into(),
+            username: "backup".into(),
+            domain: None,
+        };
+        let t = test_target(
+            &settings,
+            &creds,
+            "secondary",
+            Some(form.clone()),
+            Some("typed".into()),
+        )
+        .unwrap();
+        assert_eq!((t.host.as_str(), t.share.as_str()), ("10.111.0.2", "music"));
+        assert_eq!(
+            (t.username.as_str(), t.password.as_str()),
+            ("backup", "typed")
+        );
+        let t = test_target(&settings, &creds, "secondary", Some(form), None).unwrap();
+        assert_eq!(t.password, "", "nothing stored for that host/user");
+
+        assert!(test_target(&settings, &creds, "secondary", None, None).is_err());
+        assert!(test_target(&settings, &creds, "other", None, None).is_err());
     }
 
     #[test]

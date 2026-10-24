@@ -12,14 +12,15 @@ use smp_core::audio::output::CpalSinkFactory;
 use smp_core::audio::player::{Command, Event, Player, PlayerConfig};
 use smp_core::catalog::Catalog;
 use smp_core::scan::{scan_with, ScanOptions, ScanProgress};
-use smp_core::source::{MusicSource, Which};
+use smp_core::source::{MusicSource, SourceError, Which};
 use smp_core::TrackId;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::connection::{monitor, AppSource, ConnStatus, Servers, StatusPayload};
 use crate::credentials::{CredentialStore, Keychain};
-use crate::provider::BannedSet;
-use crate::settings::{self, Settings};
+use crate::provider::{BannedSet, Playback};
+use crate::settings::{self, Settings, SettingsStore};
+use crate::writer::CatalogWriter;
 
 /// How often the UI is told to reload genres while a scan runs.
 const GENRES_REFRESH: Duration = Duration::from_secs(3);
@@ -35,7 +36,7 @@ pub struct NowPlaying {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ScanProgressPayload {
+pub struct ScanProgressPayload {
     seen: usize,
     read: usize,
     failed: usize,
@@ -57,6 +58,8 @@ impl From<&ScanProgress> for ScanProgressPayload {
 struct ScanDonePayload {
     ok: bool,
     cancelled: bool,
+    /// Why the app cancelled the scan (none when the user did).
+    cancel_reason: Option<String>,
     error: Option<String>,
     total: usize,
     read: usize,
@@ -71,11 +74,22 @@ struct TrackSkippedPayload {
     reason: String,
 }
 
+/// `get_scan_status` result.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanStatus {
+    pub scanning: bool,
+    pub progress: Option<ScanProgressPayload>,
+}
+
 pub struct AppState {
-    pub settings_path: PathBuf,
     pub catalog_path: PathBuf,
-    pub settings: Mutex<Settings>,
+    pub settings: SettingsStore,
+    /// Read connection for the playback path (the providers on the engine thread).
     pub catalog: Arc<Mutex<Catalog>>,
+    /// Read connection for commands and UI queries.
+    pub query: Mutex<Catalog>,
+    /// Performs every catalog write.
+    pub writer: CatalogWriter,
     pub banned: BannedSet,
     pub player: Player,
     pub source: Arc<AppSource>,
@@ -85,6 +99,8 @@ pub struct AppState {
     pub now_playing: Mutex<Option<NowPlaying>>,
     scanning: AtomicBool,
     cancel_scan: Arc<AtomicBool>,
+    cancel_reason: Mutex<Option<String>>,
+    scan_progress: Mutex<Option<ScanProgressPayload>>,
 }
 
 /// Locks a mutex, carrying on after a panic elsewhere (all state here stays valid).
@@ -106,8 +122,10 @@ impl AppState {
             .as_ref()
             .is_some_and(|s| !s.primary.username.trim().is_empty());
         let settings = loaded.unwrap_or_default();
-        let catalog = Catalog::open(&catalog_path)?;
-        let catalog_empty = catalog.is_empty()?;
+        let query = Catalog::open(&catalog_path)?;
+        let catalog_empty = query.is_empty()?;
+        let playback_db = Catalog::open(&catalog_path)?;
+        let writer = CatalogWriter::spawn(Catalog::open(&catalog_path)?)?;
         let creds: Arc<dyn CredentialStore> = Arc::new(Keychain);
 
         let source = Arc::new(AppSource::default());
@@ -122,14 +140,18 @@ impl AppState {
             events_tx,
             PlayerConfig::default(),
         );
-        apply_player_settings(&player, &settings);
+        send_mix_settings(&player, &settings);
+        if settings.device.is_some() {
+            player.send(Command::SetDevice(settings.device.clone()));
+        }
 
         let (wake_tx, wake_rx) = mpsc::channel();
         app.manage(AppState {
-            settings_path,
             catalog_path,
-            settings: Mutex::new(settings),
-            catalog: Arc::new(Mutex::new(catalog)),
+            settings: SettingsStore::new(settings_path, settings)?,
+            catalog: Arc::new(Mutex::new(playback_db)),
+            query: Mutex::new(query),
+            writer,
             banned: BannedSet::default(),
             player,
             source: source.clone(),
@@ -139,6 +161,8 @@ impl AppState {
             now_playing: Mutex::new(None),
             scanning: AtomicBool::new(false),
             cancel_scan: Arc::new(AtomicBool::new(false)),
+            cancel_reason: Mutex::new(None),
+            scan_progress: Mutex::new(None),
         });
 
         let handle = app.clone();
@@ -174,34 +198,45 @@ impl AppState {
         let _ = lock(&self.wake_monitor).send(());
     }
 
-    /// Replaces the servers after the settings changed and re-checks the connection.
+    /// Replaces the servers (fresh connections, forgetting a rejected password) and
+    /// re-checks the connection.
     pub fn reconnect(&self, settings: &Settings) {
         self.source
             .set(Some(Servers::from_settings(settings, self.creds.as_ref())));
         self.wake_monitor();
     }
 
-    /// Changes the settings in memory and on disk.
-    pub fn update_settings(&self, f: impl FnOnce(&mut Settings)) -> Result<Settings, String> {
-        let mut s = lock(&self.settings);
-        f(&mut s);
-        *s = s.clone().clamped();
-        s.save(&self.settings_path)
-            .map_err(|e| format!("Postavke nije moguće spremiti: {e}"))?;
-        Ok(s.clone())
+    /// What a new track provider needs.
+    pub fn playback(&self) -> Playback {
+        Playback {
+            db: self.catalog.clone(),
+            writer: self.writer.clone(),
+            banned: self.banned.clone(),
+        }
+    }
+
+    pub fn scan_status(&self) -> ScanStatus {
+        let scanning = self.scanning.load(Ordering::SeqCst);
+        ScanStatus {
+            scanning,
+            progress: lock(&self.scan_progress).clone().filter(|_| scanning),
+        }
     }
 }
 
-pub fn apply_player_settings(player: &Player, s: &Settings) {
+fn send_mix_settings(player: &Player, s: &Settings) {
     player.send(Command::SetVolume(s.volume));
-    if s.device.is_some() {
-        player.send(Command::SetDevice(s.device.clone()));
-    }
     player.send(Command::SetCrossfade {
         enabled: s.crossfade_enabled,
         secs: s.crossfade_secs,
     });
     player.send(Command::SetNormalize(s.normalize));
+}
+
+/// Applies all player-related settings, including `device: None` (system default).
+pub fn apply_player_settings(player: &Player, s: &Settings) {
+    send_mix_settings(player, s);
+    player.send(Command::SetDevice(s.device.clone()));
 }
 
 fn now_playing_of(catalog: &Catalog, id: TrackId, paused: bool) -> smp_core::Result<NowPlaying> {
@@ -235,7 +270,7 @@ fn on_player_event(app: &AppHandle, ev: Event) {
     match ev {
         Event::TrackStarted { id } => {
             let paused = lock(&st.now_playing).as_ref().is_some_and(|n| n.paused);
-            let np = match now_playing_of(&lock(&st.catalog), id, paused) {
+            let np = match now_playing_of(&lock(&st.query), id, paused) {
                 Ok(np) => Some(np),
                 Err(e) => {
                     log::warn!("track {id} not in catalog: {e}");
@@ -288,6 +323,8 @@ pub fn start_scan(app: &AppHandle) -> Result<(), String> {
         return Err("Skeniranje je već u tijeku.".into());
     }
     st.cancel_scan.store(false, Ordering::SeqCst);
+    *lock(&st.cancel_reason) = None;
+    *lock(&st.scan_progress) = Some(ScanProgressPayload::from(&ScanProgress::default()));
     let handle = app.clone();
     let spawned = std::thread::Builder::new()
         .name("scan".into())
@@ -299,8 +336,24 @@ pub fn start_scan(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-pub fn cancel_scan(st: &AppState) {
+/// Cancels a running scan; `reason` is reported in `scan-done` when the app (not the
+/// user) cancelled. Returns whether a scan was running.
+pub fn cancel_scan(st: &AppState, reason: Option<&str>) -> bool {
+    if !st.scanning.load(Ordering::SeqCst) {
+        return false;
+    }
+    *lock(&st.cancel_reason) = reason.map(str::to_string);
     st.cancel_scan.store(true, Ordering::SeqCst);
+    true
+}
+
+/// Text for a failed scan: connection problems in the words the status uses.
+fn scan_error_message(e: &smp_core::Error) -> String {
+    match e {
+        smp_core::Error::Source(SourceError::Auth) => ConnStatus::Auth.message().to_string(),
+        smp_core::Error::Source(_) => ConnStatus::Unreachable.message().to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn run_scan(app: &AppHandle) {
@@ -312,7 +365,9 @@ fn run_scan(app: &AppHandle) {
     );
     let mut last_genres = Instant::now();
     let mut progress = |p: &ScanProgress| {
-        let _ = app.emit("scan-progress", ScanProgressPayload::from(p));
+        let payload = ScanProgressPayload::from(p);
+        *lock(&st.scan_progress) = Some(payload.clone());
+        let _ = app.emit("scan-progress", payload);
         if last_genres.elapsed() >= GENRES_REFRESH {
             last_genres = Instant::now();
             let _ = app.emit("genres-changed", ());
@@ -328,6 +383,7 @@ fn run_scan(app: &AppHandle) {
         )
     });
     let cancelled = st.cancel_scan.load(Ordering::SeqCst);
+    let cancel_reason = lock(&st.cancel_reason).take().filter(|_| cancelled);
     let payload = match result {
         Ok(r) => {
             log::info!(
@@ -343,6 +399,7 @@ fn run_scan(app: &AppHandle) {
             ScanDonePayload {
                 ok: true,
                 cancelled,
+                cancel_reason,
                 error: None,
                 total: r.total,
                 read: r.read,
@@ -354,18 +411,16 @@ fn run_scan(app: &AppHandle) {
         Err(e) => {
             log::warn!("scan failed: {e}");
             st.wake_monitor();
-            let error = match &e {
-                smp_core::Error::Source(_) => ConnStatus::Unreachable.message().to_string(),
-                other => other.to_string(),
-            };
             ScanDonePayload {
                 cancelled,
-                error: Some(error),
+                cancel_reason,
+                error: Some(scan_error_message(&e)),
                 ..Default::default()
             }
         }
     };
     st.scanning.store(false, Ordering::SeqCst);
+    *lock(&st.scan_progress) = None;
     let _ = app.emit("genres-changed", ());
     let _ = app.emit("scan-done", payload);
 }
@@ -391,5 +446,17 @@ mod tests {
         assert_eq!(np.album, "");
         assert_eq!(np.genre_display, "Chillout, Trance");
         assert!(np.paused);
+    }
+
+    #[test]
+    fn scan_errors_use_the_matching_status_text() {
+        let auth = smp_core::Error::Source(SourceError::Auth);
+        assert_eq!(scan_error_message(&auth), ConnStatus::Auth.message());
+        for e in [SourceError::Unreachable, SourceError::Timeout] {
+            let e = smp_core::Error::Source(e);
+            assert_eq!(scan_error_message(&e), ConnStatus::Unreachable.message());
+        }
+        let other = smp_core::Error::Other("disk full".into());
+        assert_eq!(scan_error_message(&other), "disk full");
     }
 }

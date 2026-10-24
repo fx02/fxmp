@@ -1,4 +1,8 @@
 //! Track providers over the catalog: a genre shuffle or an album in order.
+//!
+//! The player calls a provider on its audio engine thread, so a provider only reads
+//! (on a connection of its own, which a scan's write transaction never blocks under
+//! WAL) and hands every write to the [`CatalogWriter`].
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -10,8 +14,19 @@ use smp_core::catalog::{selection_key, Catalog};
 use smp_core::shuffle::{entropy_shuffler, Shuffler};
 use smp_core::TrackId;
 
+use crate::writer::CatalogWriter;
+
 /// Tracks banned while the app runs, so a running shuffle stops handing them out.
 pub type BannedSet = Arc<Mutex<HashSet<TrackId>>>;
+
+/// What a provider needs while playing.
+#[derive(Clone)]
+pub struct Playback {
+    /// Read connection used only on the playback path.
+    pub db: Arc<Mutex<Catalog>>,
+    pub writer: CatalogWriter,
+    pub banned: BannedSet,
+}
 
 enum Order {
     Shuffle {
@@ -23,29 +38,25 @@ enum Order {
 }
 
 pub struct CatalogProvider {
-    catalog: Arc<Mutex<Catalog>>,
-    banned: BannedSet,
+    ctx: Playback,
     order: Order,
 }
 
 impl CatalogProvider {
-    /// Fresh shuffle of the playable tracks in `genre_keys` (empty = everything).
+    /// Fresh shuffle of the playable tracks in `genre_keys` (empty = everything);
+    /// `query` is used to build the pool.
     pub fn shuffle(
-        catalog: Arc<Mutex<Catalog>>,
-        banned: BannedSet,
+        query: &Catalog,
+        ctx: Playback,
         genre_keys: &[String],
     ) -> smp_core::Result<Self> {
         let selection_key = selection_key(genre_keys);
-        let shuffler = {
-            let c = lock(&catalog);
-            entropy_shuffler(
-                c.playable_tracks(genre_keys)?,
-                c.last_first(&selection_key)?,
-            )
-        };
+        let shuffler = entropy_shuffler(
+            query.playable_tracks(genre_keys)?,
+            query.last_first(&selection_key)?,
+        );
         Ok(Self {
-            catalog,
-            banned,
+            ctx,
             order: Order::Shuffle {
                 shuffler: Box::new(shuffler),
                 selection_key,
@@ -56,22 +67,19 @@ impl CatalogProvider {
 
     /// An album in track order, without banned tracks.
     pub fn album(
-        catalog: Arc<Mutex<Catalog>>,
-        banned: BannedSet,
+        query: &Catalog,
+        ctx: Playback,
         artist: &str,
         album: &str,
     ) -> smp_core::Result<Self> {
-        let tracks = {
-            let c = lock(&catalog);
-            let banned: HashSet<TrackId> = c.banned()?.into_iter().map(|t| t.id).collect();
-            c.album_tracks(artist, album)?
-                .into_iter()
-                .filter(|id| !banned.contains(id))
-                .collect()
-        };
+        let banned: HashSet<TrackId> = query.banned()?.into_iter().map(|t| t.id).collect();
+        let tracks = query
+            .album_tracks(artist, album)?
+            .into_iter()
+            .filter(|id| !banned.contains(id))
+            .collect();
         Ok(Self {
-            catalog,
-            banned,
+            ctx,
             order: Order::Album(tracks),
         })
     }
@@ -91,32 +99,20 @@ impl CatalogProvider {
     }
 }
 
-/// The catalog stays usable after a panic elsewhere; its state is all in SQLite.
-fn lock(catalog: &Mutex<Catalog>) -> std::sync::MutexGuard<'_, Catalog> {
-    catalog.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 impl TrackProvider for CatalogProvider {
     fn next_track(&mut self) -> Option<PlayItem> {
         loop {
             let id = self.next_id()?;
-            if self
-                .banned
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&id)
-            {
+            if crate::state::lock(&self.ctx.banned).contains(&id) {
                 self.forget(id);
                 continue;
             }
-            let catalog = self.catalog.clone();
-            let c = lock(&catalog);
-            let row = match c.track(id) {
+            let row = crate::state::lock(&self.ctx.db).track(id);
+            let row = match row {
                 Ok(row) => row,
                 Err(e) => {
                     // Removed by a rescan since the run started.
                     log::debug!("track {id} unavailable: {e}");
-                    drop(c);
                     self.forget(id);
                     continue;
                 }
@@ -129,9 +125,10 @@ impl TrackProvider for CatalogProvider {
             {
                 if !*first_recorded {
                     *first_recorded = true;
-                    if let Err(e) = c.set_last_first(selection_key, id) {
-                        log::warn!("cannot remember first track: {e}");
-                    }
+                    let key = selection_key.clone();
+                    self.ctx
+                        .writer
+                        .send("first track", move |c| c.set_last_first(&key, id));
                 }
             }
             return Some(PlayItem {
@@ -143,22 +140,20 @@ impl TrackProvider for CatalogProvider {
     }
 
     fn on_failed(&mut self, id: TrackId) {
-        if let Err(e) = lock(&self.catalog).record_failure(id) {
-            log::warn!("cannot record failure of track {id}: {e}");
-        }
+        self.ctx
+            .writer
+            .send("failure", move |c| c.record_failure(id).map(drop));
         self.forget(id);
     }
 
     fn on_played(&mut self, id: TrackId, measured_lufs: Option<f32>) {
-        let c = lock(&self.catalog);
-        if let Err(e) = c.record_success(id) {
-            log::warn!("cannot reset failures of track {id}: {e}");
-        }
-        if let Some(lufs) = measured_lufs {
-            if let Err(e) = c.set_measured_lufs(id, lufs) {
-                log::warn!("cannot store loudness of track {id}: {e}");
+        self.ctx.writer.send("played", move |c| {
+            c.record_success(id)?;
+            match measured_lufs {
+                Some(lufs) => c.set_measured_lufs(id, lufs),
+                None => Ok(()),
             }
-        }
+        });
     }
 }
 
@@ -166,6 +161,7 @@ impl TrackProvider for CatalogProvider {
 mod tests {
     use super::*;
     use smp_core::catalog::TrackMeta;
+    use std::time::{Duration, Instant};
 
     fn track(cat: &Catalog, path: &str, genre: &str, album: Option<(&str, u32)>) -> TrackId {
         let meta = TrackMeta {
@@ -179,42 +175,72 @@ mod tests {
         cat.upsert_track(path, 1, 1, &meta).unwrap()
     }
 
-    fn catalog() -> (Arc<Mutex<Catalog>>, Vec<TrackId>) {
-        let cat = Catalog::open_in_memory().unwrap();
-        let ids = (0..5)
-            .map(|i| track(&cat, &format!("t/{i}.mp3"), "Trance", None))
-            .collect();
-        track(&cat, "j/0.mp3", "Jazz", None);
-        cat.rebuild_genres().unwrap();
-        (Arc::new(Mutex::new(cat)), ids)
+    /// A catalog file with a query connection (also used for setup and checks) and
+    /// the playback context (own read connection, writer thread).
+    struct Fx {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        query: Catalog,
+        ctx: Playback,
     }
 
-    fn banned() -> BannedSet {
-        Arc::default()
+    impl Fx {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("catalog.db");
+            let query = Catalog::open(&path).unwrap();
+            let ctx = Playback {
+                db: Arc::new(Mutex::new(Catalog::open(&path).unwrap())),
+                writer: CatalogWriter::spawn(Catalog::open(&path).unwrap()).unwrap(),
+                banned: BannedSet::default(),
+            };
+            Self {
+                _dir: dir,
+                path,
+                query,
+                ctx,
+            }
+        }
+
+        /// Five Trance tracks and one Jazz track; returns the Trance ids.
+        fn with_genres() -> (Self, Vec<TrackId>) {
+            let fx = Self::new();
+            let ids = (0..5)
+                .map(|i| track(&fx.query, &format!("t/{i}.mp3"), "Trance", None))
+                .collect();
+            track(&fx.query, "j/0.mp3", "Jazz", None);
+            fx.query.rebuild_genres().unwrap();
+            (fx, ids)
+        }
+
+        fn shuffle(&self, keys: &[String]) -> CatalogProvider {
+            CatalogProvider::shuffle(&self.query, self.ctx.clone(), keys).unwrap()
+        }
+
+        /// Waits until queued writes are done.
+        fn flush(&self) {
+            self.ctx.writer.call(|_| Ok(())).unwrap();
+        }
     }
 
     #[test]
     fn catalog_provider_records_last_first_and_failures() {
-        let (cat, trance) = catalog();
+        let (fx, trance) = Fx::with_genres();
         let keys = vec!["trance".to_string()];
         let key = selection_key(&keys);
 
-        let mut p = CatalogProvider::shuffle(cat.clone(), banned(), &keys).unwrap();
-        assert_eq!(cat.lock().unwrap().last_first(&key).unwrap(), None);
+        let mut p = fx.shuffle(&keys);
+        assert_eq!(fx.query.last_first(&key).unwrap(), None);
         let first = p.next_track().unwrap();
         assert!(trance.contains(&first.id));
-        assert_eq!(
-            cat.lock().unwrap().last_first(&key).unwrap(),
-            Some(first.id)
-        );
+        fx.flush();
+        assert_eq!(fx.query.last_first(&key).unwrap(), Some(first.id));
 
         // Only the first track of the run is recorded.
         let second = p.next_track().unwrap();
         assert_ne!(second.id, first.id);
-        assert_eq!(
-            cat.lock().unwrap().last_first(&key).unwrap(),
-            Some(first.id)
-        );
+        fx.flush();
+        assert_eq!(fx.query.last_first(&key).unwrap(), Some(first.id));
 
         // A failed track is counted in the catalog and leaves this run's shuffle.
         p.on_failed(second.id);
@@ -223,7 +249,8 @@ mod tests {
         }
         p.on_failed(second.id);
         p.on_failed(second.id);
-        let playable = cat.lock().unwrap().playable_tracks(&keys).unwrap();
+        fx.flush();
+        let playable = fx.query.playable_tracks(&keys).unwrap();
         assert!(
             !playable.contains(&second.id),
             "3 failures exclude the track"
@@ -231,76 +258,113 @@ mod tests {
 
         // The next run of the same selection avoids the previous first track.
         for _ in 0..20 {
-            let prev = cat.lock().unwrap().last_first(&key).unwrap();
-            let mut p = CatalogProvider::shuffle(cat.clone(), banned(), &keys).unwrap();
-            let id = p.next_track().unwrap().id;
+            let prev = fx.query.last_first(&key).unwrap();
+            let id = fx.shuffle(&keys).next_track().unwrap().id;
             assert_ne!(Some(id), prev);
-            assert_eq!(cat.lock().unwrap().last_first(&key).unwrap(), Some(id));
+            fx.flush();
+            assert_eq!(fx.query.last_first(&key).unwrap(), Some(id));
         }
     }
 
     #[test]
     fn on_played_resets_failures_and_stores_loudness() {
-        let (cat, _) = catalog();
-        let keys = vec!["jazz".to_string()];
-        let mut p = CatalogProvider::shuffle(cat.clone(), banned(), &keys).unwrap();
+        let (fx, _) = Fx::with_genres();
+        let mut p = fx.shuffle(&["jazz".to_string()]);
         let item = p.next_track().unwrap();
         assert_eq!(item.gain_db, 0.0, "no ReplayGain, not measured yet");
         p.on_failed(item.id);
         p.on_failed(item.id);
         p.on_played(item.id, Some(-8.0));
-        let c = cat.lock().unwrap();
-        assert_eq!(c.track(item.id).unwrap().measured_lufs, Some(-8.0));
-        assert_eq!(c.record_failure(item.id).unwrap(), 1, "failures were reset");
+        fx.flush();
+        assert_eq!(fx.query.track(item.id).unwrap().measured_lufs, Some(-8.0));
+        assert_eq!(
+            fx.query.record_failure(item.id).unwrap(),
+            1,
+            "failures were reset"
+        );
     }
 
     #[test]
     fn gain_comes_from_replaygain_or_measured_loudness_clamped() {
-        let cat = Catalog::open_in_memory().unwrap();
+        let fx = Fx::new();
         let meta = TrackMeta {
             raw_genre: Some("Rock".into()),
             rg_track_gain_db: Some(-30.0),
             ..Default::default()
         };
-        let rg = cat.upsert_track("a.mp3", 1, 1, &meta).unwrap();
-        let measured = track(&cat, "b.mp3", "Pop", None);
-        cat.set_measured_lufs(measured, -24.0).unwrap();
-        cat.rebuild_genres().unwrap();
-        let cat = Arc::new(Mutex::new(cat));
+        let rg = fx.query.upsert_track("a.mp3", 1, 1, &meta).unwrap();
+        let measured = track(&fx.query, "b.mp3", "Pop", None);
+        fx.query.set_measured_lufs(measured, -24.0).unwrap();
+        fx.query.rebuild_genres().unwrap();
 
-        let mut p = CatalogProvider::shuffle(cat.clone(), banned(), &["rock".into()]).unwrap();
-        let item = p.next_track().unwrap();
+        let item = fx.shuffle(&["rock".into()]).next_track().unwrap();
         assert_eq!(item.id, rg);
         assert_eq!(item.gain_db, -15.0, "clamped to [-15, +6]");
 
-        let mut p = CatalogProvider::shuffle(cat, banned(), &["pop".into()]).unwrap();
-        let item = p.next_track().unwrap();
+        let item = fx.shuffle(&["pop".into()]).next_track().unwrap();
         assert_eq!(item.rel_path, "b.mp3");
         assert_eq!(item.gain_db, 6.0, "-18 LUFS target from -24, clamped to +6");
     }
 
     #[test]
     fn album_plays_in_order_without_banned_tracks() {
-        let cat = Catalog::open_in_memory().unwrap();
-        let t3 = track(&cat, "al/3.mp3", "Rock", Some(("Album", 3)));
-        let t1 = track(&cat, "al/1.mp3", "Rock", Some(("Album", 1)));
-        let t2 = track(&cat, "al/2.mp3", "Rock", Some(("Album", 2)));
-        cat.set_banned(t2, true).unwrap();
-        let cat = Arc::new(Mutex::new(cat));
+        let fx = Fx::new();
+        let t3 = track(&fx.query, "al/3.mp3", "Rock", Some(("Album", 3)));
+        let t1 = track(&fx.query, "al/1.mp3", "Rock", Some(("Album", 1)));
+        let t2 = track(&fx.query, "al/2.mp3", "Rock", Some(("Album", 2)));
+        fx.query.set_banned(t2, true).unwrap();
 
-        let mut p = CatalogProvider::album(cat, banned(), "Artist", "Album").unwrap();
+        let mut p = CatalogProvider::album(&fx.query, fx.ctx.clone(), "Artist", "Album").unwrap();
         let got: Vec<_> = std::iter::from_fn(|| p.next_track().map(|i| i.id)).collect();
         assert_eq!(got, vec![t1, t3]);
     }
 
     #[test]
     fn tracks_banned_during_a_run_are_skipped() {
-        let (cat, trance) = catalog();
-        let banned = banned();
-        let mut p = CatalogProvider::shuffle(cat, banned.clone(), &["trance".into()]).unwrap();
-        banned.lock().unwrap().insert(trance[0]);
+        let (fx, trance) = Fx::with_genres();
+        let mut p = fx.shuffle(&["trance".into()]);
+        fx.ctx.banned.lock().unwrap().insert(trance[0]);
         for _ in 0..30 {
             assert_ne!(p.next_track().unwrap().id, trance[0]);
         }
+    }
+
+    #[test]
+    fn provider_calls_do_not_wait_for_another_writer() {
+        let (fx, ids) = Fx::with_genres();
+        let mut p = fx.shuffle(&["trance".into()]);
+
+        // Another connection (a scan, say) holds the write lock.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut blocker = Catalog::open(&fx.path).unwrap();
+        let holder = std::thread::spawn(move || {
+            blocker
+                .transaction(|c| {
+                    c.set_last_first("blocker", 1)?;
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let t = Instant::now();
+        let item = p.next_track().unwrap();
+        p.on_played(item.id, Some(-20.0));
+        let other = *ids.iter().find(|&&i| i != item.id).unwrap();
+        p.on_failed(other);
+        let took = t.elapsed();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(took < Duration::from_millis(50), "took {took:?}");
+
+        // The writes still land once the lock is free.
+        fx.flush();
+        let key = selection_key(&["trance".into()]);
+        assert_eq!(fx.query.last_first(&key).unwrap(), Some(item.id));
+        assert_eq!(fx.query.track(item.id).unwrap().measured_lufs, Some(-20.0));
+        assert_eq!(fx.query.record_failure(other).unwrap(), 2);
     }
 }

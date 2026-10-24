@@ -7,6 +7,9 @@ mod credentials;
 mod provider;
 mod settings;
 mod state;
+mod writer;
+
+use tauri::Manager;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,smb=warn"))
@@ -23,6 +26,7 @@ fn main() {
             commands::get_connection_status,
             commands::start_scan,
             commands::cancel_scan,
+            commands::get_scan_status,
             commands::get_genres,
             commands::play_genres,
             commands::play_album,
@@ -41,6 +45,15 @@ fn main() {
             commands::list_albums,
             commands::now_playing,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(st) = app.try_state::<state::AppState>() {
+                    if let Err(e) = st.settings.flush() {
+                        log::warn!("cannot save settings on exit: {e}");
+                    }
+                }
+            }
+        });
 }
