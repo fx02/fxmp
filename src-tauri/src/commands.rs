@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn merge_target_must_be_a_known_genre() {
-        assert_eq!(merge_target(" dnb ").unwrap(), "Drum & Bass");
+        assert_eq!(merge_target(" dnb ").unwrap(), "Drum & bass");
         assert_eq!(merge_target("chillout").unwrap(), "Chillout");
         assert_eq!(merge_target("  ").unwrap_err(), "Choose a genre.");
         assert_eq!(

@@ -3,117 +3,238 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use lofty::id3::v1::GENRES;
+/// The ID3v1 genres with the Winamp extensions, codes 0–191, named as in
+/// <https://en.wikipedia.org/wiki/List_of_ID3v1_genres>. These are the known genres,
+/// except [`OTHER_CODE`].
+pub const ID3V1_GENRES: [&str; 192] = [
+    "Blues",
+    "Classic rock",
+    "Country",
+    "Dance",
+    "Disco",
+    "Funk",
+    "Grunge",
+    "Hip-hop",
+    "Jazz",
+    "Metal",
+    "New age",
+    "Oldies",
+    "Other",
+    "Pop",
+    "Rhythm and blues",
+    "Rap",
+    "Reggae",
+    "Rock",
+    "Techno",
+    "Industrial",
+    "Alternative",
+    "Ska",
+    "Death metal",
+    "Pranks",
+    "Soundtrack",
+    "Euro-techno",
+    "Ambient",
+    "Trip-hop",
+    "Vocal",
+    "Jazz & funk",
+    "Fusion",
+    "Trance",
+    "Classical",
+    "Instrumental",
+    "Acid",
+    "House",
+    "Game",
+    "Sound clip",
+    "Gospel",
+    "Noise",
+    "Alternative rock",
+    "Bass",
+    "Soul",
+    "Punk",
+    "Space",
+    "Meditative",
+    "Instrumental pop",
+    "Instrumental rock",
+    "Ethnic",
+    "Gothic",
+    "Darkwave",
+    "Techno-industrial",
+    "Electronic",
+    "Pop-folk",
+    "Eurodance",
+    "Dream",
+    "Southern rock",
+    "Comedy",
+    "Cult",
+    "Gangsta",
+    "Top 40",
+    "Christian rap",
+    "Pop/funk",
+    "Jungle music",
+    "Native US",
+    "Cabaret",
+    "New wave",
+    "Psychedelic",
+    "Rave",
+    "Showtunes",
+    "Trailer",
+    "Lo-fi",
+    "Tribal",
+    "Acid punk",
+    "Acid jazz",
+    "Polka",
+    "Retro",
+    "Musical",
+    "Rock 'n' roll",
+    "Hard rock",
+    "Folk",
+    "Folk rock",
+    "National folk",
+    "Swing",
+    "Fast fusion",
+    "Bebop",
+    "Latin",
+    "Revival",
+    "Celtic",
+    "Bluegrass",
+    "Avantgarde",
+    "Gothic rock",
+    "Progressive rock",
+    "Psychedelic rock",
+    "Symphonic rock",
+    "Slow rock",
+    "Big band",
+    "Chorus",
+    "Easy listening",
+    "Acoustic",
+    "Humour",
+    "Speech",
+    "Chanson",
+    "Opera",
+    "Chamber music",
+    "Sonata",
+    "Symphony",
+    "Booty bass",
+    "Primus",
+    "Porn groove",
+    "Satire",
+    "Slow jam",
+    "Club",
+    "Tango",
+    "Samba",
+    "Folklore",
+    "Ballad",
+    "Power ballad",
+    "Rhythmic Soul",
+    "Freestyle",
+    "Duet",
+    "Punk rock",
+    "Drum solo",
+    "A cappella",
+    "Euro-house",
+    "Dance hall",
+    "Goa music",
+    "Drum & bass",
+    "Club-house",
+    "Hardcore techno",
+    "Terror",
+    "Indie",
+    "Britpop",
+    "Negerpunk",
+    "Polsk punk",
+    "Beat",
+    "Christian gangsta rap",
+    "Heavy metal",
+    "Black metal",
+    "Crossover",
+    "Contemporary Christian",
+    "Christian rock",
+    "Merengue",
+    "Salsa",
+    "Thrash metal",
+    "Anime",
+    "Jpop",
+    "Synthpop",
+    "Christmas",
+    "Art rock",
+    "Baroque",
+    "Bhangra",
+    "Big beat",
+    "Breakbeat",
+    "Chillout",
+    "Downtempo",
+    "Dub",
+    "EBM",
+    "Eclectic",
+    "Electro",
+    "Electroclash",
+    "Emo",
+    "Experimental",
+    "Garage",
+    "Global",
+    "IDM",
+    "Illbient",
+    "Industro-Goth",
+    "Jam band",
+    "Krautrock",
+    "Leftfield",
+    "Lounge",
+    "Math rock",
+    "New romantic",
+    "Nu-breakz",
+    "Post-punk",
+    "Post-rock",
+    "Psytrance",
+    "Shoegaze",
+    "Space rock",
+    "Trop rock",
+    "World music",
+    "Neoclassical",
+    "Audiobook",
+    "Audio theatre",
+    "Neue Deutsche Welle",
+    "Podcast",
+    "Indie rock",
+    "G-Funk",
+    "Dubstep",
+    "Garage rock",
+    "Psybient",
+];
 
-/// Aliases applied to the normalized key (already lowercase alphanumeric).
+/// "Other" is a placeholder, not a genre: it goes to Unknown.
+const OTHER_CODE: usize = 12;
+
+/// Aliases applied to the normalized key (already lowercase alphanumeric). Each one
+/// targets the key of a name in [`ID3V1_GENRES`].
 pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("dnb", "drumandbass"),
     ("dandb", "drumandbass"),
     ("drumnbass", "drumandbass"),
-    ("hiphop", "hiphop"),
     ("raphiphop", "hiphop"),
-    ("rnb", "randb"),
-    ("rhythmandblues", "randb"),
+    ("rnb", "rhythmandblues"),
+    ("randb", "rhythmandblues"),
     ("psychedelictrance", "psytrance"),
-    ("goamusic", "goa"),
-    ("goatrance", "goa"),
+    ("goa", "goamusic"),
+    ("goatrance", "goamusic"),
     ("rocknroll", "rockandroll"),
-    ("worldmusic", "world"),
+    ("jungle", "junglemusic"),
+    ("world", "worldmusic"),
     ("electronica", "electronic"),
-    ("children", "childrens"),
 ];
 
-/// Common genres missing from the ID3v1/Winamp list, or spelled better here.
-/// Listed first, so these spellings win over the ID3 ones with the same key.
-const MODERN_GENRES: &[&str] = &[
-    "Chillout",
-    "Downtempo",
-    "Lounge",
-    "Trip-Hop",
-    "Deep House",
-    "Progressive House",
-    "Tech House",
-    "Electro House",
-    "Minimal",
-    "Techno",
-    "Dubstep",
-    "Breakbeat",
-    "Drum & Bass",
-    "Jungle",
-    "Hardstyle",
-    "Psytrance",
-    "Goa",
-    "Progressive Trance",
-    "Uplifting Trance",
-    "Ambient",
-    "IDM",
-    "Synthpop",
-    "Indie",
-    "Indie Rock",
-    "Alternative",
-    "Post-Rock",
-    "Metalcore",
-    "Death Metal",
-    "Black Metal",
-    "Thrash Metal",
-    "Nu Metal",
-    "Punk",
-    "Grunge",
-    "Blues",
-    "Funk",
-    "Disco",
-    "Soul",
-    "R&B",
-    "Hip-Hop",
-    "Rap",
-    "Trap",
-    "Reggaeton",
-    "Latin",
-    "World",
-    "Folk",
-    "Country",
-    "Singer-Songwriter",
-    "Classical",
-    "Opera",
-    "Soundtrack",
-    "Jazz",
-    "Smooth Jazz",
-    "Nu Jazz",
-    "Acid Jazz",
-    "Swing",
-    "Bossa Nova",
-    "Gospel",
-    "Christmas",
-    "Children's",
-    "Oldies",
-    "Schlager",
-    "Chanson",
-    "K-Pop",
-    "J-Pop",
-    "Ska",
-    "Reggae",
-    "Dub",
-    "Electronic",
-    "Dance",
-    "Pop",
-    "Rock",
-    "Hard Rock",
-    "Heavy Metal",
-    "New Wave",
-    "Rock & Roll",
-    "National Folk",
-    "Classic Rock",
-];
-
-/// Placeholder or offensive names that never count as a genre, by key.
-const NOT_GENRES: &[&str] = &[
-    "other",
-    "misc",
-    "miscellaneous",
-    "unknown",
-    "genre",
-    "none",
-    "negerpunk",
+/// Common subgenres that are not in [`ID3V1_GENRES`], filed under their parent
+/// genre (by key). Kept short on purpose: only names that are both frequent in tags
+/// and clearly part of one listed genre.
+const SUBGENRE_PARENTS: &[(&str, &str)] = &[
+    ("deephouse", "house"),
+    ("progressivehouse", "house"),
+    ("techhouse", "house"),
+    ("electrohouse", "house"),
+    ("progressivetrance", "trance"),
+    ("upliftingtrance", "trance"),
+    ("vocaltrance", "trance"),
+    ("numetal", "metal"),
+    ("smoothjazz", "jazz"),
 ];
 
 /// Split a raw genre tag value into individual genre names.
@@ -141,7 +262,7 @@ fn id3v1_name(part: &str) -> Option<&'static str> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    GENRES.get(digits.parse::<usize>().ok()?).copied()
+    ID3V1_GENRES.get(digits.parse::<usize>().ok()?).copied()
 }
 
 /// Normalized comparison key for a genre name.
@@ -176,44 +297,32 @@ pub struct KnownGenre {
     pub display: String,
 }
 
-/// Known genres by key: [`MODERN_GENRES`], then the ID3v1/Winamp list (codes 0–191).
-fn known_genres() -> &'static HashMap<String, String> {
-    static KNOWN: OnceLock<HashMap<String, String>> = OnceLock::new();
+/// Known genres by key, with their display names from [`ID3V1_GENRES`].
+fn known_genres() -> &'static HashMap<String, &'static str> {
+    static KNOWN: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
     KNOWN.get_or_init(|| {
-        let mut map = HashMap::new();
-        for name in MODERN_GENRES.iter().chain(GENRES.iter()) {
-            let key = genre_key(name);
-            if !NOT_GENRES.contains(&key.as_str()) {
-                map.entry(key).or_insert_with(|| title_case(name));
-            }
-        }
-        map
+        ID3V1_GENRES
+            .iter()
+            .enumerate()
+            .filter(|(code, _)| *code != OTHER_CODE)
+            .map(|(_, name)| (genre_key(name), *name))
+            .collect()
     })
 }
 
-/// "Classic rock" -> "Classic Rock"; other letters are left as they are.
-fn title_case(name: &str) -> String {
-    name.split(' ')
-        .map(|w| {
-            let mut c = w.chars();
-            c.next()
-                .map(|f| f.to_uppercase().chain(c).collect())
-                .unwrap_or_default()
-        })
-        .collect::<Vec<String>>()
-        .join(" ")
-}
-
-/// The known genre `name` stands for (by key or alias), or `None`.
+/// The known genre `name` stands for (by key, alias or parent genre), or `None`.
 pub fn known_genre(name: &str) -> Option<KnownGenre> {
-    let key = genre_key(name);
-    let display = known_genres().get(&key)?.clone();
+    let mut key = genre_key(name);
+    if let Some((_, parent)) = SUBGENRE_PARENTS.iter().find(|(sub, _)| *sub == key) {
+        key = parent.to_string();
+    }
+    let display = known_genres().get(&key)?.to_string();
     Some(KnownGenre { key, display })
 }
 
 /// Display names of all known genres, sorted case-insensitively.
 pub fn known_genre_names() -> Vec<String> {
-    let mut names: Vec<String> = known_genres().values().cloned().collect();
+    let mut names: Vec<String> = known_genres().values().map(|n| n.to_string()).collect();
     names.sort_by_key(|n| n.to_lowercase());
     names
 }
@@ -251,8 +360,8 @@ mod tests {
         }
         assert_eq!(genre_key("Chill Out"), genre_key("Chillout"));
         assert_ne!(genre_key("Trance"), genre_key("Techno"));
-        assert_eq!(genre_key("R&B"), "randb");
-        assert_eq!(genre_key("RnB"), "randb");
+        assert_eq!(genre_key("R&B"), "rhythmandblues");
+        assert_eq!(genre_key("RnB"), "rhythmandblues");
         assert_eq!(genre_key("Hip-Hop"), "hiphop");
     }
 
@@ -286,65 +395,82 @@ mod tests {
     }
 
     #[test]
-    fn aliases_map_to_canonical_names() {
+    fn aliases_map_to_names_from_the_list() {
         let cases = [
-            ("dnb", "Drum & Bass"),
-            ("D&B", "Drum & Bass"),
-            ("drum n bass", "Drum & Bass"),
-            ("Drum'n'Bass", "Drum & Bass"),
-            ("hip hop", "Hip-Hop"),
-            ("HipHop", "Hip-Hop"),
-            ("Rap/Hip-Hop", "Hip-Hop"),
-            ("rnb", "R&B"),
-            ("R'n'B", "R&B"),
+            ("dnb", "Drum & bass"),
+            ("D&B", "Drum & bass"),
+            ("drum n bass", "Drum & bass"),
+            ("Drum'n'Bass", "Drum & bass"),
+            ("hip hop", "Hip-hop"),
+            ("HipHop", "Hip-hop"),
+            ("Rap/Hip-Hop", "Hip-hop"),
+            ("rnb", "Rhythm and blues"),
+            ("R&B", "Rhythm and blues"),
+            ("R'n'B", "Rhythm and blues"),
             ("chill out", "Chillout"),
             ("Chill-Out", "Chillout"),
             ("psy trance", "Psytrance"),
             ("Psy-Trance", "Psytrance"),
-            ("trip hop", "Trip-Hop"),
+            ("trip hop", "Trip-hop"),
             ("synth-pop", "Synthpop"),
-            ("Rock \u{2019}n\u{2019} Roll", "Rock & Roll"),
-            ("rock n roll", "Rock & Roll"),
-            ("classic rock", "Classic Rock"),
+            ("Rock \u{2019}n\u{2019} Roll", "Rock 'n' roll"),
+            ("rock n roll", "Rock 'n' roll"),
+            ("classic rock", "Classic rock"),
             ("TRANCE", "Trance"),
-            ("deep house", "Deep House"),
-            ("Goa music", "Goa"),
+            ("Goa", "Goa music"),
+            ("Jungle", "Jungle music"),
+            ("World", "World music"),
         ];
         for (name, want) in cases {
             assert_eq!(known(name).as_deref(), Some(want), "{name:?}");
         }
         let dnb = known_genre("dnb").unwrap();
-        assert_eq!(dnb.key, genre_key("Drum & Bass"));
+        assert_eq!(dnb.key, genre_key("Drum & bass"));
     }
 
     #[test]
-    fn id3_codes_resolve_to_known_genres_except_other() {
+    fn common_subgenres_go_to_their_parent() {
+        for (name, want) in [
+            ("Deep House", "House"),
+            ("progressive house", "House"),
+            ("Tech-House", "House"),
+            ("Progressive Trance", "Trance"),
+            ("Uplifting Trance", "Trance"),
+            ("Nu Metal", "Metal"),
+            ("Nu-Metal", "Metal"),
+        ] {
+            let g = known_genre(name).unwrap();
+            assert_eq!(g.display, want, "{name}");
+            assert_eq!(g.key, genre_key(want), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_known_list_is_exactly_the_id3v1_list_without_other() {
+        assert_eq!(ID3V1_GENRES[0], "Blues");
+        assert_eq!(ID3V1_GENRES[12], "Other");
+        assert_eq!(ID3V1_GENRES[148], "Christmas");
+        assert_eq!(ID3V1_GENRES[191], "Psybient");
         assert_eq!(known(&split_genres("(31)")[0]).as_deref(), Some("Trance"));
         assert_eq!(known(&split_genres("12")[0]), None, "12 is Other");
-        for (i, name) in GENRES.iter().enumerate() {
-            if !matches!(*name, "Other" | "Negerpunk") {
-                assert!(known(name).is_some(), "ID3 {i} {name}");
-            }
+        let names = known_genre_names();
+        assert_eq!(names.len(), 191);
+        let mut expected: Vec<&str> = ID3V1_GENRES
+            .iter()
+            .copied()
+            .filter(|n| *n != "Other")
+            .collect();
+        expected.sort_by_key(|s| s.to_lowercase());
+        assert_eq!(names, expected, "verbatim names, sorted");
+        // Names not in the list are not genres, however common.
+        for n in ["K-Pop", "Hardstyle", "Reggaeton", "Trap"] {
+            assert_eq!(known(n), None, "{n}");
         }
     }
 
     #[test]
-    fn known_names_are_sorted_unique_and_include_modern_genres() {
+    fn known_names_are_unique_by_key_and_canonical() {
         let names = known_genre_names();
-        for n in [
-            "Chillout",
-            "Drum & Bass",
-            "Hip-Hop",
-            "K-Pop",
-            "Children's",
-            "Unknown",
-        ] {
-            assert_eq!(names.iter().any(|x| x == n), n != "Unknown", "{n}");
-        }
-        assert!(!names.iter().any(|x| x == "Other"));
-        let mut sorted = names.clone();
-        sorted.sort_by_key(|s| s.to_lowercase());
-        assert_eq!(names, sorted);
         let keys: std::collections::HashSet<String> = names.iter().map(|n| genre_key(n)).collect();
         assert_eq!(keys.len(), names.len(), "one display per key");
         for n in &names {

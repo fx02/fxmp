@@ -12,7 +12,7 @@ use crate::{Result, TrackId};
 
 /// Version of the genre rules. Opening a catalog older than this re-derives its genres
 /// from the stored tags, so a change to the rules needs no rescan.
-const GENRE_VERSION: i64 = 1;
+const GENRE_VERSION: i64 = 2;
 /// Consecutive failures after which a track leaves the shuffle until the next scan.
 const MAX_FAILS: i64 = 3;
 
@@ -687,7 +687,7 @@ mod tests {
         let d = add(&c, "b.mp3", Some("dnb"));
         c.rebuild_genres().unwrap();
         assert_eq!(c.track_genres(t).unwrap(), vec!["Trance"]);
-        assert_eq!(c.track_genres(d).unwrap(), vec!["Drum & Bass"]);
+        assert_eq!(c.track_genres(d).unwrap(), vec!["Drum & bass"]);
         assert_eq!(count_of(&c, "_none"), None);
         assert_eq!(count_of(&c, "drumandbass"), Some(1));
     }
@@ -700,7 +700,7 @@ mod tests {
         let artists = add(&c, "Artists/z.mp3", None);
         c.rebuild_genres().unwrap();
         assert_eq!(c.track_genres(chill).unwrap(), vec!["Chillout"]);
-        assert_eq!(c.track_genres(dnb).unwrap(), vec!["Drum & Bass"]);
+        assert_eq!(c.track_genres(dnb).unwrap(), vec!["Drum & bass"]);
         assert_eq!(c.track_genres(artists).unwrap(), vec!["Unknown"]);
     }
 
