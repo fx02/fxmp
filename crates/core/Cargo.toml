@@ -13,6 +13,8 @@ log = "0.4"
 smb = { version = "=0.12.1", default-features = false, features = ["async", "sign", "encrypt", "compress"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 futures-util = "0.3"
+symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "flac", "ogg", "vorbis"] }
+rubato = "0.16"
 
 [dev-dependencies]
 tempfile = "3"
