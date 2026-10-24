@@ -1,176 +1,193 @@
 # SMB music player
 
-macOS-first Tauri 2 player koji pušta glazbu izravno s SMB dijeljenja
-(MP3, FLAC, OGG Vorbis). Dizajn: `docs/superpowers/specs/2026-10-24-smb-music-player-design.md`.
+A macOS-first Tauri 2 player that plays music straight from an SMB share
+(MP3, FLAC, OGG Vorbis). Design: `docs/superpowers/specs/2026-10-24-smb-music-player-design.md`.
 
-## Što aplikacija radi
+## What the app does
 
-- Spaja se sama na SMB server (ne treba OS mount), skenira mapu s glazbom u
-  lokalni katalog i grupira pjesme po žanrovima iz tagova.
-- Pušta nasumično (shuffle) iz odabranih žanrova: bez ponavljanja unutar
-  prolaza, svako pokretanje odabira počinje drugom pjesmom.
-- Crossfade (uključen, 5 s, podesivo 1–10 s), ručni "sljedeća" radi kratki fade
-  od 0,7 s, ujednačavanje glasnoće (ReplayGain ili izmjereno, cilj -18 LUFS).
-- Živi u traci izbornika (bez ikone u Docku), medijske tipke i Now Playing,
-  neobavezne obavijesti i pokretanje pri prijavi.
-- Opcionalni rezervni server: ako glavni ne odgovara, koristi se rezervni.
+- Connects to the SMB server on its own (no OS mount needed), scans the music
+  folder into a local library and groups the tracks by the genres in their tags.
+- Plays shuffled from the selected genres: no repeats within a pass, and every
+  start of a selection begins with a different track.
+- Crossfade (on, 5 s, adjustable 1–10 s); a manual "next" does a short 0.7 s
+  fade; volume normalization (ReplayGain or measured loudness, target -18 LUFS).
+- Lives in the menu bar (no Dock icon), with media keys and Now Playing,
+  optional notifications and start at login.
+- Optional backup server: if the main server does not answer, the backup is used.
 
-## Instalacija (macOS 12+, Apple Silicon i Intel)
+## Installation (macOS 12+, Apple Silicon and Intel)
 
-1. Preuzmi `.dmg` (`SMB Music Player_0.1.0_universal.dmg`), otvori ga i
-   povuci aplikaciju u `Applications`.
-2. Aplikacija nije potpisana ni notarizirana, pa je macOS blokira pri prvom
-   pokretanju. Ukloni oznaku karantene:
+1. Download the `.dmg` (`SMB Music Player_0.1.0_universal.dmg`), open it and
+   drag the app into `Applications`.
+2. The app is neither signed nor notarized, so macOS blocks it on first launch.
+   Remove the quarantine flag:
 
    ```sh
    xattr -dr com.apple.quarantine "/Applications/SMB Music Player.app"
    ```
 
-3. Pokreni aplikaciju. Ikona se pojavljuje u traci izbornika.
+3. Start the app. Its icon appears in the menu bar.
 
-Build iz izvora: `cargo tauri build --target universal-apple-darwin`
-(`rustup target add aarch64-apple-darwin x86_64-apple-darwin`); `.dmg` je u
-`target/universal-apple-darwin/release/bundle/dmg/`. Verzija Rusta je
-pripeta u `rust-toolchain.toml`. Ikone se generiraju skriptom
+Building from source: `cargo tauri build --target universal-apple-darwin`
+(`rustup target add aarch64-apple-darwin x86_64-apple-darwin`); the `.dmg` ends
+up in `target/universal-apple-darwin/release/bundle/dmg/`. The Rust version is
+pinned in `rust-toolchain.toml`. The icons are generated with
 `src-tauri/icons/gen_app_icon.py` + `cargo tauri icon`.
 
-## Prvo postavljanje
+## First setup
 
-Pri prvom pokretanju otvara se prozor. U **Postavke** upiši:
+On first launch a window opens. In **Settings** enter:
 
-- **Server**, **Share**, **Putanja** (defaulti: `10.111.100.2`, `F`, `MP3`),
-- **Korisnik** i **Lozinka** (domena je opcionalna),
-- po želji uključi **Rezervni server** (predloženo `10.111.0.2`) i upiši njegove podatke.
+- **Server**, **Share**, **Path** (defaults: `10.111.100.2`, `F`, `MP3`),
+- **Username** and **Password** (the domain is optional),
+- optionally turn on **Backup server** (suggested `10.111.0.2`) and enter its details.
 
-Klikni "Testiraj vezu", zatim "Spremi" i "Osvježi katalog". Lozinke se čuvaju
-samo u macOS keychainu (servis `smb-music-player`), nikad u datoteci ni u logu.
-macOS će pitati smije li aplikacija čitati keychain: odaberi **Uvijek dopusti**.
+Click "Test connection", then "Save" and "Refresh library". Passwords are kept
+only in the macOS keychain (service `smb-music-player`), never in a file or a log.
+macOS will ask whether the app may read the keychain: choose **Always Allow**.
 
-## Korištenje
+## Usage
 
-- Kartica **Žanrovi**: klik na žanr pušta samo taj žanr. Kvačicama možeš odabrati
-  više žanrova pa "Pusti odabrano (n)". **Sve** pušta cijelu knjižnicu.
-  Desni klik (ili ⋯) na žanr: "Spoji u…" i "Preimenuj…".
-- Tipke u prozoru: ⏯ pauza, ⏭ sljedeća, 🚫 "nikad više ne puštaj ovu pjesmu"
-  (traži potvrdu, drugi klik unutar 3 s). Zabranjene pjesme se vraćaju u
-  Postavkama gumbom **Vrati**.
-- Traka izbornika: **lijevi klik na ikonu = sljedeća pjesma**, desni klik otvara
-  izbornik (trenutna pjesma, pauza, žanr, zabrana, prikaži prozor, izlaz).
-- **F8** je pauza/nastavi, **F9** sljedeća (i Control Center).
-- Zatvaranje prozora ne gasi aplikaciju; izlaz je iz izbornika u traci.
+- **Genres** tab: clicking a genre plays only that genre. Tick several genres and
+  use "Play selected (n)". **All** plays the whole library.
+  Only well-known genres are listed (the ID3/Winamp list plus common modern ones,
+  such as Chillout, Drum & Bass or Hip-Hop, with their usual spellings). Tracks
+  with no known genre in the tag or in the top folder name are under **Unknown**.
+  Right-click (or ⋯) on a genre: "Merge into…" picks another known genre from a
+  filterable list.
+- **Artists** tab: search for an artist, click it to list the albums, click an
+  album to play it in order.
+- Window controls: ⏯ pause, ⏭ next, 🚫 "never play this track again" (asks for
+  confirmation: click again within 3 s), and a volume slider. Banned tracks come
+  back with the **Restore** button in Settings.
+- **Settings → Playback**: output device, crossfade on/off and its length
+  (1–10 s), and "Normalize volume".
+- Menu bar: **left click on the icon = next track**; right click opens the menu
+  (current track, pause, genre, ban, show window, quit).
+- **F8** is pause/resume, **F9** next (Control Center works too).
+- Closing the window does not quit the app; quit from the menu bar menu.
 
-## Poznata ograničenja
+## Known limitations
 
-- Aplikacija nije potpisana (vidi `xattr` gore).
-- Gapless nije sample-točan (prijelaz između pjesama nije na uzorak točno).
-- Izlistavanje mape na serveru traje 15–40 s i bez prikaza napretka.
-- Prvo puno skeniranje (~59 000 datoteka) traje otprilike 25–75 min, ali se
-  žanrovi pojavljuju već tijekom skeniranja.
-- Ako se pjesma pusti prije nego što odgovoriš na keychain upit, pjesme se
-  preskaču dok se lozinka ne dobije.
-- Windows: CI gradi `.msi`/`.exe`, ali medijske tipke (souvlaki traži HWND) su
-  za sada samo na macOS-u, a build nije isprobavan na pravom Windowsu.
+- The app is not signed (see `xattr` above).
+- Gapless is not sample-accurate (the handover between tracks is not exact to the sample).
+- Listing the folder on the server takes 15–40 s and shows no progress.
+- The first full scan (~59,000 files) takes roughly 25–75 min, but genres
+  appear while it runs.
+- If a track is played before you answer the keychain prompt, tracks are
+  skipped until the password is available.
+- Windows: CI builds the `.msi`/`.exe`, but media keys (souvlaki needs an HWND)
+  are macOS-only for now, and the build has not been tried on real Windows.
+- Windows: the tray icon is the macOS template glyph (black on transparent), so
+  it may be hard to see, or invisible, on a dark taskbar.
 
-## Live testovi i testiranje
+## Live tests and testing
 
 ```sh
-cargo test --workspace            # bez live testova
+cargo test --workspace            # without the live tests
 node --test ui/*.test.mjs
-cp .env.test.example .env.test    # upiši podatke; datoteka je u .gitignore
+cp .env.test.example .env.test    # fill in the details; the file is in .gitignore
 cargo test -p smp-core --test smb_live -- --ignored --test-threads=1
+cargo test -p smb-music-player live_ -- --ignored
 ```
 
-Live testovi (`cargo test -- --ignored`) samo čitaju sa servera, ništa se ne piše.
-CI (`.github/workflows/build.yml`, push na `main` i ručno) vrti testove i gradi
-macOS `.dmg` i Windows `.msi`/`.exe` kao artefakte.
+Live tests (`cargo test -- --ignored`) only read from the server; nothing is written.
+CI (`.github/workflows/build.yml`, on push to `main` and manually) runs the tests
+and builds the macOS `.dmg` and the Windows `.msi`/`.exe` as artifacts.
 
-## Checklista za vlasnika (ručne provjere)
+## Owner checklist (manual checks)
 
-Ovo se ne može provjeriti automatski (treba slušati ili kliknuti):
+These cannot be checked automatically (they need listening or clicking):
 
-- [ ] Crossfade je čujan i bez klika za 1, 5 i 10 s (prirodni kraj pjesme).
-- [ ] ⏭ radi kratki fade od 0,7 s, bez klika.
-- [ ] Gapless/album: prijelaz pjesama u albumu je uredan.
-- [ ] Promjena izlaznog uređaja prebacuje zvuk; vađenje slušalica ne ruši zvuk.
-- [ ] Ujednačavanje glasnoće: pjesme su približno jednako glasne (uključeno/isključeno).
-- [ ] Pet pokretanja istog žanra daje pet različitih prvih pjesama.
-- [ ] Izgled u svijetlom i tamnom načinu (420×640, dugi naslovi, chip žanra, ⋯).
-- [ ] Lijevi klik na ikonu u traci pouzdano preskače pjesmu (ako Click ne stiže
-      pouzdano: premjestiti "Sljedeća" na prvu stavku izbornika).
-- [ ] Desni klik: izbornik, naziv pjesme se osvježava, izbor žanra pušta taj žanr.
-- [ ] F8/F9 rade i pjesma se vidi u Control Centeru.
-- [ ] Obavijesti se pojavljuju samo kad su uključene (isprobati s instaliranim .app).
-- [ ] Pokretanje pri prijavi: nakon odjave/prijave aplikacija je u traci, prozor skriven.
-- [ ] Nema ikone u Docku; "Prikaži prozor" i drugo pokretanje dižu prozor naprijed.
-- [ ] Puno prvo skeniranje do kraja, uz postupno pojavljivanje žanrova.
-- [ ] Keychain upit ("Uvijek dopusti") i da nakon toga pjesme normalno sviraju.
-- [ ] Prelazak na rezervni server kad glavni nije dostupan.
-- [ ] Žanr chip, zabrana i "Vrati" ponašaju se ispravno na pravom slušanju.
+- [ ] Crossfade is audible and click-free at 1, 5 and 10 s (natural end of a track).
+- [ ] ⏭ does a short 0.7 s fade, without a click.
+- [ ] Gapless/album: the handover between tracks of an album is clean.
+- [ ] Changing the output device moves the sound; unplugging headphones does not break playback.
+- [ ] Volume normalization: tracks are about equally loud (on/off).
+- [ ] Five starts of the same genre give five different first tracks.
+- [ ] Look in light and dark mode (420×640, long titles, genre chip, ⋯).
+- [ ] Left click on the menu bar icon reliably skips the track (if the click does
+      not arrive reliably: move "Next" to the first menu item).
+- [ ] Right click: the menu opens, the track name updates, picking a genre plays that genre.
+- [ ] Right-click on a genre in the window opens the app's own menu (not WebKit's),
+      and "Merge into…" really merges.
+- [ ] After closing the window, music keeps playing and the menu bar icon stays.
+- [ ] The menu bar icon looks right in both the light and the dark menu bar.
+- [ ] F8/F9 work and the track shows in Control Center.
+- [ ] Notifications appear only when turned on (try with the installed .app).
+- [ ] Start at login: after logging out and in, the app is in the menu bar with the window hidden.
+- [ ] No Dock icon; "Show window" and a second launch bring the window to the front.
+- [ ] A full first scan to the end, with genres appearing along the way.
+- [ ] The keychain prompt ("Always Allow"), and tracks play normally afterwards.
+- [ ] Switching to the backup server when the main one is unreachable.
+- [ ] Genre chip, ban and "Restore" behave correctly during real listening.
 
-## SMB klijent
+## SMB client
 
-**Odluka:** pure-Rust crate [`smb`](https://crates.io/crates/smb) (smb-rs)
-`=0.12.1`, u **async** načinu, pokretan iz privatnog tokio runtimea
-(`crates/core/src/source/smb.rs`). `libsmb2` preko FFI-ja nije bio potreban.
+**Decision:** the pure-Rust crate [`smb`](https://crates.io/crates/smb) (smb-rs)
+`=0.12.1`, in **async** mode, driven from a private tokio runtime
+(`crates/core/src/source/smb.rs`). `libsmb2` over FFI was not needed.
 
-**Spike (24. 10. 2026)** protiv oba stvarna servera (Windows 10 `10.111.100.2`
-i Unraid/Samba `10.111.0.2`, share `F`, putanja `MP3`):
+**Spike (24 Oct 2026)** against both real servers (Windows 10 `10.111.100.2`
+and Unraid/Samba `10.111.0.2`, share `F`, path `MP3`):
 
-| Kriterij | Windows 10 | Samba |
+| Criterion | Windows 10 | Samba |
 |---|---|---|
-| izlistavanje `F/MP3` | da | da |
-| 1 MB s offseta 0 i iz sredine datoteke | da | da (vidi niže) |
-| kriva lozinka → zasebna greška (`Logon Failure 0xC000006D`) | da | da |
+| listing `F/MP3` | yes | yes |
+| 1 MB from offset 0 and from the middle of a file | yes | yes (see below) |
+| wrong password → its own error (`Logon Failure 0xC000006D`) | yes | yes |
 
-Usput pronađena tri problema u crateu i kako su riješena:
+Three problems found in the crate along the way, and how they were solved:
 
-1. **Sinkroni (`multi_threaded`) način gubi podatke.** Prijemna petlja čita
-   socket s timeoutom od 100 ms i `read_exact`; kad veliki READ odgovor stiže
-   u dijelovima sporije od toga, pročitani bajtovi se bace, tok se raspadne
-   ("bad magic") i zahtjev istekne nakon 10 s. Async (tokio) backend nema taj
-   problem, pa se koristi on, a `MusicSource` ostaje blokirajući preko
-   `block_on`. Posljedica: metode `SmbSource` se ne smiju zvati iz async
-   konteksta (koristiti `spawn_blocking`).
-2. **Nema `TCP_NODELAY`.** Svaki zahtjev se šalje u nekoliko malih pisanja pa
-   Nagle + odgođeni ACK dodaju ~40–80 ms po zahtjevu. `smb-transport` 0.12.1 je
-   zato vendoran u `vendor/smb-transport` s jednom dodanom linijom
-   (`set_nodelay(true)`), vidi `vendor/smb-transport/SMP-PATCH.md`. Obilazak
-   ~10 900 datoteka: 255 s bez zakrpe, 70 s sa zakrpom.
-3. **Izlistavanje mape povremeno visi do timeouta.** `Directory::query` stream
-   u `smb` 0.12.1 gubi buđenje (`notify_waiters` umjesto `notify_one` u
-   `poll_next`), pa ne pošalje završni upit i čeka do timeouta, nakon čega
-   slijedi ponovno spajanje i ponovni pokušaj. Na Sambi (`10.111.0.2`) puni
-   obilazak (~59 400 datoteka) zbog toga je završavao greškom `Timeout`.
-   `smb` 0.12.1 je zato vendoran u `vendor/smb` s tom jednom promjenom, vidi
-   `vendor/smb/SMP-PATCH.md`. Puni obilazak Sambe: `Timeout` nakon 130 s bez
-   zakrpe, ~38 s bez greške sa zakrpom.
+1. **The synchronous (`multi_threaded`) mode loses data.** The receive loop reads
+   the socket with a 100 ms timeout and `read_exact`; when a large READ response
+   arrives in pieces more slowly than that, the bytes already read are thrown
+   away, the stream falls apart ("bad magic") and the request times out after
+   10 s. The async (tokio) backend does not have this problem, so it is used,
+   and `MusicSource` stays blocking through `block_on`. Consequence: `SmbSource`
+   methods must not be called from an async context (use `spawn_blocking`).
+2. **No `TCP_NODELAY`.** Every request is sent in several small writes, so
+   Nagle + delayed ACK add ~40–80 ms per request. `smb-transport` 0.12.1 is
+   therefore vendored in `vendor/smb-transport` with one added line
+   (`set_nodelay(true)`), see `vendor/smb-transport/SMP-PATCH.md`. Walking
+   ~10,900 files: 255 s without the patch, 70 s with it.
+3. **Listing a folder sometimes hangs until the timeout.** The `Directory::query`
+   stream in `smb` 0.12.1 loses a wake-up (`notify_waiters` instead of
+   `notify_one` in `poll_next`), so it does not send the final query and waits
+   until the timeout, followed by a reconnect and a retry. On Samba
+   (`10.111.0.2`) a full walk (~59,400 files) ended with a `Timeout` error
+   because of this. `smb` 0.12.1 is therefore vendored in `vendor/smb` with that
+   one change, see `vendor/smb/SMP-PATCH.md`. Full Samba walk: `Timeout` after
+   130 s without the patch, ~38 s without errors with it.
 
-Ostalo:
-- Čitanje ide u komadima od 256 KiB (read-ahead buffer po otvorenoj datoteci),
-  nikad se ne skida cijela datoteka.
-- Svaka mrežna operacija ima timeout 10 s (`SourceError::Timeout`), osim
-  izlistavanja mape, koje ima 15 s. Nakon
-  prekinute veze ili timeouta veza se jednom ponovno uspostavi (npr. poluotvorena
-  veza nakon spavanja), a tek onda se vraća greška.
-- Podmapa koja se ne može izlistati zbog vlastitog razloga (pristup odbijen,
-  nestala, I/O greška) se preskače uz log. Prekid veze ili timeout prekida cijeli
-  obilazak greškom, inače bi skener obrisao pjesme iz neobiđenih mapa. Greška je
-  i kad se ne može izlistati korijen.
-- Obilazak izlistava do 8 mapa istodobno na istoj vezi (svaka na svojoj
-  dretvi), pa redoslijed pronađenih datoteka nije određen. Pravila za greške
-  iznad vrijede jednako.
-- Skener (`scan`) otvara i čita tagove novih/promijenjenih datoteka u 8
-  paralelnih dretvi (`ScanOptions { workers }`); u katalog piše samo pozivajuća
-  dretva, u transakcijama po 500. Mjereno na `10.111.100.2`, prvo skeniranje
-  500 datoteka: 28,0 s s jednom dretvom, 9,8 s s osam (2,8×).
-  Tijekom skeniranja žanrovi se ponovno grade nakon svakih 5000 novih
-  datoteka, pa je knjižnica upotrebljiva i prije kraja prvog skeniranja.
+Other notes:
+- Reads go in 256 KiB chunks (a read-ahead buffer per open file); a whole file
+  is never downloaded.
+- Every network operation has a 10 s timeout (`SourceError::Timeout`), except
+  folder listing, which has 15 s. After a broken connection or a timeout the
+  connection is re-established once (e.g. a half-open connection after sleep),
+  and only then is the error returned.
+- A subfolder that cannot be listed for a reason of its own (access denied,
+  gone, I/O error) is skipped with a log entry. A dropped connection or a
+  timeout aborts the whole walk with an error, otherwise the scanner would delete
+  the tracks of the folders it did not walk. Failing to list the root is an
+  error too.
+- The walk lists up to 8 folders at once on the same connection (each on its own
+  thread), so the order of the files found is not fixed. The error rules above
+  apply the same way.
+- The scanner (`scan`) opens new/changed files and reads their tags on 8
+  parallel threads (`ScanOptions { workers }`); only the calling thread writes
+  to the library, in transactions of 500. Measured on `10.111.100.2`, a first
+  scan of 500 files: 28.0 s with one thread, 9.8 s with eight (2.8×).
+  During a scan the genres are rebuilt after every 5000 new files or every
+  30 s, whichever comes first, so the library is usable before the first scan
+  ends.
 
-Live testovi (samo čitanje, ništa se ne piše na servere):
+Live tests (read-only, nothing is written to the servers):
 
 ```sh
-cp .env.test.example .env.test   # upiši podatke; datoteka je u .gitignore
+cp .env.test.example .env.test   # fill in the details; the file is in .gitignore
 cargo test -p smp-core --test smb_live -- --ignored --test-threads=1
 ```
 
-Testovi idu na glavni server i, ako je `SMB_TEST2_HOST` postavljen, i na rezervni.
+The tests go to the main server and, if `SMB_TEST2_HOST` is set, also to the backup.
