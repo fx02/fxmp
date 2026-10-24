@@ -12,6 +12,8 @@ import {
   connMessage,
   serverFromForm,
   missingUsername,
+  plural,
+  passwordRequired,
 } from "./lib.mjs";
 
 const NB = " ";
@@ -78,20 +80,33 @@ test("debounce runs once with the last arguments after the quiet period", async 
   assert.deepEqual(calls, [3, 4]);
 });
 
+test("plural picks Croatian forms (1 / 2-4 / 5+, 11-14 are 5+)", () => {
+  const f = ["datoteka", "datoteke", "datoteka"];
+  const forms = ["jedan", "dva", "pet"];
+  const pick = (n) => plural(n, forms);
+  assert.deepEqual([1, 21, 101].map(pick), ["jedan", "jedan", "jedan"]);
+  assert.deepEqual([2, 3, 4, 22, 104].map(pick), ["dva", "dva", "dva", "dva", "dva"]);
+  assert.deepEqual([0, 5, 11, 12, 13, 14, 111, 112, 25].map(pick), Array(9).fill("pet"));
+  assert.equal(plural(2, f), "datoteke");
+});
+
 test("scanProgressText", () => {
   assert.equal(scanProgressText(null), "Skeniram… popisujem datoteke");
   assert.equal(scanProgressText({ seen: 0, read: 0, failed: 0 }), "Skeniram… popisujem datoteke");
   assert.equal(scanProgressText({ seen: 12340, read: 10, failed: 0 }), `Skeniram… 12${NB}340 datoteka`);
-  assert.equal(
-    scanProgressText({ seen: 5, read: 3, failed: 2 }),
-    "Skeniram… 5 datoteka (2 nečitljivih)",
-  );
+  assert.equal(scanProgressText({ seen: 1, read: 1, failed: 0 }), "Skeniram… 1 datoteka");
+  assert.equal(scanProgressText({ seen: 3, read: 3, failed: 0 }), "Skeniram… 3 datoteke");
+  assert.equal(scanProgressText({ seen: 5, read: 3, failed: 2 }), "Skeniram… 5 datoteka (nečitljivo: 2)");
 });
 
 test("scanDoneText covers success, cancel and error", () => {
   assert.equal(
     scanDoneText({ ok: true, cancelled: false, total: 59400, read: 100, failed: 2, removed: 1 }),
-    `Katalog osvježen: 59${NB}400 datoteka, 100 novih ili promijenjenih, 2 nečitljivih, 1 uklonjenih.`,
+    `Katalog osvježen: 59${NB}400 datoteka. Novo ili promijenjeno: 100, nečitljivo: 2, uklonjeno: 1.`,
+  );
+  assert.equal(
+    scanDoneText({ ok: true, cancelled: false, total: 22, read: 0, failed: 0, removed: 0 }),
+    "Katalog osvježen: 22 datoteke. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0.",
   );
   assert.equal(scanDoneText({ ok: true, cancelled: true, cancel_reason: null }), "Skeniranje je prekinuto.");
   assert.equal(
@@ -123,4 +138,15 @@ test("missingUsername", () => {
   assert.equal(missingUsername({ username: "" }), true);
   assert.equal(missingUsername({ username: "  " }), true);
   assert.equal(missingUsername({ username: "x" }), false);
+});
+
+test("passwordRequired when the keychain account (host/username) or share is new", () => {
+  const saved = { host: "10.111.100.2", share: "F", root: "MP3", username: "music", domain: null };
+  assert.equal(passwordRequired(saved, { ...saved }), false);
+  assert.equal(passwordRequired(saved, { ...saved, root: "Other", domain: "WG" }), false);
+  assert.equal(passwordRequired(saved, { ...saved, host: "10.111.0.2" }), true);
+  assert.equal(passwordRequired(saved, { ...saved, username: "other" }), true);
+  assert.equal(passwordRequired(saved, { ...saved, share: "G" }), true);
+  assert.equal(passwordRequired(null, saved), true, "server not saved before");
+  assert.equal(passwordRequired({ ...saved, username: "" }, saved), true, "never configured");
 });

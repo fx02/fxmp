@@ -148,7 +148,7 @@ button.ban.confirm { width: auto; padding: 3px 8px; background: var(--danger); b
 main { flex: 1; min-height: 0; overflow-y: auto; }
 .panel { padding: 10px 12px 16px; }
 
-.toolbar { display: flex; gap: 6px; margin-bottom: 8px; position: sticky; top: 0; }
+.toolbar { display: flex; gap: 6px; margin-bottom: 4px; padding: 4px 0; position: sticky; top: 0; z-index: 1; background: var(--bg); }
 .toolbar input { flex: 1; }
 
 .note { color: var(--muted); font-size: 12px; margin: 6px 2px; }

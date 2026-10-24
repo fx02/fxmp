@@ -10,6 +10,7 @@ import {
   connMessage,
   serverFromForm,
   missingUsername,
+  passwordRequired,
 } from "./lib.mjs";
 
 const { invoke } = window.__TAURI__.core;
@@ -130,12 +131,12 @@ const sendVolume = debounce((v) => run("set_volume", { v }), 60);
 
 // ---------- connection status ----------
 
-function renderStatus(payload) {
+function renderStatus(payload, checking = false) {
   const dot = $("conn-dot");
   dot.className = "dot" + (payload ? ` ${payload.status}` : "");
   $("conn-text").textContent = payload
     ? payload.message || connMessage(payload.status)
-    : state.configured
+    : state.configured || checking
       ? "Provjeravam vezu…"
       : "Server nije postavljen";
 }
@@ -171,12 +172,31 @@ function renderScanDone(done) {
   if (rescan) startScan();
 }
 
+function renderScanIdle() {
+  state.scanning = false;
+  $("genre-scan").hidden = true;
+  $("btn-scan").disabled = false;
+  $("btn-scan-cancel").hidden = true;
+  renderGenres();
+}
+
+/** Re-reads the scan state from the backend (after a failed start, say). */
+async function syncScanStatus() {
+  const scan = await run("get_scan_status");
+  if (!scan) return;
+  if (scan.scanning) renderScanProgress(scan.progress);
+  else renderScanIdle();
+}
+
+// Shown before the request: the scan's own events (`scan-progress`, then
+// `scan-done`) may arrive before the reply and must have the last word.
 async function startScan() {
+  renderScanProgress(null);
   try {
     await invoke("start_scan");
-    renderScanProgress(null);
   } catch (e) {
     toast(String(e));
+    syncScanStatus();
   }
 }
 
@@ -215,11 +235,14 @@ function renderGenres() {
   if (!state.genres.length) {
     empty.textContent = state.scanning
       ? "Žanrovi će se pojavljivati tijekom skeniranja."
-      : "Katalog je prazan. Postavi server u Postavkama i osvježi katalog.";
+      : state.configured
+        ? "Katalog je prazan. Osvježi katalog u Postavkama."
+        : "Katalog je prazan. Postavi server u Postavkama.";
   } else if (!shown.length) {
     empty.textContent = "Nijedan žanr ne odgovara filtru.";
   }
   empty.hidden = Boolean(shown.length);
+  $("btn-play-all").disabled = !state.genres.length;
   renderSelection();
 }
 
@@ -284,13 +307,13 @@ async function onMenuAction(action) {
   if (!g) return;
   const into =
     action === "merge"
-      ? await askName(`Spoji „${g.display}” u žanr:`, "")
-      : await askName(`Novi naziv za „${g.display}”:`, g.display);
+      ? await askName(`Spoji „${g.display}“ u žanr:`, "")
+      : await askName(`Novi naziv za „${g.display}“:`, g.display);
   if (!into || into === g.display) return;
   try {
     await invoke("merge_genre", { from_key: g.key, into_display: into });
     state.selected.delete(g.key);
-    toast(action === "merge" ? `„${g.display}” je spojen u „${into}”.` : `Preimenovano u „${into}”.`);
+    toast(action === "merge" ? `„${g.display}“ je spojen u „${into}“.` : `Preimenovano u „${into}“.`);
   } catch (e) {
     toast(String(e));
   }
@@ -358,12 +381,25 @@ function fieldset(which) {
   return document.querySelector(`fieldset[data-server="${which}"]`);
 }
 
+/** The saved config of a server (null if not saved). */
+function savedServer(which) {
+  const s = state.settings;
+  return s ? (which === "primary" ? s.primary : s.secondary) : null;
+}
+
+function updatePasswordHint(which) {
+  const pw = fieldset(which).elements.password;
+  pw.placeholder = passwordRequired(savedServer(which), readServer(which))
+    ? "obavezno"
+    : "prazno = ostaje spremljena";
+}
+
 function fillServer(which, cfg) {
   const fs = fieldset(which);
   for (const f of serverFields) fs.elements[f].value = cfg[f] || "";
   fs.elements.password.value = "";
-  fs.elements.password.placeholder = cfg.username ? "prazno = ostaje spremljena" : "";
   fs.querySelector(".test-result").textContent = "";
+  updatePasswordHint(which);
 }
 
 function readServer(which) {
@@ -425,10 +461,20 @@ async function onSave(e) {
   const secondary = $("use-secondary").checked ? readServer("secondary") : null;
   for (const [which, srv, name] of [["primary", primary, "glavnog"], ["secondary", secondary, "rezervnog"]]) {
     if (!srv) continue;
-    const missing = !srv.host ? "host" : missingUsername(srv) ? "username" : null;
+    const els = fieldset(which).elements;
+    let missing = null;
+    if (!srv.host) {
+      missing = "host";
+      result.textContent = `Upiši adresu ${name} servera.`;
+    } else if (missingUsername(srv)) {
+      missing = "username";
+      result.textContent = `Upiši korisničko ime ${name} servera.`;
+    } else if (!els.password.value && passwordRequired(savedServer(which), srv)) {
+      missing = "password";
+      result.textContent = `Upiši lozinku ${name} servera: server, share ili korisnik su novi, pa spremljene lozinke nema.`;
+    }
     if (missing) {
-      result.textContent = missing === "host" ? `Upiši adresu ${name} servera.` : `Upiši korisničko ime ${name} servera.`;
-      fieldset(which).elements[missing].focus();
+      els[missing].focus();
       return;
     }
   }
@@ -445,6 +491,9 @@ async function onSave(e) {
       notify: $("notify").checked,
       autostart: $("autostart").checked,
     };
+    // The monitor reports the new status right after the save, possibly
+    // before the reply: show "checking" first, never after.
+    renderStatus(null, true);
     await invoke("save_settings", {
       settings,
       primary_password: fieldset("primary").elements.password.value || null,
@@ -456,7 +505,6 @@ async function onSave(e) {
     if (secondary) fillServer("secondary", secondary);
     result.className = "result";
     result.textContent = "Spremljeno.";
-    renderStatus(null);
     // Empty catalog: fill it straight away. A running scan is cancelled by the
     // backend when the servers changed; start again once it has stopped.
     if (!state.genres.length) {
@@ -465,6 +513,7 @@ async function onSave(e) {
     }
   } catch (err) {
     result.textContent = String(err);
+    renderStatus((await run("get_connection_status")) || null);
   } finally {
     submit.disabled = false;
   }
@@ -576,6 +625,8 @@ function wire() {
   $("servers-form").addEventListener("submit", onSave);
   for (const b of document.querySelectorAll(".btn-test")) b.addEventListener("click", () => onTest(b));
   $("use-secondary").addEventListener("change", (e) => (fieldset("secondary").hidden = !e.target.checked));
+  for (const which of ["primary", "secondary"])
+    fieldset(which).addEventListener("input", () => updatePasswordHint(which));
   $("device").addEventListener("change", (e) => {
     const name = e.target.value || null;
     if (state.settings) state.settings.device = name;

@@ -55,11 +55,22 @@ export function debounce(fn, ms) {
   };
 }
 
+/** Croatian plural: `forms` = [1, 2–4, 5+] (11–14 take the 5+ form). */
+export function plural(n, forms) {
+  const d = n % 10;
+  const dd = n % 100;
+  if (d === 1 && dd !== 11) return forms[0];
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return forms[1];
+  return forms[2];
+}
+
+const FILES = ["datoteka", "datoteke", "datoteka"];
+
 export function scanProgressText(p) {
   // Nothing is counted while the share is still being listed.
   if (!p || !p.seen) return "Skeniram… popisujem datoteke";
-  let text = `Skeniram… ${formatCount(p.seen)} datoteka`;
-  if (p.failed) text += ` (${formatCount(p.failed)} nečitljivih)`;
+  let text = `Skeniram… ${formatCount(p.seen)} ${plural(p.seen, FILES)}`;
+  if (p.failed) text += ` (nečitljivo: ${formatCount(p.failed)})`;
   return text;
 }
 
@@ -68,9 +79,9 @@ export function scanDoneText(d) {
   if (d.cancelled) return d.cancel_reason || "Skeniranje je prekinuto.";
   if (d.error) return `Skeniranje nije uspjelo: ${d.error}`;
   return (
-    `Katalog osvježen: ${formatCount(d.total)} datoteka, ` +
-    `${formatCount(d.read)} novih ili promijenjenih, ` +
-    `${formatCount(d.failed)} nečitljivih, ${formatCount(d.removed)} uklonjenih.`
+    `Katalog osvježen: ${formatCount(d.total)} ${plural(d.total, FILES)}. ` +
+    `Novo ili promijenjeno: ${formatCount(d.read)}, ` +
+    `nečitljivo: ${formatCount(d.failed)}, uklonjeno: ${formatCount(d.removed)}.`
   );
 }
 
@@ -100,4 +111,14 @@ export function serverFromForm(f) {
 
 export function missingUsername(server) {
   return !(server.username || "").trim();
+}
+
+/**
+ * Whether saving `form` needs a typed password: the password is stored per
+ * host/username, so a new account (or share) has none to keep.
+ */
+export function passwordRequired(saved, form) {
+  if (!saved || missingUsername(saved)) return true;
+  const t = (v) => (v || "").trim();
+  return ["host", "share", "username"].some((f) => t(saved[f]) !== t(form[f]));
 }
