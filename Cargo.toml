@@ -3,5 +3,7 @@ resolver = "2"
 members = ["crates/core"]
 
 # smb-transport 0.12.1 with TCP_NODELAY enabled (see vendor/smb-transport/SMP-PATCH.md).
+# smb 0.12.1 with a lost-wakeup fix in directory listing (see vendor/smb/SMP-PATCH.md).
 [patch.crates-io]
 smb-transport = { path = "vendor/smb-transport" }
+smb = { path = "vendor/smb" }

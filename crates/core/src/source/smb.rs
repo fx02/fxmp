@@ -29,7 +29,7 @@ use crate::SetOnDrop;
 /// Timeout for every network operation (connect, open, read a chunk) except listing.
 const NET_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for listing one folder: big folders on a busy server answer slowly.
-const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+const LIST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Folders listed at once during a walk (on the one shared connection).
 const WALK_CONCURRENCY: usize = 8;
 /// Bytes requested per SMB READ and kept in the reader's buffer.
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn listing_gets_a_longer_timeout_than_file_ops() {
-        assert_eq!(LIST_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(LIST_TIMEOUT, Duration::from_secs(15));
         assert_eq!(NET_TIMEOUT, Duration::from_secs(10));
         let slow = || async {
             tokio::time::sleep(Duration::from_millis(100)).await;
