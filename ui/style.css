@@ -235,7 +235,8 @@ fieldset > label { display: grid; grid-template-columns: 72px 1fr; align-items: 
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
 }
 .dialog p { margin: 0 0 8px; }
-.dialog input { width: 100%; }
+.dialog input, .dialog select { width: 100%; }
+.dialog select { margin-top: 6px; }
 
 .toast {
   position: fixed;

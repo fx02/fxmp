@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="hr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -15,30 +15,30 @@
     <span id="np-genre" class="chip" hidden></span>
   </div>
   <div class="now-controls">
-    <button id="btn-pause" class="icon" title="Pauza / nastavi" aria-label="Pauza / nastavi">⏯</button>
-    <button id="btn-next" class="icon" title="Sljedeća" aria-label="Sljedeća">⏭</button>
-    <button id="btn-ban" class="icon ban" title="Nikad više ne puštaj ovu pjesmu" aria-label="Zabrani pjesmu">🚫</button>
-    <input id="volume" class="volume" type="range" min="0" max="100" step="1" value="70" title="Glasnoća" aria-label="Glasnoća">
+    <button id="btn-pause" class="icon" title="Pause / resume" aria-label="Pause / resume">⏯</button>
+    <button id="btn-next" class="icon" title="Next" aria-label="Next">⏭</button>
+    <button id="btn-ban" class="icon ban" title="Never play this track again" aria-label="Ban track">🚫</button>
+    <input id="volume" class="volume" type="range" min="0" max="100" step="1" value="70" title="Volume" aria-label="Volume">
   </div>
 </header>
 
 <div class="status-row">
   <span id="conn-dot" class="dot"></span>
-  <span id="conn-text" class="conn-text">Provjeravam vezu…</span>
+  <span id="conn-text" class="conn-text">Checking connection…</span>
 </div>
 
 <nav class="tabs" role="tablist">
-  <button class="tab" data-tab="genres" role="tab">Žanrovi</button>
-  <button class="tab" data-tab="artists" role="tab">Izvođači</button>
-  <button class="tab" data-tab="settings" role="tab">Postavke</button>
+  <button class="tab" data-tab="genres" role="tab">Genres</button>
+  <button class="tab" data-tab="artists" role="tab">Artists</button>
+  <button class="tab" data-tab="settings" role="tab">Settings</button>
 </nav>
 
 <main>
   <section id="tab-genres" class="panel" hidden>
     <div class="toolbar">
-      <input id="genre-filter" type="search" placeholder="Filtriraj žanrove" autocomplete="off" spellcheck="false">
-      <button id="btn-play-selected" disabled>Pusti odabrano</button>
-      <button id="btn-play-all">Sve</button>
+      <input id="genre-filter" type="search" placeholder="Filter genres" autocomplete="off" spellcheck="false">
+      <button id="btn-play-selected" disabled>Play selected</button>
+      <button id="btn-play-all">All</button>
     </div>
     <div id="genre-scan" class="note" hidden></div>
     <ul id="genre-list" class="list"></ul>
@@ -47,7 +47,7 @@
 
   <section id="tab-artists" class="panel" hidden>
     <div class="toolbar">
-      <input id="artist-filter" type="search" placeholder="Traži izvođača" autocomplete="off" spellcheck="false">
+      <input id="artist-filter" type="search" placeholder="Search artists" autocomplete="off" spellcheck="false">
     </div>
     <ul id="artist-list" class="list"></ul>
     <p id="artist-note" class="note" hidden></p>
@@ -56,80 +56,79 @@
   <section id="tab-settings" class="panel settings" hidden>
     <form id="servers-form" autocomplete="off">
       <fieldset data-server="primary">
-        <legend>Glavni server</legend>
+        <legend>Main server</legend>
         <label>Server <input name="host" spellcheck="false"></label>
         <label>Share <input name="share" spellcheck="false"></label>
-        <label>Putanja <input name="root" spellcheck="false"></label>
-        <label>Korisnik <input name="username" spellcheck="false"></label>
-        <label>Lozinka <input name="password" type="password" autocomplete="new-password"></label>
-        <label>Domena <input name="domain" placeholder="(opcionalno)" spellcheck="false"></label>
+        <label>Path <input name="root" spellcheck="false"></label>
+        <label>Username <input name="username" spellcheck="false"></label>
+        <label>Password <input name="password" type="password" autocomplete="new-password"></label>
+        <label>Domain <input name="domain" placeholder="(optional)" spellcheck="false"></label>
         <div class="row">
-          <button type="button" class="btn-test" data-which="primary">Testiraj vezu</button>
+          <button type="button" class="btn-test" data-which="primary">Test connection</button>
           <span class="test-result"></span>
         </div>
       </fieldset>
 
-      <label class="check"><input id="use-secondary" type="checkbox"> Rezervni server</label>
+      <label class="check"><input id="use-secondary" type="checkbox"> Backup server</label>
       <fieldset data-server="secondary" hidden>
-        <legend>Rezervni server</legend>
+        <legend>Backup server</legend>
         <label>Server <input name="host" spellcheck="false"></label>
         <label>Share <input name="share" spellcheck="false"></label>
-        <label>Putanja <input name="root" spellcheck="false"></label>
-        <label>Korisnik <input name="username" spellcheck="false"></label>
-        <label>Lozinka <input name="password" type="password" autocomplete="new-password"></label>
-        <label>Domena <input name="domain" placeholder="(opcionalno)" spellcheck="false"></label>
+        <label>Path <input name="root" spellcheck="false"></label>
+        <label>Username <input name="username" spellcheck="false"></label>
+        <label>Password <input name="password" type="password" autocomplete="new-password"></label>
+        <label>Domain <input name="domain" placeholder="(optional)" spellcheck="false"></label>
         <div class="row">
-          <button type="button" class="btn-test" data-which="secondary">Testiraj vezu</button>
+          <button type="button" class="btn-test" data-which="secondary">Test connection</button>
           <span class="test-result"></span>
         </div>
       </fieldset>
 
-      <label class="check"><input id="notify" type="checkbox"> Obavijest pri promjeni pjesme</label>
-      <label class="check"><input id="autostart" type="checkbox"> Pokreni pri prijavi u sustav</label>
+      <label class="check"><input id="notify" type="checkbox"> Notify when the track changes</label>
+      <label class="check"><input id="autostart" type="checkbox"> Start at login</label>
 
       <div class="row">
-        <button type="submit" class="primary">Spremi</button>
+        <button type="submit" class="primary">Save</button>
         <span id="save-result" class="result"></span>
       </div>
     </form>
 
-    <h3>Reprodukcija</h3>
-    <label class="field">Izlazni uređaj
+    <h3>Playback</h3>
+    <label class="field">Output device
       <select id="device"></select>
     </label>
     <label class="check"><input id="crossfade-on" type="checkbox"> Crossfade</label>
     <label class="field slider-field">
-      <input id="crossfade-secs" type="range" min="1" max="10" step="1" value="5" aria-label="Trajanje crossfadea">
+      <input id="crossfade-secs" type="range" min="1" max="10" step="1" value="5" aria-label="Crossfade length">
       <span id="crossfade-label">5 s</span>
     </label>
-    <label class="check"><input id="normalize" type="checkbox"> Ujednači glasnoću</label>
+    <label class="check"><input id="normalize" type="checkbox"> Normalize volume</label>
 
-    <h3>Katalog</h3>
+    <h3>Library</h3>
     <div class="row">
-      <button id="btn-scan">Osvježi katalog</button>
-      <button id="btn-scan-cancel" hidden>Prekini</button>
+      <button id="btn-scan">Refresh library</button>
+      <button id="btn-scan-cancel" hidden>Cancel</button>
     </div>
     <p id="scan-status" class="note"></p>
 
-    <h3>Zabranjene pjesme</h3>
+    <h3>Banned tracks</h3>
     <ul id="banned-list" class="list compact"></ul>
-    <p id="banned-empty" class="note" hidden>Nema zabranjenih pjesama.</p>
+    <p id="banned-empty" class="note" hidden>No banned tracks.</p>
   </section>
 </main>
 
 <div id="menu" class="menu" hidden>
-  <button data-action="merge">Spoji u…</button>
-  <button data-action="rename">Preimenuj…</button>
+  <button data-action="merge">Merge into…</button>
 </div>
 
 <div id="dialog" class="overlay" hidden>
   <form id="dialog-form" class="dialog">
     <p id="dialog-title"></p>
-    <input id="dialog-input" list="genre-names" autocomplete="off" spellcheck="false">
-    <datalist id="genre-names"></datalist>
+    <input id="dialog-filter" type="search" placeholder="Filter genres" aria-label="Filter genres" autocomplete="off" spellcheck="false">
+    <select id="dialog-choices" size="10" aria-label="Genres"></select>
     <div class="row end">
-      <button type="button" id="dialog-cancel">Odustani</button>
-      <button type="submit" class="primary">U redu</button>
+      <button type="button" id="dialog-cancel">Cancel</button>
+      <button type="submit" class="primary">Merge</button>
     </div>
   </form>
 </div>

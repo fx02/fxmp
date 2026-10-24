@@ -11,12 +11,14 @@ import {
   serverFromForm,
   missingUsername,
   passwordRequired,
+  mergeChoices,
 } from "./lib.mjs";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const ARTIST_LIMIT = 300;
+const UNKNOWN_KEY = "_none";
 const BAN_CONFIRM_MS = 3000;
 const SUGGESTED_SECONDARY = { host: "10.111.0.2", share: "F", root: "MP3", username: "", domain: null };
 
@@ -28,6 +30,7 @@ const state = {
   configured: false,
   nowPlaying: null,
   genres: [],
+  knownGenres: null,
   selected: new Set(),
   artists: null,
   artistsStale: true,
@@ -94,7 +97,7 @@ function renderNowPlaying(np) {
   chip.textContent = (np && np.genre_display) || "";
   chip.title = chip.textContent;
   chip.hidden = !chip.textContent;
-  $("btn-pause").title = np && np.paused ? "Nastavi" : "Pauza";
+  $("btn-pause").title = np && np.paused ? "Resume" : "Pause";
   $("btn-ban").disabled = !np;
   // A pending ban confirmation was for the previous track.
   if (changed) resetBan();
@@ -112,7 +115,7 @@ async function onBan() {
   const b = $("btn-ban");
   if (!b.classList.contains("confirm")) {
     b.classList.add("confirm");
-    b.textContent = "Sigurno?";
+    b.textContent = "Sure?";
     banTimer = setTimeout(resetBan, BAN_CONFIRM_MS);
     return;
   }
@@ -120,7 +123,7 @@ async function onBan() {
   resetBan();
   try {
     await invoke("ban_current");
-    toast(`Zabranjeno: ${label}`);
+    toast(`Banned: ${label}`);
     if (state.tab === "settings") loadBanned();
   } catch (e) {
     toast(String(e));
@@ -137,8 +140,8 @@ function renderStatus(payload, checking = false) {
   $("conn-text").textContent = payload
     ? payload.message || connMessage(payload.status)
     : state.configured || checking
-      ? "Provjeravam vezu…"
-      : "Server nije postavljen";
+      ? "Checking connection…"
+      : "No server set up";
 }
 
 // ---------- scan ----------
@@ -209,7 +212,6 @@ async function loadGenres() {
   const keys = new Set(genres.map((g) => g.key));
   for (const k of state.selected) if (!keys.has(k)) state.selected.delete(k);
   renderGenres();
-  $("genre-names").replaceChildren(...genres.map((g) => el("option", { value: g.display })));
 }
 
 const refreshGenres = debounce(loadGenres, 500);
@@ -221,11 +223,12 @@ function renderGenres() {
     const li = el(
       "li",
       {},
-      el("input", { type: "checkbox", checked: state.selected.has(g.key), title: "Odaberi" }),
-      el("span", { className: "name", textContent: g.display, title: `Pusti: ${g.display}` }),
+      el("input", { type: "checkbox", checked: state.selected.has(g.key), title: "Select" }),
+      el("span", { className: "name", textContent: g.display, title: `Play: ${g.display}` }),
       el("span", { className: "count", textContent: formatCount(g.count) }),
-      el("button", { className: "more", textContent: "⋯", title: "Spoji ili preimenuj" }),
     );
+    // Unknown cannot be merged: it holds the tracks with no known genre.
+    if (g.key !== UNKNOWN_KEY) li.append(el("button", { className: "more", textContent: "⋯", title: "Merge into…" }));
     li.dataset.key = g.key;
     frag.append(li);
   }
@@ -234,12 +237,12 @@ function renderGenres() {
   const empty = $("genre-empty");
   if (!state.genres.length) {
     empty.textContent = state.scanning
-      ? "Žanrovi će se pojavljivati tijekom skeniranja."
+      ? "Genres will appear as the scan goes."
       : state.configured
-        ? "Katalog je prazan. Osvježi katalog u Postavkama."
-        : "Katalog je prazan. Postavi server u Postavkama.";
+        ? "The library is empty. Refresh it in Settings."
+        : "The library is empty. Set up a server in Settings.";
   } else if (!shown.length) {
-    empty.textContent = "Nijedan žanr ne odgovara filtru.";
+    empty.textContent = "No genre matches the filter.";
   }
   empty.hidden = Boolean(shown.length);
   $("btn-play-all").disabled = !state.genres.length;
@@ -250,7 +253,7 @@ function renderSelection() {
   const n = state.selected.size;
   const b = $("btn-play-selected");
   b.disabled = n === 0;
-  b.textContent = n ? `Pusti odabrano (${n})` : "Pusti odabrano";
+  b.textContent = n ? `Play selected (${n})` : "Play selected";
 }
 
 function playGenres(keys) {
@@ -271,31 +274,53 @@ function openMenu(key, x, y) {
   menu.style.top = `${Math.min(y, window.innerHeight - h - 4)}px`;
 }
 
-/** Asks for a genre name; resolves to the trimmed text, or null if cancelled. */
-function askName(title, initial) {
+/** The known genre names (loaded once; the list is fixed in the app). */
+async function knownGenres() {
+  if (!state.knownGenres) state.knownGenres = (await run("known_genres")) || null;
+  return state.knownGenres || [];
+}
+
+/** Asks which genre to merge `from` into; resolves to its name, or null if cancelled. */
+function askMergeTarget(from, known) {
   return new Promise((resolve) => {
     const overlay = $("dialog");
     const form = $("dialog-form");
-    const input = $("dialog-input");
-    $("dialog-title").textContent = title;
-    input.value = initial;
+    const filter = $("dialog-filter");
+    const choices = $("dialog-choices");
+    const fill = () => {
+      const names = mergeChoices(known, state.genres, from.key, filter.value);
+      choices.replaceChildren(...names.map((n) => el("option", { value: n, textContent: n })));
+      if (names.length) choices.selectedIndex = 0;
+    };
+    $("dialog-title").textContent = `Merge “${from.display}” into:`;
+    filter.value = "";
+    fill();
     overlay.hidden = false;
-    input.focus();
-    input.select();
+    filter.focus();
     const finish = (value) => {
       overlay.hidden = true;
       form.onsubmit = null;
+      filter.oninput = null;
+      choices.ondblclick = null;
       $("dialog-cancel").onclick = null;
       overlay.onkeydown = null;
       resolve(value);
     };
+    filter.oninput = fill;
     form.onsubmit = (e) => {
       e.preventDefault();
-      finish(input.value.trim() || null);
+      finish(choices.value || null);
     };
+    choices.ondblclick = () => finish(choices.value || null);
     $("dialog-cancel").onclick = () => finish(null);
     overlay.onkeydown = (e) => {
       if (e.key === "Escape") finish(null);
+      // Arrow keys in the filter move through the list.
+      else if (e.target === filter && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+        e.preventDefault();
+        const i = choices.selectedIndex + (e.key === "ArrowDown" ? 1 : -1);
+        if (i >= 0 && i < choices.options.length) choices.selectedIndex = i;
+      }
     };
   });
 }
@@ -304,16 +329,13 @@ async function onMenuAction(action) {
   const menu = $("menu");
   menu.hidden = true;
   const g = genreOf(menu.dataset.key);
-  if (!g) return;
-  const into =
-    action === "merge"
-      ? await askName(`Spoji „${g.display}“ u žanr:`, "")
-      : await askName(`Novi naziv za „${g.display}“:`, g.display);
-  if (!into || into === g.display) return;
+  if (!g || action !== "merge") return;
+  const into = await askMergeTarget(g, await knownGenres());
+  if (!into) return;
   try {
     await invoke("merge_genre", { from_key: g.key, into_display: into });
     state.selected.delete(g.key);
-    toast(action === "merge" ? `„${g.display}“ je spojen u „${into}“.` : `Preimenovano u „${into}“.`);
+    toast(`Merged “${g.display}” into “${into}”.`);
   } catch (e) {
     toast(String(e));
   }
@@ -337,16 +359,16 @@ function renderArtists() {
   const { items, total, truncated } = limitMatches(all, $("artist-filter").value, ARTIST_LIMIT);
   const frag = document.createDocumentFragment();
   for (const name of items) {
-    const li = el("li", { className: "artist" }, el("span", { className: "name", textContent: name || "(nepoznat izvođač)", title: name }));
+    const li = el("li", { className: "artist" }, el("span", { className: "name", textContent: name || "(unknown artist)", title: name }));
     li.dataset.artist = name;
     frag.append(li);
   }
   $("artist-list").replaceChildren(frag);
   const note = $("artist-note");
-  if (!all.length) note.textContent = "Nema izvođača u katalogu.";
-  else if (!total) note.textContent = "Nijedan izvođač ne odgovara pretrazi.";
+  if (!all.length) note.textContent = "No artists in the library.";
+  else if (!total) note.textContent = "No artist matches the search.";
   else if (truncated)
-    note.textContent = `Prikazano ${formatCount(items.length)} od ${formatCount(total)}. Suzi pretragu.`;
+    note.textContent = `Showing ${formatCount(items.length)} of ${formatCount(total)}. Narrow the search.`;
   note.hidden = Boolean(total) && !truncated;
 }
 
@@ -362,11 +384,11 @@ async function toggleAlbums(li) {
   if (!albums || !li.isConnected) return;
   const ul = el("ul", { className: "albums" });
   for (const album of albums) {
-    const a = el("li", {}, el("span", { className: "name", textContent: album || "(bez albuma)", title: "Pusti album" }));
+    const a = el("li", {}, el("span", { className: "name", textContent: album || "(no album)", title: "Play album" }));
     a.dataset.album = album;
     ul.append(a);
   }
-  if (!albums.length) ul.append(el("li", { className: "note", textContent: "Nema albuma." }));
+  if (!albums.length) ul.append(el("li", { className: "note", textContent: "No albums." }));
   const wrap = el("li", { className: "albums-wrap" }, ul);
   wrap.dataset.artist = artist;
   li.after(wrap);
@@ -390,8 +412,8 @@ function savedServer(which) {
 function updatePasswordHint(which) {
   const pw = fieldset(which).elements.password;
   pw.placeholder = passwordRequired(savedServer(which), readServer(which))
-    ? "obavezno"
-    : "prazno = ostaje spremljena";
+    ? "required"
+    : "leave empty to keep the saved one";
 }
 
 function fillServer(which, cfg) {
@@ -431,11 +453,11 @@ async function onTest(button) {
   const server = readServer(which);
   out.className = "test-result";
   if (!server.host || missingUsername(server)) {
-    out.textContent = "Upiši server i korisničko ime.";
+    out.textContent = "Enter the server and username.";
     out.classList.add("bad");
     return;
   }
-  out.textContent = "Testiram…";
+  out.textContent = "Testing…";
   button.disabled = true;
   try {
     const status = await invoke("test_connection", {
@@ -443,7 +465,7 @@ async function onTest(button) {
       server,
       password: fs.elements.password.value || null,
     });
-    out.textContent = status === "ok" ? "Veza radi." : connMessage(status);
+    out.textContent = status === "ok" ? "Connection works." : connMessage(status);
     out.classList.add(status === "ok" ? "ok" : "bad");
   } catch (e) {
     out.textContent = String(e);
@@ -459,19 +481,19 @@ async function onSave(e) {
   result.className = "result bad";
   const primary = readServer("primary");
   const secondary = $("use-secondary").checked ? readServer("secondary") : null;
-  for (const [which, srv, name] of [["primary", primary, "glavnog"], ["secondary", secondary, "rezervnog"]]) {
+  for (const [which, srv, name] of [["primary", primary, "main"], ["secondary", secondary, "backup"]]) {
     if (!srv) continue;
     const els = fieldset(which).elements;
     let missing = null;
     if (!srv.host) {
       missing = "host";
-      result.textContent = `Upiši adresu ${name} servera.`;
+      result.textContent = `Enter the ${name} server's address.`;
     } else if (missingUsername(srv)) {
       missing = "username";
-      result.textContent = `Upiši korisničko ime ${name} servera.`;
+      result.textContent = `Enter the ${name} server's username.`;
     } else if (!els.password.value && passwordRequired(savedServer(which), srv)) {
       missing = "password";
-      result.textContent = `Upiši lozinku ${name} servera: server, share ili korisnik su novi, pa spremljene lozinke nema.`;
+      result.textContent = `Enter the ${name} server's password: the server, share or username is new, so there is no saved password.`;
     }
     if (missing) {
       els[missing].focus();
@@ -504,7 +526,7 @@ async function onSave(e) {
     fillServer("primary", primary);
     if (secondary) fillServer("secondary", secondary);
     result.className = "result";
-    result.textContent = "Spremljeno.";
+    result.textContent = "Saved.";
     // Empty catalog: fill it straight away. A running scan is cancelled by the
     // backend when the servers changed; start again once it has stopped.
     if (!state.genres.length) {
@@ -524,10 +546,10 @@ async function loadDevices() {
   if (!names) return;
   const saved = state.settings && state.settings.device;
   const sel = $("device");
-  const options = [el("option", { value: "", textContent: "Zadani uređaj sustava" })];
+  const options = [el("option", { value: "", textContent: "System default" })];
   for (const n of names) options.push(el("option", { value: n, textContent: n }));
   if (saved && !names.includes(saved))
-    options.push(el("option", { value: saved, textContent: `${saved} (nije spojen)` }));
+    options.push(el("option", { value: saved, textContent: `${saved} (not connected)` }));
   sel.replaceChildren(...options);
   sel.value = saved || "";
 }
@@ -550,7 +572,7 @@ async function loadBanned() {
       "li",
       {},
       el("span", { className: "name", textContent: label === "—" ? t.rel_path : label, title: t.rel_path }),
-      el("button", { textContent: "Vrati" }),
+      el("button", { textContent: "Restore" }),
     );
     li.dataset.id = t.id;
     frag.append(li);
@@ -595,7 +617,7 @@ function wire() {
     const li = e.target.closest("li");
     if (!li) return;
     e.preventDefault();
-    openMenu(li.dataset.key, e.clientX, e.clientY);
+    if (li.dataset.key !== UNKNOWN_KEY) openMenu(li.dataset.key, e.clientX, e.clientY);
   });
   $("menu").addEventListener("click", (e) => {
     const action = e.target.dataset.action;
@@ -666,7 +688,7 @@ async function init() {
       state.artistsStale = true;
       if (state.tab === "artists") reloadArtists();
     }),
-    listen("track-skipped", (e) => console.info("preskočeno:", e.payload)),
+    listen("track-skipped", (e) => console.info("skipped:", e.payload)),
   ]);
 
   const settings = await run("get_settings");

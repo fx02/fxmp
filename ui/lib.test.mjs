@@ -14,6 +14,7 @@ import {
   missingUsername,
   plural,
   passwordRequired,
+  mergeChoices,
 } from "./lib.mjs";
 
 const NB = " ";
@@ -80,50 +81,60 @@ test("debounce runs once with the last arguments after the quiet period", async 
   assert.deepEqual(calls, [3, 4]);
 });
 
-test("plural picks Croatian forms (1 / 2-4 / 5+, 11-14 are 5+)", () => {
-  const f = ["datoteka", "datoteke", "datoteka"];
-  const forms = ["jedan", "dva", "pet"];
-  const pick = (n) => plural(n, forms);
-  assert.deepEqual([1, 21, 101].map(pick), ["jedan", "jedan", "jedan"]);
-  assert.deepEqual([2, 3, 4, 22, 104].map(pick), ["dva", "dva", "dva", "dva", "dva"]);
-  assert.deepEqual([0, 5, 11, 12, 13, 14, 111, 112, 25].map(pick), Array(9).fill("pet"));
-  assert.equal(plural(2, f), "datoteke");
+test("plural picks the English singular only for exactly one", () => {
+  const forms = ["track", "tracks"];
+  assert.equal(plural(1, forms), "track");
+  assert.deepEqual([0, 2, 11, 21, 101].map((n) => plural(n, forms)), Array(5).fill("tracks"));
 });
 
 test("scanProgressText", () => {
-  assert.equal(scanProgressText(null), "Skeniram… popisujem datoteke");
-  assert.equal(scanProgressText({ seen: 0, read: 0, failed: 0 }), "Skeniram… popisujem datoteke");
-  assert.equal(scanProgressText({ seen: 12340, read: 10, failed: 0 }), `Skeniram… 12${NB}340 datoteka`);
-  assert.equal(scanProgressText({ seen: 1, read: 1, failed: 0 }), "Skeniram… 1 datoteka");
-  assert.equal(scanProgressText({ seen: 3, read: 3, failed: 0 }), "Skeniram… 3 datoteke");
-  assert.equal(scanProgressText({ seen: 5, read: 3, failed: 2 }), "Skeniram… 5 datoteka (nečitljivo: 2)");
+  assert.equal(scanProgressText(null), "Scanning… listing files");
+  assert.equal(scanProgressText({ seen: 0, read: 0, failed: 0 }), "Scanning… listing files");
+  assert.equal(scanProgressText({ seen: 12340, read: 10, failed: 0 }), `Scanning… 12${NB}340 files`);
+  assert.equal(scanProgressText({ seen: 1, read: 1, failed: 0 }), "Scanning… 1 file");
+  assert.equal(scanProgressText({ seen: 3, read: 3, failed: 0 }), "Scanning… 3 files");
+  assert.equal(scanProgressText({ seen: 5, read: 3, failed: 2 }), "Scanning… 5 files (unreadable: 2)");
 });
 
 test("scanDoneText covers success, cancel and error", () => {
   assert.equal(
     scanDoneText({ ok: true, cancelled: false, total: 59400, read: 100, failed: 2, removed: 1 }),
-    `Katalog osvježen: 59${NB}400 datoteka. Novo ili promijenjeno: 100, nečitljivo: 2, uklonjeno: 1.`,
+    `Library refreshed: 59${NB}400 files. New or changed: 100, unreadable: 2, removed: 1.`,
   );
   assert.equal(
-    scanDoneText({ ok: true, cancelled: false, total: 22, read: 0, failed: 0, removed: 0 }),
-    "Katalog osvježen: 22 datoteke. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0.",
+    scanDoneText({ ok: true, cancelled: false, total: 1, read: 0, failed: 0, removed: 0 }),
+    "Library refreshed: 1 file. New or changed: 0, unreadable: 0, removed: 0.",
   );
-  assert.equal(scanDoneText({ ok: true, cancelled: true, cancel_reason: null }), "Skeniranje je prekinuto.");
+  assert.equal(scanDoneText({ ok: true, cancelled: true, cancel_reason: null }), "Scan cancelled.");
   assert.equal(
-    scanDoneText({ ok: false, cancelled: true, cancel_reason: "Postavke su promijenjene." }),
-    "Postavke su promijenjene.",
+    scanDoneText({ ok: false, cancelled: true, cancel_reason: "The server settings changed." }),
+    "The server settings changed.",
   );
   assert.equal(
-    scanDoneText({ ok: false, cancelled: false, error: "Disk nije dostupan." }),
-    "Skeniranje nije uspjelo: Disk nije dostupan.",
+    scanDoneText({ ok: false, cancelled: false, error: "source unreachable" }),
+    "Scan failed: source unreachable",
   );
 });
 
-test("connMessage maps statuses to Croatian text", () => {
-  assert.equal(connMessage("ok"), "Spojeno");
-  assert.equal(connMessage("auth"), "Pogrešno korisničko ime ili lozinka");
-  assert.match(connMessage("unreachable"), /Disk nije dostupan/);
-  assert.equal(connMessage("secondary"), "Spojeno na rezervni server");
+test("connMessage maps statuses to the backend's English text", () => {
+  assert.equal(connMessage("ok"), "Connected");
+  assert.equal(connMessage("auth"), "Wrong username or password");
+  assert.equal(connMessage("unreachable"), "The music share is unreachable. Is WireGuard/VPN on?");
+  assert.equal(connMessage("secondary"), "Connected to the backup server");
+  assert.equal(connMessage("nope"), "");
+});
+
+test("mergeChoices lists known and existing genres except the source and Unknown", () => {
+  const known = ["Chillout", "Drum & Bass", "Downtempo", "Trance"];
+  const genres = [
+    { key: "chillout", display: "Chillout", count: 3 },
+    { key: "_none", display: "Unknown", count: 9 },
+    { key: "lounge", display: "Lounge", count: 1 },
+  ];
+  assert.deepEqual(mergeChoices(known, genres, "chillout", ""), ["Downtempo", "Drum & Bass", "Lounge", "Trance"]);
+  assert.deepEqual(mergeChoices(known, genres, "chillout", " d "), ["Downtempo", "Drum & Bass"]);
+  assert.deepEqual(mergeChoices(known, genres, "lounge", "chill"), ["Chillout"]);
+  assert.deepEqual(mergeChoices([], [], "x", "zzz"), []);
 });
 
 test("serverFromForm trims fields and turns an empty domain into null", () => {
