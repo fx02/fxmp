@@ -39,7 +39,7 @@ fn main() {
             media::init(handle);
             let st = handle.state::<state::AppState>();
             let settings = st.settings.get();
-            if let Err(e) = autostart::apply(handle, settings.autostart) {
+            if let Err(e) = autostart::apply(handle, settings.autostart, true) {
                 log::warn!("start at login: {e}");
             }
             // The window starts hidden: a start at login stays in the menu bar unless

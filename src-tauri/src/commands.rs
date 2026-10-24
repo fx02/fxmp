@@ -114,10 +114,9 @@ pub async fn save_settings(
             );
         }
         st.reconnect(&saved);
-        autostart::apply(app, saved.autostart).map_err(|e| {
-            format!(
-                "Postavke su spremljene, ali automatsko pokretanje nije moguće promijeniti: {e}"
-            )
+        autostart::apply(app, saved.autostart, false).map_err(|e| {
+            log::warn!("start at login: {e}");
+            "Postavke su spremljene, ali automatsko pokretanje nije moguće promijeniti.".to_string()
         })
     })
     .await

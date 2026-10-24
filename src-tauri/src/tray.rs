@@ -1,7 +1,6 @@
 //! Menu bar (tray) icon and its menu.
 
 use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use smp_core::audio::player::Command;
@@ -52,13 +51,13 @@ struct Tray {
     pause: MenuItem<Wry>,
     ban: MenuItem<Wry>,
     genres: Submenu<Wry>,
-    rebuild_genres: Mutex<Sender<()>>,
+    rebuild_genres: Sender<()>,
 }
 
 /// Creates the tray icon. Runs on the main thread, after `AppState::init`.
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let now = MenuItem::with_id(app, "now", track_label(None), false, None::<&str>)?;
-    let pause = MenuItem::with_id(app, ID_TOGGLE, pause_label(None), true, None::<&str>)?;
+    let pause = MenuItem::with_id(app, ID_TOGGLE, pause_label(None), false, None::<&str>)?;
     let next = MenuItem::with_id(app, ID_NEXT, "Sljedeća", true, None::<&str>)?;
     let ban = MenuItem::with_id(app, ID_BAN, "Nikad više ovu pjesmu", false, None::<&str>)?;
     // Filled in the background: the catalog is not queried on the main thread.
@@ -112,7 +111,7 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         pause,
         ban,
         genres,
-        rebuild_genres: Mutex::new(tx),
+        rebuild_genres: tx,
     });
 
     let handle = app.clone();
@@ -132,14 +131,14 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let handle = app.clone();
     app.listen_any("genres-changed", move |_| refresh_genres(&handle));
     let handle = app.clone();
-    state::on_now_playing(app, move |np| show_now_playing(&handle, np.as_ref()));
+    state::on_now_playing(app, move |np| show_now_playing(&handle, np));
     Ok(())
 }
 
 /// Schedules a rebuild of the "Žanr" submenu (no-op before the tray exists).
 pub fn refresh_genres(app: &AppHandle) {
     if let Some(tray) = app.try_state::<Tray>() {
-        let _ = lock(&tray.rebuild_genres).send(());
+        let _ = tray.rebuild_genres.send(());
     }
 }
 
@@ -153,11 +152,15 @@ fn rebuild_genre_menu(app: &AppHandle, shown: &mut Vec<GenreEntry>) -> Result<()
     }
     let menu = &app.state::<Tray>().genres;
     let err = |e: tauri::Error| e.to_string();
+    // Until the rebuild completes the submenu matches nothing, so a failure is
+    // retried on the next event.
+    shown.clear();
     for item in menu.items().map_err(err)? {
         menu.remove(&item).map_err(err)?;
     }
     for e in &entries {
-        let item = MenuItem::with_id(app, &e.id, &e.label, true, None::<&str>).map_err(err)?;
+        let item =
+            MenuItem::with_id(app, &e.id, menu_text(&e.label), true, None::<&str>).map_err(err)?;
         menu.append(&item).map_err(err)?;
     }
     log::info!("tray genre menu: {} items", entries.len());
@@ -165,20 +168,30 @@ fn rebuild_genre_menu(app: &AppHandle, shown: &mut Vec<GenreEntry>) -> Result<()
     Ok(())
 }
 
-fn show_now_playing(app: &AppHandle, np: Option<&NowPlaying>) {
-    let Some(tray) = app.try_state::<Tray>() else {
-        return;
-    };
-    let label = track_label(np);
-    let _ = tray.now.set_text(&label);
-    let _ = tray.pause.set_text(pause_label(np));
-    let _ = tray.ban.set_enabled(np.is_some());
-    let tooltip = if np.is_some() {
-        label.as_str()
-    } else {
-        TOOLTIP_IDLE
-    };
-    let _ = tray.icon.set_tooltip(Some(tooltip));
+/// Updates the menu and tooltip in one main-thread call, so the player-event thread
+/// does not wait for the main thread.
+fn show_now_playing(app: &AppHandle, np: Option<NowPlaying>) {
+    let handle = app.clone();
+    let result = app.run_on_main_thread(move || {
+        let Some(tray) = handle.try_state::<Tray>() else {
+            return;
+        };
+        let np = np.as_ref();
+        let label = track_label(np);
+        let _ = tray.now.set_text(menu_text(&label));
+        let _ = tray.pause.set_text(pause_label(np));
+        let _ = tray.pause.set_enabled(np.is_some());
+        let _ = tray.ban.set_enabled(np.is_some());
+        let tooltip = if np.is_some() {
+            label.as_str()
+        } else {
+            TOOLTIP_IDLE
+        };
+        let _ = tray.icon.set_tooltip(Some(tooltip));
+    });
+    if let Err(e) = result {
+        log::warn!("tray: {e}");
+    }
 }
 
 /// Runs on the main thread: anything that touches the catalog goes to a thread.
@@ -272,6 +285,11 @@ pub fn track_label(np: Option<&NowPlaying>) -> String {
     let mut short: String = label.chars().take(LABEL_MAX_CHARS - 1).collect();
     short.push('…');
     short
+}
+
+/// Menu item text as shown: macOS menus drop a single `&` (mnemonic marker).
+pub fn menu_text(s: &str) -> String {
+    s.replace('&', "&&")
 }
 
 pub fn pause_label(np: Option<&NowPlaying>) -> &'static str {
@@ -368,6 +386,13 @@ mod tests {
         let label = track_label(Some(&np("A", &long, false)));
         assert_eq!(label.chars().count(), LABEL_MAX_CHARS);
         assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn menu_text_keeps_ampersands() {
+        assert_eq!(menu_text("Drum & Bass"), "Drum && Bass");
+        assert_eq!(menu_text("A&&B"), "A&&&&B");
+        assert_eq!(menu_text("Plain"), "Plain");
     }
 
     #[test]
