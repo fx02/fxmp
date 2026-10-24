@@ -6,14 +6,16 @@ use serde::Serialize;
 use smp_core::audio::output::list_output_devices;
 use smp_core::audio::player::Command;
 use smp_core::genre::{known_genre, known_genre_names};
+use smp_core::source::Which;
 use smp_core::TrackId;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::autostart;
 use crate::connection::{status_of, test_server, test_target, ConnStatus, StatusPayload};
+use crate::credentials::CredentialStore;
 use crate::i18n;
 use crate::provider::CatalogProvider;
-use crate::settings::{ServerConfig, Settings};
+use crate::settings::{ServerConfig, Settings, SettingsStore};
 use crate::state::{self, apply_player_settings, lock, AppState, NowPlaying, ScanStatus};
 use crate::tray;
 
@@ -73,7 +75,70 @@ pub struct BannedTrack {
     pub id: TrackId,
     pub artist: String,
     pub title: String,
+    pub year: Option<u16>,
     pub rel_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Album {
+    pub name: String,
+    pub year: Option<u16>,
+}
+
+/// A row of the "Unreadable" list.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnreadableRow {
+    pub id: TrackId,
+    /// `smb://host/share/path/to/file.mp3`, without username or password.
+    pub path: String,
+    /// Failure code (`not_found`, `timeout`, …); none if not recorded.
+    pub code: Option<String>,
+    pub message: Option<String>,
+    pub fail_count: u32,
+    /// Unix seconds.
+    pub at: Option<i64>,
+    /// Left out of the shuffle until the next refresh.
+    pub excluded: bool,
+}
+
+/// Where a track lives: `smb://host/share/root/rel_path` on the server the failure
+/// came from (the configured primary when unknown or no backup is set up). Never
+/// holds a username or password.
+pub fn file_url(settings: &Settings, server: Option<Which>, rel_path: &str) -> String {
+    let cfg = match (server, &settings.secondary) {
+        (Some(Which::Secondary), Some(secondary)) => secondary,
+        _ => &settings.primary,
+    };
+    let path = [cfg.host.trim(), cfg.share.trim(), cfg.root.trim(), rel_path]
+        .iter()
+        .flat_map(|part| part.split('/'))
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("smb://{path}")
+}
+
+/// Resets the settings (see [`Settings::reset`]) and saves them at once; with
+/// `forget_servers` the servers' keychain passwords are deleted first. `apply` runs
+/// with the old and the new settings, as in [`SettingsStore::replace_and_save`].
+pub fn reset_settings_now(
+    store: &SettingsStore,
+    creds: &dyn CredentialStore,
+    forget_servers: bool,
+    apply: impl FnOnce(&Settings, &Settings),
+) -> CmdResult<Settings> {
+    let old = store.get();
+    if forget_servers {
+        for server in std::iter::once(&old.primary).chain(old.secondary.as_ref()) {
+            let username = server.username.trim();
+            if !username.is_empty() {
+                creds.delete(server.host.trim(), username)?;
+            }
+        }
+    }
+    store
+        .replace_and_save(old.reset(forget_servers), apply)
+        .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -339,6 +404,7 @@ pub async fn list_banned(app: AppHandle) -> CmdResult<Vec<BannedTrack>> {
                 id: t.id,
                 artist: t.meta.artist.unwrap_or_default(),
                 title: t.meta.title.unwrap_or_default(),
+                year: t.meta.year,
                 rel_path: t.rel_path,
             })
             .collect())
@@ -426,12 +492,102 @@ pub async fn list_artists(app: AppHandle) -> CmdResult<Vec<String>> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn list_albums(app: AppHandle, artist: String) -> CmdResult<Vec<String>> {
+pub async fn list_albums(app: AppHandle, artist: String) -> CmdResult<Vec<Album>> {
     run(app, move |_, st| {
         let albums = lock(&st.query).albums(&artist).map_err(db_err)?;
-        Ok(albums.into_iter().map(|a| a.name).collect())
+        Ok(albums
+            .into_iter()
+            .map(|a| Album {
+                name: a.name,
+                year: a.year,
+            })
+            .collect())
     })
     .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn list_unreadable(app: AppHandle) -> CmdResult<Vec<UnreadableRow>> {
+    run(app, |_, st| {
+        let rows = lock(&st.query).unreadable().map_err(db_err)?;
+        let settings = st.settings.get();
+        Ok(rows
+            .into_iter()
+            .map(|t| UnreadableRow {
+                id: t.id,
+                path: file_url(&settings, t.server, &t.rel_path),
+                code: t.code,
+                message: t.message,
+                fail_count: t.fail_count,
+                at: t.at,
+                excluded: t.excluded,
+            })
+            .collect())
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn unreadable_count(app: AppHandle) -> CmdResult<usize> {
+    run(app, |_, st| {
+        lock(&st.query).unreadable_count().map_err(db_err)
+    })
+    .await
+}
+
+/// Lets an unreadable track (`id`), or all of them, play again.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn retry_unreadable(app: AppHandle, id: Option<TrackId>) -> CmdResult<()> {
+    run(app, move |app, st| {
+        st.writer
+            .call(move |c| match id {
+                Some(id) => c.retry_failed(id),
+                None => c.retry_all_failed().map(drop),
+            })
+            .map_err(db_err)?;
+        let _ = app.emit(state::UNREADABLE_EVENT, ());
+        // Tracks left out of the shuffle count again.
+        let _ = app.emit("genres-changed", ());
+        Ok(())
+    })
+    .await
+}
+
+/// "Reset settings to defaults" (see [`Settings::reset`]); with `forget_servers`
+/// also the servers and their keychain passwords. Start at login is switched off.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn reset_settings(app: AppHandle, forget_servers: bool) -> CmdResult<Settings> {
+    run(app, move |app, st| {
+        let mut servers_changed = false;
+        let new = reset_settings_now(
+            &st.settings,
+            st.creds.as_ref(),
+            forget_servers,
+            |old, new| {
+                servers_changed = old.primary != new.primary || old.secondary != new.secondary;
+                apply_player_settings(&st.player, new);
+            },
+        )?;
+        log::info!("settings reset to defaults (servers forgotten: {forget_servers})");
+        if servers_changed || forget_servers {
+            state::cancel_scan(st, Some(&i18n::t("scan.cancelled_settings")));
+            st.forget_or_reconnect(app, &new);
+        }
+        // The tray's genre menu lists the (now cleared) last selection.
+        tray::refresh_genres(app);
+        autostart::apply(app, new.autostart, false).map_err(|e| {
+            log::warn!("start at login: {e}");
+            i18n::t("err.autostart")
+        })?;
+        Ok(new)
+    })
+    .await
+}
+
+/// "Clear library": see [`state::clear_library`].
+#[tauri::command(rename_all = "snake_case")]
+pub async fn clear_library(app: AppHandle) -> CmdResult<()> {
+    run(app, |app, _| state::clear_library(app)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -442,6 +598,101 @@ pub async fn now_playing(app: AppHandle) -> CmdResult<Option<NowPlaying>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::credentials::{CredentialStore, MemoryStore};
+    use crate::settings::SettingsStore;
+    use smp_core::source::Which;
+
+    fn two_servers() -> Settings {
+        Settings {
+            primary: ServerConfig {
+                host: " 10.111.100.2 ".into(),
+                share: "F".into(),
+                root: "/MP3/".into(),
+                username: "music".into(),
+                domain: None,
+            },
+            secondary: Some(ServerConfig {
+                host: "10.111.0.2".into(),
+                share: "F".into(),
+                root: "".into(),
+                username: "backup".into(),
+                domain: Some("WG".into()),
+            }),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn file_url_uses_the_failing_server_and_no_credentials() {
+        let s = two_servers();
+        assert_eq!(
+            file_url(&s, None, "Rock/A b.mp3"),
+            "smb://10.111.100.2/F/MP3/Rock/A b.mp3"
+        );
+        assert_eq!(
+            file_url(&s, Some(Which::Primary), "x.mp3"),
+            "smb://10.111.100.2/F/MP3/x.mp3"
+        );
+        assert_eq!(
+            file_url(&s, Some(Which::Secondary), "x.mp3"),
+            "smb://10.111.0.2/F/x.mp3"
+        );
+        let one = Settings {
+            secondary: None,
+            ..s
+        };
+        assert_eq!(
+            file_url(&one, Some(Which::Secondary), "x.mp3"),
+            "smb://10.111.100.2/F/MP3/x.mp3",
+            "falls back to the primary"
+        );
+        assert!(!file_url(&one, None, "x.mp3").contains("music"));
+    }
+
+    #[test]
+    fn reset_settings_keeps_or_forgets_servers_and_passwords() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::settings::FILE_NAME);
+        let creds = MemoryStore::default();
+        creds.set("10.111.100.2", "music", "pw1").unwrap();
+        creds.set("10.111.0.2", "backup", "pw2").unwrap();
+        let start = Settings {
+            volume: 0.1,
+            notify: true,
+            autostart: true,
+            language: "hr".into(),
+            last_selection: vec!["rock".into()],
+            ..two_servers()
+        };
+        let store = SettingsStore::new(path.clone(), start.clone()).unwrap();
+
+        let mut applied = None;
+        let kept = reset_settings_now(&store, &creds, false, |old, new| {
+            applied = Some((old.volume, new.volume))
+        })
+        .unwrap();
+        assert_eq!(applied, Some((0.1, 0.7)));
+        assert_eq!(kept.primary, start.primary);
+        assert_eq!(kept.secondary, start.secondary);
+        assert_eq!((kept.notify, kept.autostart), (false, false));
+        assert!(kept.last_selection.is_empty());
+        assert_eq!(kept.language, "hr");
+        assert_eq!(Settings::load(&path).unwrap(), kept, "saved at once");
+        assert_eq!(creds.get("10.111.100.2", "music").as_deref(), Some("pw1"));
+
+        let forgot = reset_settings_now(&store, &creds, true, |_, _| {}).unwrap();
+        assert_eq!(
+            forgot,
+            Settings {
+                language: "hr".into(),
+                ..Settings::default()
+            }
+        );
+        assert_eq!(creds.get("10.111.100.2", "music"), None);
+        assert_eq!(creds.get("10.111.0.2", "backup"), None);
+        assert_eq!(Settings::load(&path).unwrap(), forgot);
+    }
 
     #[test]
     fn merge_target_must_be_a_known_genre() {

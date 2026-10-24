@@ -324,7 +324,8 @@ pub fn genre_pick(menu_id: &str) -> Option<GenrePick> {
         .map(|key| GenrePick::One(key.to_string()))
 }
 
-/// "Artist – Title" for the menu and the tooltip.
+/// "Artist – Title (1991)" for the menu and the tooltip; a long label is shortened
+/// before the year.
 pub fn track_label(lang: &str, np: Option<&NowPlaying>) -> String {
     let parts: Vec<&str> = np
         .map(|n| [n.artist.trim(), n.title.trim()])
@@ -336,12 +337,17 @@ pub fn track_label(lang: &str, np: Option<&NowPlaying>) -> String {
         return tr(lang, "tray.nothing_playing");
     }
     let label = parts.join(" – ");
-    if label.chars().count() <= LABEL_MAX_CHARS {
-        return label;
+    let year = np
+        .and_then(|n| n.year)
+        .map(|y| format!(" ({y})"))
+        .unwrap_or_default();
+    let room = LABEL_MAX_CHARS - year.chars().count();
+    if label.chars().count() <= room {
+        return label + &year;
     }
-    let mut short: String = label.chars().take(LABEL_MAX_CHARS - 1).collect();
+    let mut short: String = label.chars().take(room - 1).collect();
     short.push('…');
-    short
+    short + &year
 }
 
 /// Menu item text as shown: macOS menus drop a single `&` (mnemonic marker).
@@ -376,9 +382,32 @@ mod tests {
             artist: artist.into(),
             title: title.into(),
             album: String::new(),
+            year: None,
             genre_display: String::new(),
             paused,
         }
+    }
+
+    fn with_year(mut n: NowPlaying, year: u16) -> NowPlaying {
+        n.year = Some(year);
+        n
+    }
+
+    #[test]
+    fn track_label_ends_with_the_year() {
+        assert_eq!(
+            track_label("en", Some(&with_year(np("Artist", "Song", false), 1991))),
+            "Artist – Song (1991)"
+        );
+        assert_eq!(
+            track_label("en", Some(&with_year(np("", "Song", false), 2003))),
+            "Song (2003)"
+        );
+        // Shortened before the year, which stays.
+        let long = "ž".repeat(100);
+        let label = track_label("en", Some(&with_year(np("A", &long, false), 1991)));
+        assert_eq!(label.chars().count(), LABEL_MAX_CHARS);
+        assert!(label.ends_with("… (1991)"), "{label}");
     }
 
     #[test]

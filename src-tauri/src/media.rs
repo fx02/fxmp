@@ -121,47 +121,56 @@ fn notify_track(app: &AppHandle, np: &NowPlaying) {
         return;
     }
     let (title, body) = notification_text(np);
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+    // Title and year only: no image, icon or attachment is set.
+    let mut builder = app.notification().builder().title(title);
+    if !body.is_empty() {
+        builder = builder.body(body);
+    }
+    if let Err(e) = builder.show() {
         log::warn!("notification: {e}");
     }
 }
 
-/// Notification title and body: the song title, and "Artist — Album".
+/// Notification title and body: "Artist – Title", and the year (or nothing). The
+/// notification carries no image; macOS still shows the app icon.
 pub fn notification_text(np: &NowPlaying) -> (String, String) {
-    let body = [np.artist.trim(), np.album.trim()]
+    let title = [np.artist.trim(), np.title.trim()]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join(" — ");
-    (np.title.clone(), body)
+        .join(" – ");
+    (title, np.year.map(|y| y.to_string()).unwrap_or_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn np(artist: &str, title: &str, album: &str) -> NowPlaying {
+    fn np(artist: &str, title: &str, year: Option<u16>) -> NowPlaying {
         NowPlaying {
             id: 1,
             artist: artist.into(),
             title: title.into(),
-            album: album.into(),
+            album: "Album".into(),
+            year,
             genre_display: String::new(),
             paused: false,
         }
     }
 
     #[test]
-    fn notification_shows_title_then_artist_and_album() {
-        let (title, body) = notification_text(&np("Artist", "Song", "Album"));
-        assert_eq!(title, "Song");
-        assert_eq!(body, "Artist — Album");
+    fn notification_is_artist_and_title_with_the_year_as_body() {
+        let (title, body) = notification_text(&np("Artist", "Song", Some(1991)));
+        assert_eq!(title, "Artist – Song");
+        assert_eq!(body, "1991");
     }
 
     #[test]
-    fn notification_body_leaves_out_missing_parts() {
-        assert_eq!(notification_text(&np("Artist", "S", "")).1, "Artist");
-        assert_eq!(notification_text(&np(" ", "S", "Album")).1, "Album");
-        assert_eq!(notification_text(&np("", "S", "")).1, "");
+    fn notification_leaves_out_missing_parts() {
+        assert_eq!(
+            notification_text(&np("Artist", "Song", None)),
+            ("Artist – Song".to_string(), String::new())
+        );
+        assert_eq!(notification_text(&np(" ", "Song", None)).0, "Song");
     }
 }

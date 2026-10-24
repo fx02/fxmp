@@ -13,12 +13,16 @@ use smp_core::audio::player::{PlayItem, TrackProvider};
 use smp_core::catalog::{selection_key, Catalog};
 use smp_core::failure::Failure;
 use smp_core::shuffle::{entropy_shuffler, Shuffler};
+use smp_core::source::Which;
 use smp_core::TrackId;
 
 use crate::writer::CatalogWriter;
 
 /// Tracks banned while the app runs, so a running shuffle stops handing them out.
 pub type BannedSet = Arc<Mutex<HashSet<TrackId>>>;
+
+/// The server playback is using, if known (recorded with a failure).
+pub type ActiveServer = Arc<dyn Fn() -> Option<Which> + Send + Sync>;
 
 /// What a provider needs while playing.
 #[derive(Clone)]
@@ -27,6 +31,7 @@ pub struct Playback {
     pub db: Arc<Mutex<Catalog>>,
     pub writer: CatalogWriter,
     pub banned: BannedSet,
+    pub active_server: ActiveServer,
 }
 
 enum Order {
@@ -142,8 +147,9 @@ impl TrackProvider for CatalogProvider {
 
     fn on_failed(&mut self, id: TrackId, failure: &Failure) {
         let failure = failure.clone();
+        let server = (self.ctx.active_server)();
         self.ctx.writer.send("failure", move |c| {
-            c.record_failure(id, &failure, None).map(drop)
+            c.record_failure(id, &failure, server).map(drop)
         });
         self.forget(id);
     }
@@ -163,10 +169,11 @@ impl TrackProvider for CatalogProvider {
 mod tests {
     use super::*;
     use smp_core::catalog::TrackMeta;
+    use smp_core::failure::FailCode;
     use std::time::{Duration, Instant};
 
     fn decode_failure() -> Failure {
-        Failure::new(smp_core::failure::FailCode::Decode, "bad frame")
+        Failure::new(FailCode::Decode, "bad frame")
     }
 
     fn track(cat: &Catalog, path: &str, genre: &str, album: Option<(&str, u32)>) -> TrackId {
@@ -199,6 +206,7 @@ mod tests {
                 db: Arc::new(Mutex::new(Catalog::open(&path).unwrap())),
                 writer: CatalogWriter::spawn(Catalog::open(&path).unwrap()).unwrap(),
                 banned: BannedSet::default(),
+                active_server: Arc::new(|| Some(Which::Secondary)),
             };
             Self {
                 _dir: dir,
@@ -270,6 +278,21 @@ mod tests {
             fx.flush();
             assert_eq!(fx.query.last_first(&key).unwrap(), Some(id));
         }
+    }
+
+    #[test]
+    fn failures_are_stored_with_reason_and_server() {
+        let (fx, _) = Fx::with_genres();
+        let mut p = fx.shuffle(&["jazz".to_string()]);
+        let item = p.next_track().unwrap();
+        p.on_failed(item.id, &Failure::new(FailCode::Timeout, "timed out"));
+        fx.flush();
+        let u = fx.query.unreadable().unwrap();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].id, item.id);
+        assert_eq!(u[0].code.as_deref(), Some("timeout"));
+        assert_eq!(u[0].message.as_deref(), Some("timed out"));
+        assert_eq!(u[0].server, Some(Which::Secondary));
     }
 
     #[test]

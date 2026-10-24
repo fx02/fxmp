@@ -26,6 +26,13 @@ use crate::writer::CatalogWriter;
 
 /// How often the UI is told to reload genres while a scan runs.
 const GENRES_REFRESH: Duration = Duration::from_secs(3);
+/// Failures come in bursts (a dead share): the "Unreadable" list is reloaded once
+/// they settle for this long.
+const UNREADABLE_DEBOUNCE: Duration = Duration::from_secs(1);
+/// Longest wait for a running scan to stop before the library is cleared.
+const CLEAR_SCAN_WAIT: Duration = Duration::from_secs(30);
+/// Tells the UI that the "Unreadable" list changed.
+pub const UNREADABLE_EVENT: &str = "unreadable-changed";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NowPlaying {
@@ -33,6 +40,7 @@ pub struct NowPlaying {
     pub artist: String,
     pub title: String,
     pub album: String,
+    pub year: Option<u16>,
     pub genre_display: String,
     pub paused: bool,
 }
@@ -103,6 +111,7 @@ pub struct AppState {
     cancel_scan: Arc<AtomicBool>,
     cancel_reason: Mutex<Option<String>>,
     scan_progress: Mutex<Option<ScanProgressPayload>>,
+    unreadable_changed: Mutex<Sender<()>>,
 }
 
 /// Locks a mutex, carrying on after a panic elsewhere (all state here stays valid).
@@ -149,6 +158,7 @@ impl AppState {
         }
 
         let (wake_tx, wake_rx) = mpsc::channel();
+        let (unreadable_tx, unreadable_rx) = mpsc::channel::<()>();
         app.manage(AppState {
             catalog_path,
             settings: SettingsStore::new(settings_path, settings)?,
@@ -166,7 +176,21 @@ impl AppState {
             cancel_scan: Arc::new(AtomicBool::new(false)),
             cancel_reason: Mutex::new(None),
             scan_progress: Mutex::new(None),
+            unreadable_changed: Mutex::new(unreadable_tx),
         });
+
+        let handle = app.clone();
+        std::thread::Builder::new()
+            .name("unreadable-events".into())
+            .spawn(move || {
+                while unreadable_rx.recv().is_ok() {
+                    std::thread::sleep(UNREADABLE_DEBOUNCE);
+                    while unreadable_rx.try_recv().is_ok() {}
+                    // Failures are written by the writer: wait for those queued.
+                    let _ = handle.state::<AppState>().writer.call(|_| Ok(()));
+                    let _ = handle.emit(UNREADABLE_EVENT, ());
+                }
+            })?;
 
         let handle = app.clone();
         std::thread::Builder::new()
@@ -216,6 +240,23 @@ impl AppState {
         let _ = lock(&self.wake_monitor).send(());
     }
 
+    /// Schedules an `unreadable-changed` event (debounced).
+    pub fn unreadable_changed(&self) {
+        let _ = lock(&self.unreadable_changed).send(());
+    }
+
+    /// After the servers changed: reconnects, or with no server set up (no username)
+    /// drops the connection and reports no status, as on a first start.
+    pub fn forget_or_reconnect(&self, app: &AppHandle, settings: &Settings) {
+        if settings.primary.username.trim().is_empty() {
+            self.source.set(None);
+            *lock(&self.status) = None;
+            let _ = app.emit("connection-status", None::<StatusPayload>);
+        } else {
+            self.reconnect(settings);
+        }
+    }
+
     /// Replaces the servers (fresh connections, forgetting a rejected password) and
     /// re-checks the connection.
     pub fn reconnect(&self, settings: &Settings) {
@@ -230,6 +271,10 @@ impl AppState {
             db: self.catalog.clone(),
             writer: self.writer.clone(),
             banned: self.banned.clone(),
+            active_server: {
+                let source = self.source.clone();
+                Arc::new(move || source.servers().map(|s| s.failover.active()))
+            },
         }
     }
 
@@ -274,6 +319,7 @@ fn now_playing_of(catalog: &Catalog, id: TrackId, paused: bool) -> smp_core::Res
         artist: row.meta.artist.unwrap_or_default(),
         title,
         album: row.meta.album.unwrap_or_default(),
+        year: row.meta.year,
         genre_display: catalog
             .track_genres(id)?
             .into_iter()
@@ -333,6 +379,7 @@ fn on_player_event(app: &AppHandle, ev: Event) {
         }
         Event::TrackSkipped { id, reason } => {
             let _ = app.emit("track-skipped", TrackSkippedPayload { id, reason });
+            st.unreadable_changed();
             // Possibly the network: re-check the connection.
             st.wake_monitor();
         }
@@ -464,6 +511,55 @@ fn run_scan(app: &AppHandle) {
     *lock(&st.scan_progress) = None;
     let _ = app.emit("genres-changed", ());
     let _ = app.emit("scan-done", payload);
+    st.unreadable_changed();
+}
+
+/// Clears the scan flag when dropped (also on an early return).
+struct ScanSlot<'a>(&'a AtomicBool);
+
+impl Drop for ScanSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// "Clear library": stops any scan and the music, then empties the catalog through
+/// the writer (one transaction, which every connection sees at once). The scan flag
+/// is held meanwhile, so no scan starts until the catalog is empty. Settings stay;
+/// only the last genre selection is forgotten.
+pub fn clear_library(app: &AppHandle) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    let deadline = Instant::now() + CLEAR_SCAN_WAIT;
+    while st
+        .scanning
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        cancel_scan(&st, Some(&i18n::t("scan.cancelled_clear")));
+        if Instant::now() >= deadline {
+            return Err(i18n::t("err.clear_busy"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _slot = ScanSlot(&st.scanning);
+    st.player.send(Command::Stop);
+    let cleared = st.writer.call(|c| c.clear());
+    lock(&st.banned).clear();
+    st.settings.update(|s| s.last_selection.clear(), |_| {});
+    *lock(&st.now_playing) = None;
+    emit_now_playing(app, &None);
+    let _ = app.emit("genres-changed", ());
+    let _ = app.emit(UNREADABLE_EVENT, ());
+    match cleared {
+        Ok(()) => {
+            log::info!("library cleared");
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!("clearing the library failed: {e}");
+            Err(i18n::tf("err.database", &[("error", &e.to_string())]))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +573,7 @@ mod tests {
         let meta = TrackMeta {
             artist: Some("Artist".into()),
             raw_genre: Some("Trance; Chillout".into()),
+            year: Some(1997),
             ..Default::default()
         };
         let id = c.upsert_track("x/Some Song.mp3", 1, 1, &meta).unwrap();
@@ -486,6 +583,7 @@ mod tests {
         assert_eq!(np.artist, "Artist");
         assert_eq!(np.album, "");
         assert_eq!(np.genre_display, "Chillout, Trance");
+        assert_eq!(np.year, Some(1997));
         assert!(np.paused);
     }
 

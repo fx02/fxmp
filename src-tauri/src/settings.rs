@@ -92,6 +92,24 @@ impl Settings {
         self
     }
 
+    /// "Reset settings to defaults": every setting back to its default except the
+    /// language, and the servers unless `forget_servers`.
+    pub fn reset(&self, forget_servers: bool) -> Self {
+        let defaults = Settings {
+            language: self.language.clone(),
+            ..Settings::default()
+        };
+        if forget_servers {
+            defaults
+        } else {
+            Settings {
+                primary: self.primary.clone(),
+                secondary: self.secondary.clone(),
+                ..defaults
+            }
+        }
+    }
+
     /// Reads settings from `path`; `None` if the file does not exist or cannot be parsed.
     pub fn load(path: &Path) -> Option<Self> {
         let text = match std::fs::read_to_string(path) {
@@ -255,6 +273,53 @@ mod tests {
         assert_eq!(hr.clamped().language, "hr");
         let xx: Settings = serde_json::from_str(r#"{"language": "xx"}"#).unwrap();
         assert_eq!(xx.clamped().language, "en");
+    }
+
+    fn customised() -> Settings {
+        Settings {
+            primary: ServerConfig {
+                host: "10.0.0.9".into(),
+                username: "music".into(),
+                ..ServerConfig::default()
+            },
+            secondary: Some(ServerConfig {
+                host: "10.111.0.2".into(),
+                username: "music".into(),
+                ..ServerConfig::default()
+            }),
+            volume: 0.2,
+            device: Some("USB DAC".into()),
+            crossfade_enabled: false,
+            crossfade_secs: 9,
+            normalize: false,
+            notify: true,
+            autostart: true,
+            last_selection: vec!["rock".into()],
+            language: "hr".into(),
+        }
+    }
+
+    #[test]
+    fn reset_restores_defaults_keeping_language_and_servers() {
+        let old = customised();
+        let new = old.reset(false);
+        assert_eq!(
+            new,
+            Settings {
+                primary: old.primary.clone(),
+                secondary: old.secondary.clone(),
+                language: "hr".into(),
+                ..Settings::default()
+            }
+        );
+        let forgot = old.reset(true);
+        assert_eq!(
+            forgot,
+            Settings {
+                language: "hr".into(),
+                ..Settings::default()
+            }
+        );
     }
 
     #[test]

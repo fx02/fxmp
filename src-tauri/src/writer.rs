@@ -64,6 +64,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clearing_through_the_writer_empties_what_readers_see() {
+        use smp_core::catalog::TrackMeta;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let reader = Catalog::open(&path).unwrap();
+        let w = CatalogWriter::spawn(Catalog::open(&path).unwrap()).unwrap();
+        w.call(|c| {
+            let id = c.upsert_track("a.mp3", 1, 1, &TrackMeta::default())?;
+            c.rebuild_genres()?;
+            c.set_banned(id, true)
+        })
+        .unwrap();
+        assert!(!reader.is_empty().unwrap());
+        w.call(|c| c.clear()).unwrap();
+        assert!(reader.is_empty().unwrap());
+        assert!(reader.banned().unwrap().is_empty());
+        assert!(reader.genres().unwrap().is_empty());
+    }
+
+    #[test]
     fn jobs_run_in_order_and_call_returns_results() {
         let w = CatalogWriter::spawn(Catalog::open_in_memory().unwrap()).unwrap();
         w.send("first", |c| c.set_last_first("k", 1));

@@ -87,6 +87,11 @@ fn main() {
             commands::list_artists,
             commands::list_albums,
             commands::now_playing,
+            commands::list_unreadable,
+            commands::unreadable_count,
+            commands::retry_unreadable,
+            commands::reset_settings,
+            commands::clear_library,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

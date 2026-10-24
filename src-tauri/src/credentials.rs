@@ -11,6 +11,8 @@ pub fn account(host: &str, username: &str) -> String {
 pub trait CredentialStore: Send + Sync {
     fn get(&self, host: &str, username: &str) -> Option<String>;
     fn set(&self, host: &str, username: &str, password: &str) -> Result<(), String>;
+    /// Removes the stored password; no password stored is not an error.
+    fn delete(&self, host: &str, username: &str) -> Result<(), String>;
 }
 
 /// The OS keychain via `keyring`.
@@ -23,6 +25,10 @@ impl CredentialStore for Keychain {
 
     fn set(&self, host: &str, username: &str, password: &str) -> Result<(), String> {
         set(host, username, password)
+    }
+
+    fn delete(&self, host: &str, username: &str) -> Result<(), String> {
+        delete(host, username)
     }
 }
 
@@ -51,6 +57,18 @@ pub fn set(host: &str, username: &str, password: &str) -> Result<(), String> {
         .map_err(|e| crate::i18n::tf("err.keychain", &[("error", &e.to_string())]))
 }
 
+pub fn delete(host: &str, username: &str) -> Result<(), String> {
+    let result =
+        keyring::Entry::new(SERVICE, &account(host, username)).and_then(|e| e.delete_credential());
+    match result {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(crate::i18n::tf(
+            "err.keychain_delete",
+            &[("error", &e.to_string())],
+        )),
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub struct MemoryStore(std::sync::Mutex<std::collections::HashMap<String, String>>);
@@ -72,11 +90,25 @@ impl CredentialStore for MemoryStore {
             .insert(account(host, username), password.to_string());
         Ok(())
     }
+
+    fn delete(&self, host: &str, username: &str) -> Result<(), String> {
+        self.0.lock().unwrap().remove(&account(host, username));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_store_deletes() {
+        let m = MemoryStore::default();
+        m.set("h", "u", "pw").unwrap();
+        m.delete("h", "u").unwrap();
+        assert_eq!(m.get("h", "u"), None);
+        m.delete("h", "u").unwrap();
+    }
 
     #[test]
     fn account_is_host_slash_username() {
