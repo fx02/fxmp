@@ -89,6 +89,9 @@ enum Msg {
 /// Handle to the engine thread; dropping it stops the engine.
 pub struct Player {
     tx: Sender<Msg>,
+    /// Engine loop iterations, to check the engine does not spin.
+    #[cfg(test)]
+    loops: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Player {
@@ -100,11 +103,17 @@ impl Player {
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let engine = Engine::new(rx, tx.clone(), source, sinks, events, cfg);
+        #[cfg(test)]
+        let loops = engine.loops.clone();
         std::thread::Builder::new()
             .name("player".into())
             .spawn(move || engine.run())
             .expect("spawn player thread");
-        Self { tx }
+        Self {
+            tx,
+            #[cfg(test)]
+            loops,
+        }
     }
 
     pub fn send(&self, c: Command) {
@@ -171,6 +180,7 @@ struct Engine {
     pending: Vec<f32>,
     pending_pos: usize,
     scratch: Vec<f32>,
+    loops: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Engine {
@@ -219,6 +229,7 @@ impl Engine {
             pending: Vec::with_capacity(BLOCK * 2),
             pending_pos: 0,
             scratch: Vec::with_capacity(BLOCK * 2),
+            loops: Arc::default(),
         }
     }
 
@@ -228,6 +239,8 @@ impl Engine {
             if !self.drain_messages(wait) {
                 return;
             }
+            self.loops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.update();
             wait = match self.step() {
                 Step::Progress => None,
@@ -332,10 +345,15 @@ impl Engine {
     }
 
     /// Pausing fades out over 20 ms first; `Paused(true)` follows once the fade is written.
+    /// Resuming before the fade-out finished emits nothing: `Paused(true)` never went out.
     fn set_paused(&mut self, p: bool) {
+        if p == self.paused {
+            return;
+        }
+        let was_reported = self.paused && self.pause_reported;
         self.paused = p;
         self.pause_reported = !p;
-        if !p {
+        if !p && was_reported {
             self.emit(Event::Paused(false));
         }
     }
@@ -491,6 +509,7 @@ impl Engine {
 
     /// Drops the outgoing deck, reporting it if it had played to its end.
     fn drop_outgoing(&mut self) {
+        self.out_starved_since = None;
         if let Some(mut deck) = self.out.take() {
             self.report_end(&mut deck);
         }
@@ -671,7 +690,10 @@ impl Engine {
                 return Step::Progress;
             }
             if let Some(since) = self.out_starved_since {
-                return Step::Wait(OUT_STALL_GRACE.saturating_sub(since.elapsed()));
+                let left = OUT_STALL_GRACE.saturating_sub(since.elapsed());
+                if !left.is_zero() {
+                    return Step::Wait(left);
+                }
             }
             // Waiting for a deck: its thread wakes us when data arrives.
             return Step::Wait(IDLE_WAIT);

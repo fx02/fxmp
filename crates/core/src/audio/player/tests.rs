@@ -218,6 +218,20 @@ impl Harness {
         }
     }
 
+    /// Waits until the mixer has run dry (output stops growing).
+    fn wait_output_stable(&self) {
+        let mut len = 0;
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = self.out.lock().unwrap().len();
+            if now == len && now > 0 {
+                return;
+            }
+            len = now;
+        }
+        panic!("output kept growing");
+    }
+
     fn output(&self) -> Vec<f32> {
         self.out.lock().unwrap().clone()
     }
@@ -601,7 +615,8 @@ fn normalization_applies_gain() {
     assert!((off - 1.0).abs() <= 0.1, "unnormalised ratio {off}");
 }
 
-/// Serves `stall-after.flac`: the bytes of tone500.flac up to 20 %, then reads never return.
+/// Serves `stall-<pct>-<freq>.flac`: the first `pct` % of the bytes of `tone<freq>.flac`,
+/// after which reads never return.
 struct StallAfterSource(LocalSource);
 
 struct StallAfter {
@@ -633,9 +648,14 @@ impl MusicSource for StallAfterSource {
         self.0.walk(on_entry)
     }
     fn open(&self, rel_path: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
-        if rel_path == "stall-after.flac" {
-            let data = std::fs::read(tests_dir().join("fixtures-audio/tone500.flac")).unwrap();
-            let limit = data.len() as u64 / 5;
+        if let Some(spec) = rel_path
+            .strip_prefix("stall-")
+            .and_then(|r| r.strip_suffix(".flac"))
+        {
+            let (pct, freq) = spec.split_once('-').unwrap();
+            let path = tests_dir().join(format!("fixtures-audio/tone{freq}.flac"));
+            let data = std::fs::read(path).unwrap();
+            let limit = data.len() as u64 * pct.parse::<u64>().unwrap() / 100;
             return Ok(Box::new(StallAfter {
                 data: std::io::Cursor::new(data),
                 limit,
@@ -664,21 +684,12 @@ fn next_on_stalled_track_is_immediate() {
     });
     let stalling = PlayItem {
         id: 1,
-        rel_path: "stall-after.flac".into(),
+        rel_path: "stall-20-500.flac".into(),
         gain_db: 0.0,
     };
     h.play(vec![stalling, tone(2, 1500)]);
     h.wait("first track", 5, |e| *e == Event::TrackStarted { id: 1 });
-    // Let the mixer run dry on the stalled source.
-    let mut len = 0;
-    for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(20));
-        let now = h.output().len();
-        if now == len && now > 0 {
-            break;
-        }
-        len = now;
-    }
+    h.wait_output_stable();
     h.player.send(Command::Next);
     h.wait("next track", 3, |e| *e == Event::TrackStarted { id: 2 });
 }
@@ -822,4 +833,92 @@ fn next_with_ready_track_crossfades_for_0_7_s() {
         (secs - 0.7).abs() <= 0.05,
         "both tones present for {secs} s"
     );
+}
+
+fn stalling_harness() -> Harness {
+    let cfg = PlayerConfig {
+        prefetch: PrefetchConfig {
+            read_timeout: Duration::from_secs(60),
+            ..Default::default()
+        },
+    };
+    let source: Arc<dyn MusicSource> = Arc::new(StallAfterSource(LocalSource::new(tests_dir())));
+    Harness::new(Opts {
+        cfg,
+        source: Some(source),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn engine_does_not_spin_when_both_decks_starve() {
+    let mut h = stalling_harness();
+    h.player.send(Command::SetCrossfade {
+        enabled: false,
+        secs: 5,
+    });
+    // Track 1 stalls after 12 s (the second is preloaded from 10 s); track 2 stalls after
+    // about 0.5 s (the file header is ~8 KB),
+    // well under the 0.7 s Next crossfade.
+    let item = |id, path: &str| PlayItem {
+        id,
+        rel_path: path.into(),
+        gain_db: 0.0,
+    };
+    h.play(vec![
+        item(1, "stall-60-500.flac"),
+        item(2, "stall-11-1500.flac"),
+    ]);
+    h.wait("first track", 5, |e| *e == Event::TrackStarted { id: 1 });
+    h.wait_output_stable();
+    h.player.send(Command::Next);
+    h.wait("second track", 5, |e| *e == Event::TrackStarted { id: 2 });
+    // Past the outgoing deck's stall grace both decks are starved mid-crossfade.
+    h.wait_output_stable();
+    let loops = || h.player.loops.load(std::sync::atomic::Ordering::Relaxed);
+    let before = loops();
+    std::thread::sleep(Duration::from_millis(300));
+    let n = loops() - before;
+    assert!(n < 50, "engine looped {n} times in 300 ms while starved");
+}
+
+#[test]
+fn resume_during_pause_fade_keeps_events_paired() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    h.play(vec![tone(1, 500), tone(2, 1500)]);
+    h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    std::thread::sleep(Duration::from_millis(100));
+    // Undo each pause before its fade-out can finish.
+    h.player.send(Command::Pause);
+    h.player.send(Command::Resume);
+    std::thread::sleep(Duration::from_millis(100));
+    h.player.send(Command::TogglePause);
+    h.player.send(Command::TogglePause);
+    std::thread::sleep(Duration::from_millis(100));
+    h.player.send(Command::Pause);
+    h.player.send(Command::Stop);
+    h.wait("stop", 5, |e| *e == Event::Idle);
+    // A complete pause/resume for comparison.
+    h.play(vec![tone(3, 500)]);
+    h.wait("restart", 5, |e| *e == Event::TrackStarted { id: 3 });
+    h.player.send(Command::Pause);
+    h.wait("paused", 5, |e| *e == Event::Paused(true));
+    h.player.send(Command::Resume);
+    h.wait("resumed", 5, |e| *e == Event::Paused(false));
+    let paused: Vec<bool> = h
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Paused(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    // Strictly alternating, starting with a pause.
+    for (i, p) in paused.iter().enumerate() {
+        assert_eq!(*p, i % 2 == 0, "unpaired Paused events: {paused:?}");
+    }
+    assert_eq!(paused.len() % 2, 0, "unpaired Paused events: {paused:?}");
 }
