@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, TrackMeta};
 use crate::failure::{FailCode, Failure};
-use crate::source::{FileEntry, MusicSource, SourceError};
+use crate::source::{FileEntry, MusicSource};
 use crate::tags::read_meta;
 use crate::{Error, Result, SetOnDrop};
 
@@ -51,16 +51,6 @@ impl Reporter<'_> {
     }
 }
 
-/// I/O error kinds that mean the connection failed, not the file
-/// (what `SmbReader` reports for timeouts and lost connections).
-fn is_network_io(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        TimedOut | NotConnected | ConnectionReset | ConnectionAborted | BrokenPipe
-    )
-}
-
 /// How [`scan_with`] runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanOptions {
@@ -96,10 +86,9 @@ pub fn scan(
 
 /// Syncs `catalog` with `source`: unchanged files are only marked seen, new or
 /// modified ones (and those marked for a new tag read) are tagged and upserted,
-/// vanished ones are removed. A file whose tags cannot be read stays in the catalog
-/// with empty metadata, its failure stored, and counts as failed; if opening or
-/// reading it failed because of a network problem, it is stored with size/mtime 0
-/// so the next scan retries it, and a known track keeps its tags.
+/// vanished ones are removed. A file whose tags cannot be read counts as failed and
+/// is read again by the next scan; a known track keeps everything it had, a new
+/// one is stored with empty metadata (see [`Catalog::record_scan_failure`]).
 /// Tagging runs on `opts.workers` threads; only the calling thread writes to the catalog.
 /// On cancel the walk stops and nothing is removed (`finish_scan` is skipped).
 pub fn scan_with(
@@ -183,61 +172,22 @@ pub fn scan_with(
 /// Outcome of opening and tagging one file.
 struct ReadResult {
     index: usize,
-    meta: std::result::Result<TrackMeta, ReadFailure>,
-    size: u64,
-    mtime: i64,
-}
-
-struct ReadFailure {
-    failure: Failure,
-    /// A network problem: size/mtime are stored as 0 so the next scan retries it,
-    /// and a known track keeps its tags meanwhile.
-    retry: bool,
+    meta: std::result::Result<TrackMeta, Failure>,
 }
 
 /// Opens and tags `entry`, classifying failures (see [`scan_with`]). A panic
-/// while doing so (a tag-parser bug, say) counts as an undecodable file.
+/// while doing so (a tag-parser bug, say) counts as a tag failure.
 fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult {
     let ext = e.rel_path.rsplit_once('.').map_or("", |(_, x)| x);
-    let failed = |err: &Error, retry: bool| {
-        let failure = Failure::from_tag_error(err);
-        let (size, mtime) = if retry { (0, 0) } else { (e.size, e.mtime) };
-        (Err(ReadFailure { failure, retry }), size, mtime)
-    };
     let read = || match source.open(&e.rel_path) {
-        Ok(mut r) => match read_meta(&mut *r, ext) {
-            Ok(meta) => (Ok(meta), e.size, e.mtime),
-            // Connection trouble while reading: retry next scan.
-            Err(err @ Error::Io(_)) if matches!(&err, Error::Io(io) if is_network_io(io)) => {
-                failed(&err, true)
-            }
-            Err(err) => failed(&err, false),
-        },
-        // Network trouble: retry next scan.
-        Err(err @ (SourceError::Unreachable | SourceError::Timeout | SourceError::Io(_))) => {
-            failed(&Error::Source(err), true)
-        }
-        Err(err) => failed(&Error::Source(err), false),
+        Ok(mut r) => read_meta(&mut *r, ext).map_err(|err| Failure::from_tag_error(&err)),
+        Err(err) => Err(Failure::from_tag_error(&Error::Source(err))),
     };
-    let (meta, size, mtime) =
-        std::panic::catch_unwind(AssertUnwindSafe(read)).unwrap_or_else(|_| {
-            log::warn!("scan: reading tags of '{}' panicked", e.rel_path);
-            let failure = Failure::new(FailCode::Tag, "reading the tags panicked");
-            (
-                Err(ReadFailure {
-                    failure,
-                    retry: false,
-                }),
-                e.size,
-                e.mtime,
-            )
-        });
-    ReadResult {
-        index,
-        meta,
-        size,
-        mtime,
-    }
+    let meta = std::panic::catch_unwind(AssertUnwindSafe(read)).unwrap_or_else(|_| {
+        log::warn!("scan: reading tags of '{}' panicked", e.rel_path);
+        Err(Failure::new(FailCode::Tag, "reading the tags panicked"))
+    });
+    ReadResult { index, meta }
 }
 
 /// Tags `files` on `opts.workers` threads and upserts the results from the
@@ -302,14 +252,8 @@ fn read_parallel(
                     let e = files[r.index];
                     let failed = r.meta.is_err();
                     match &r.meta {
-                        Ok(meta) => c.upsert_track(&e.rel_path, r.size, r.mtime, meta)?,
-                        Err(f) => c.record_scan_failure(
-                            &e.rel_path,
-                            r.size,
-                            r.mtime,
-                            &f.failure,
-                            f.retry,
-                        )?,
+                        Ok(meta) => c.upsert_track(&e.rel_path, e.size, e.mtime, meta)?,
+                        Err(f) => c.record_scan_failure(&e.rel_path, e.size, e.mtime, f)?,
                     };
                     on_written(e, failed);
                 }
@@ -338,7 +282,7 @@ fn read_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{LocalSource, ReadSeek};
+    use crate::source::{LocalSource, ReadSeek, SourceError};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicI64;
@@ -435,6 +379,9 @@ mod tests {
         OpenFails(SourceError),
         /// Opens, but every read fails with this kind (as SmbReader's `to_io` produces).
         ReadFails(std::io::ErrorKind),
+        /// Reads fail as SmbReader's do: `kind` wrapping the source error.
+        ReadFailsWith(std::io::ErrorKind, SourceError),
+        Good(Vec<u8>),
         Garbage,
         /// Opens, but the first read panics (a bug in a tag parser, say).
         ReadPanics,
@@ -470,6 +417,21 @@ mod tests {
         }
     }
 
+    /// Reader whose reads fail with a source error inside an I/O error.
+    struct WrappedFailingReader(std::io::ErrorKind, SourceError);
+
+    impl std::io::Read for WrappedFailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, self.1.clone()))
+        }
+    }
+
+    impl std::io::Seek for WrappedFailingReader {
+        fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
     /// Source whose files fail in a per-file way.
     struct FlakySource(Vec<(FileEntry, Behaviour)>);
 
@@ -486,6 +448,8 @@ mod tests {
             match b.clone() {
                 Behaviour::OpenFails(err) => Err(err),
                 Behaviour::ReadFails(kind) => Ok(Box::new(FailingReader(kind))),
+                Behaviour::ReadFailsWith(kind, e) => Ok(Box::new(WrappedFailingReader(kind, e))),
+                Behaviour::Good(bytes) => Ok(Box::new(std::io::Cursor::new(bytes))),
                 Behaviour::Garbage => Ok(Box::new(std::io::Cursor::new(b"not audio".to_vec()))),
                 Behaviour::ReadPanics => Ok(Box::new(PanickingReader)),
             }
@@ -527,8 +491,8 @@ mod tests {
             ),
         ];
         let kept = [
-            ("missing.mp3", Behaviour::OpenFails(SourceError::NotFound)),
             ("garbage.mp3", Behaviour::Garbage),
+            ("missing.mp3", Behaviour::OpenFails(SourceError::NotFound)),
         ];
         let src = FlakySource(
             retried
@@ -541,31 +505,27 @@ mod tests {
         let no = AtomicBool::new(false);
         let first = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((first.read, first.failed), (8, 8));
-        for (name, _) in &retried {
+        // Network trouble (and a file that went missing) is retried by the next
+        // scan; a broken new file waits until it changes. Size and time are the
+        // real ones either way.
+        for (name, _) in retried.iter().chain(&kept[1..]) {
             assert!(
                 !cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(),
                 "{name}"
             );
         }
-        for (name, _) in &kept {
-            assert!(
-                cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(),
-                "{name}"
-            );
-        }
+        assert!(cat
+            .file_unchanged("garbage.mp3", 1000, 1_700_000_000)
+            .unwrap());
         let codes: std::collections::BTreeMap<String, String> = cat
             .unreadable()
             .unwrap()
             .into_iter()
             .map(|t| (t.rel_path, t.code.unwrap()))
             .collect();
+        // Network trouble is not a file problem: not listed.
         let want = [
-            ("timeout.mp3", "timeout"),
-            ("unreachable.mp3", "unreachable"),
             ("io.mp3", "io"),
-            ("read-timeout.mp3", "timeout"),
-            ("read-dropped.flac", "unreachable"),
-            ("read-reset.ogg", "unreachable"),
             ("missing.mp3", "not_found"),
             ("garbage.mp3", "tag"),
         ];
@@ -576,7 +536,119 @@ mod tests {
                 .collect()
         );
         let second = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
-        assert_eq!((second.read, second.unchanged), (6, 2));
+        assert_eq!((second.read, second.unchanged), (7, 1));
+    }
+
+    #[test]
+    fn a_failing_re_read_keeps_tags_and_loudness_and_retries() {
+        use std::io::ErrorKind;
+        let tone = fs::read(fixtures().join("tone.mp3")).unwrap();
+        let names = [
+            "auth.mp3",
+            "io-open.mp3",
+            "io-read.mp3",
+            "missing.mp3",
+            "garbage.mp3",
+            "timeout.mp3",
+        ];
+        let entry = |name: &str| FileEntry {
+            rel_path: name.into(),
+            size: tone.len() as u64,
+            mtime: 1_700_000_000,
+        };
+        let good = FlakySource(
+            names
+                .iter()
+                .map(|n| (entry(n), Behaviour::Good(tone.clone())))
+                .collect(),
+        );
+        let failing = FlakySource(vec![
+            (entry("auth.mp3"), Behaviour::OpenFails(SourceError::Auth)),
+            (
+                entry("io-open.mp3"),
+                Behaviour::OpenFails(SourceError::Io("boom".into())),
+            ),
+            (
+                entry("io-read.mp3"),
+                Behaviour::ReadFailsWith(ErrorKind::Other, SourceError::Io("boom".into())),
+            ),
+            (
+                entry("missing.mp3"),
+                Behaviour::OpenFails(SourceError::NotFound),
+            ),
+            (entry("garbage.mp3"), Behaviour::Garbage),
+            (
+                entry("timeout.mp3"),
+                Behaviour::OpenFails(SourceError::Timeout),
+            ),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("catalog.db");
+        let mut cat = Catalog::open(&db).unwrap();
+        let no = AtomicBool::new(false);
+        scan(&good, &mut cat, &mut |_| {}, &no).unwrap();
+        let ids = cat.playable_tracks(&[]).unwrap();
+        for &id in &ids {
+            cat.set_measured_lufs(id, -10.0).unwrap();
+        }
+        let before: Vec<_> = ids.iter().map(|&id| cat.track(id).unwrap()).collect();
+        assert!(before.iter().all(|t| t.meta.title.is_some()));
+        // The migration to version 4 marks every track for a new read.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE tracks SET needs_retag=1", [])
+            .unwrap();
+
+        let r = scan(&failing, &mut cat, &mut |_| {}, &no).unwrap();
+        assert_eq!((r.read, r.failed, r.removed), (6, 6, 0));
+        for t in &before {
+            assert_eq!(&cat.track(t.id).unwrap(), t, "kept: {}", t.rel_path);
+            let e = entry(&t.rel_path);
+            // A broken file (unreadable tags) waits until it changes.
+            let retried = t.rel_path != "garbage.mp3";
+            assert_eq!(
+                cat.file_unchanged(&e.rel_path, e.size, e.mtime).unwrap(),
+                !retried,
+                "{}",
+                t.rel_path
+            );
+        }
+        let codes: std::collections::BTreeMap<String, String> = cat
+            .unreadable()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.rel_path, t.code.unwrap()))
+            .collect();
+        let want = [
+            ("garbage.mp3", "tag"),
+            // Opening or reading: the same code for the same source error.
+            ("io-open.mp3", "io"),
+            ("io-read.mp3", "io"),
+            ("missing.mp3", "not_found"),
+        ];
+        assert_eq!(
+            codes,
+            want.iter()
+                .map(|(p, c)| (p.to_string(), c.to_string()))
+                .collect()
+        );
+
+        // The share works again: the retried files are read once, loudness kept,
+        // and only the broken one is still listed.
+        let r = scan(&good, &mut cat, &mut |_| {}, &no).unwrap();
+        assert_eq!((r.read, r.failed, r.unchanged), (5, 0, 1));
+        for t in &before {
+            assert_eq!(cat.track(t.id).unwrap().measured_lufs, Some(-10.0));
+        }
+        let listed: Vec<_> = cat
+            .unreadable()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.rel_path)
+            .collect();
+        assert_eq!(listed, ["garbage.mp3"]);
+        let r = scan(&good, &mut cat, &mut |_| {}, &no).unwrap();
+        assert_eq!((r.read, r.unchanged), (0, 6));
     }
 
     #[test]

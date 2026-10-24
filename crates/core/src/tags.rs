@@ -1,7 +1,7 @@
 //! Tag reading via lofty.
 
 use crate::catalog::TrackMeta;
-use crate::source::ReadSeek;
+use crate::source::{ReadSeek, SourceError};
 use lofty::config::{ParseOptions, ParsingMode};
 use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
 use lofty::id3::v2::FrameId;
@@ -11,11 +11,22 @@ use lofty::tag::{Accessor, ItemKey};
 
 use crate::{Error, Result};
 
-/// An I/O failure underneath the parser stays `Error::Io` (so callers can tell a
-/// network hiccup from a broken file); anything else is `Error::Decode`.
+/// A source failure underneath the parser stays `Error::Source`, an I/O failure
+/// `Error::Io` (so callers can tell a network hiccup from a broken file); anything
+/// else is `Error::Decode`.
 fn parse_error(e: &(dyn std::error::Error + 'static)) -> Error {
     let mut cur = Some(e);
     while let Some(err) = cur {
+        if let Some(src) = err.downcast_ref::<SourceError>() {
+            return Error::Source(src.clone());
+        }
+        if let Some(src) = err
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| inner.downcast_ref::<SourceError>())
+        {
+            return Error::Source(src.clone());
+        }
         if let Some(io) = err.downcast_ref::<std::io::Error>() {
             return Error::Io(std::io::Error::new(io.kind(), io.to_string()));
         }
@@ -51,7 +62,8 @@ pub fn read_meta(reader: &mut dyn ReadSeek, ext: &str) -> Result<TrackMeta> {
     };
 
     let mut meta = TrackMeta {
-        duration_ms: Some(file.properties().duration().as_millis() as u64),
+        // Relaxed parsing leaves the duration 0 when it cannot tell: unknown.
+        duration_ms: Some(file.properties().duration().as_millis() as u64).filter(|&ms| ms > 0),
         ..TrackMeta::default()
     };
     if let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) {

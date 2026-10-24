@@ -166,10 +166,15 @@ const MIGRATIONS: &[Migration] = &[
     }),
 ];
 
-/// `upsert_track` keeps a stored failure only when the file did not change, and
-/// never a tag failure (the tags were just read).
+/// `upsert_track` keeps a stored failure only when the file did not change and the
+/// failure was in decoding the audio, which a successful tag read does not disprove.
 const KEEP_ERROR: &str = "size=excluded.size AND mtime=excluded.mtime \
-                          AND last_error IS NOT 'tag'";
+                          AND last_error IN ('decode', 'unsupported')";
+
+/// Tracks the "Unreadable" list shows: not banned, and failed (network trouble
+/// stored by an older build aside).
+const UNREADABLE: &str = "banned=0 AND (fail_count>0 OR (last_error IS NOT NULL \
+                          AND last_error NOT IN ('timeout', 'unreachable')))";
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -442,32 +447,52 @@ impl Catalog {
         Ok(id)
     }
 
-    /// A file whose tags could not be read during a scan: stored with its failure.
-    /// With `keep_tags` (a network problem: the file is retried next scan) a known
-    /// track keeps the tags it has; otherwise it is stored with empty tags.
+    /// A file whose tags could not be read during a scan. A known track keeps its
+    /// tags; a new file is stored with empty tags. After a failure worth retrying
+    /// ([`crate::failure::FailCode::is_retried`]) a known track keeps everything
+    /// (size, time, loudness) and the next scan reads it again; after a tag, decode
+    /// or format failure the new size and time are stored (a changed file loses its
+    /// loudness) and it waits until the file changes. The failure is stored unless
+    /// it was network trouble ([`crate::failure::FailCode::is_transient`]).
     pub fn record_scan_failure(
         &self,
         rel_path: &str,
         size: u64,
         mtime: i64,
         failure: &Failure,
-        keep_tags: bool,
     ) -> Result<TrackId> {
-        let kept: Option<TrackId> = if keep_tags {
+        let retry = failure.code.is_retried();
+        let known: Option<TrackId> = if retry {
             self.conn
                 .prepare_cached(
-                    "UPDATE tracks SET size=?2, mtime=?3, present=1 WHERE rel_path=?1 RETURNING id",
+                    "UPDATE tracks SET present=1, needs_retag=1 WHERE rel_path=?1 RETURNING id",
+                )?
+                .query_row([rel_path], |r| r.get(0))
+                .optional()?
+        } else {
+            self.conn
+                .prepare_cached(
+                    "UPDATE tracks SET
+                        measured_lufs = CASE WHEN size=?2 AND mtime=?3 THEN measured_lufs END,
+                        size=?2, mtime=?3, present=1, needs_retag=0
+                     WHERE rel_path=?1 RETURNING id",
                 )?
                 .query_row(params![rel_path, size as i64, mtime], |r| r.get(0))
                 .optional()?
-        } else {
-            None
         };
-        let id = match kept {
+        let id = match known {
             Some(id) => id,
-            None => self.upsert_track(rel_path, size, mtime, &TrackMeta::default())?,
+            None => {
+                let id = self.upsert_track(rel_path, size, mtime, &TrackMeta::default())?;
+                self.conn
+                    .prepare_cached("UPDATE tracks SET needs_retag=?2 WHERE id=?1")?
+                    .execute(params![id, retry])?;
+                id
+            }
         };
-        self.set_error(id, failure, None)?;
+        if !failure.code.is_transient() {
+            self.set_error(id, failure, None)?;
+        }
         Ok(id)
     }
 
@@ -683,21 +708,37 @@ impl Catalog {
     }
 
     /// A playback failure: counts it and stores why (and from which server, if
-    /// known). Returns the failures in a row.
+    /// known). Network trouble ([`crate::failure::FailCode::is_transient`]) is not
+    /// the file's fault: neither counted nor stored. Returns the failures in a row
+    /// (0 for a track no longer in the catalog).
     pub fn record_failure(
         &self,
         id: TrackId,
         failure: &Failure,
         server: Option<Which>,
     ) -> Result<u32> {
+        if failure.code.is_transient() {
+            let n: Option<i64> = self
+                .conn
+                .query_row("SELECT fail_count FROM tracks WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            return Ok(n.unwrap_or(0) as u32);
+        }
         self.savepoint(|| {
-            let n: i64 = self.conn.query_row(
-                "UPDATE tracks SET fail_count = fail_count + 1 WHERE id=?1 RETURNING fail_count",
-                [id],
-                |r| r.get(0),
-            )?;
-            self.set_error(id, failure, server)?;
-            Ok(n as u32)
+            let n: Option<i64> = self
+                .conn
+                .query_row(
+                    "UPDATE tracks SET fail_count = fail_count + 1 WHERE id=?1 RETURNING fail_count",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if n.is_some() {
+                self.set_error(id, failure, server)?;
+            }
+            Ok(n.unwrap_or(0) as u32)
         })
     }
 
@@ -711,13 +752,13 @@ impl Catalog {
     pub fn unreadable(&self) -> Result<Vec<UnreadableTrack>> {
         let v = self
             .conn
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT id, rel_path, last_error, last_error_msg, fail_count, last_error_at,
                         last_error_server
                  FROM tracks
-                 WHERE banned=0 AND (fail_count>0 OR last_error IS NOT NULL)
-                 ORDER BY last_error_at IS NULL, last_error_at DESC, rel_path",
-            )?
+                 WHERE {UNREADABLE}
+                 ORDER BY last_error_at IS NULL, last_error_at DESC, rel_path"
+            ))?
             .query_map([], |r| {
                 let fail_count: i64 = r.get(4)?;
                 Ok(UnreadableTrack {
@@ -742,8 +783,7 @@ impl Catalog {
     /// How many tracks [`Self::unreadable`] lists.
     pub fn unreadable_count(&self) -> Result<usize> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tracks
-             WHERE banned=0 AND (fail_count>0 OR last_error IS NOT NULL)",
+            &format!("SELECT COUNT(*) FROM tracks WHERE {UNREADABLE}"),
             [],
             |r| r.get(0),
         )?;
@@ -764,9 +804,11 @@ impl Catalog {
     /// [`Self::retry_failed`] for every listed track; returns how many.
     pub fn retry_all_failed(&self) -> Result<usize> {
         Ok(self.conn.execute(
-            "UPDATE tracks SET fail_count=0, last_error=NULL, last_error_msg=NULL,
-                               last_error_at=NULL, last_error_server=NULL
-             WHERE banned=0 AND (fail_count>0 OR last_error IS NOT NULL)",
+            &format!(
+                "UPDATE tracks SET fail_count=0, last_error=NULL, last_error_msg=NULL,
+                                   last_error_at=NULL, last_error_server=NULL
+                 WHERE {UNREADABLE}"
+            ),
             [],
         )?)
     }
@@ -836,8 +878,10 @@ impl Catalog {
     }
 
     pub fn set_last_first(&self, selection_key: &str, id: TrackId) -> Result<()> {
+        // Not for a track removed meanwhile (the library was cleared, say).
         self.conn.execute(
-            "INSERT OR REPLACE INTO selection_state(selection_key, last_first) VALUES(?1, ?2)",
+            "INSERT OR REPLACE INTO selection_state(selection_key, last_first)
+             SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM tracks WHERE id=?2)",
             params![selection_key, id],
         )?;
         Ok(())
@@ -1328,7 +1372,7 @@ mod tests {
         assert_eq!(
             c.record_failure(
                 a,
-                &failure(FailCode::Timeout, "timed out"),
+                &failure(FailCode::NotFound, "gone"),
                 Some(Which::Secondary)
             )
             .unwrap(),
@@ -1346,8 +1390,8 @@ mod tests {
         assert_eq!(c.unreadable_count().unwrap(), 2);
         let ua = u.iter().find(|t| t.id == a).unwrap();
         assert_eq!(ua.rel_path, "a.mp3");
-        assert_eq!(ua.code.as_deref(), Some("timeout"));
-        assert_eq!(ua.message.as_deref(), Some("timed out"));
+        assert_eq!(ua.code.as_deref(), Some("not_found"));
+        assert_eq!(ua.message.as_deref(), Some("gone"));
         assert_eq!(ua.fail_count, 1);
         assert_eq!(ua.server, Some(Which::Secondary));
         assert!(!ua.excluded);
@@ -1381,49 +1425,185 @@ mod tests {
     fn playing_a_track_clears_its_failure() {
         let c = Catalog::open_in_memory().unwrap();
         let a = add(&c, "a.mp3", None);
-        c.record_failure(a, &failure(FailCode::Timeout, "t"), None)
+        c.record_failure(a, &failure(FailCode::Decode, "d"), None)
             .unwrap();
         c.record_success(a).unwrap();
         assert!(c.unreadable().unwrap().is_empty());
     }
 
-    #[test]
-    fn scan_failures_are_listed_and_a_network_failure_keeps_the_tags() {
-        let c = Catalog::open_in_memory().unwrap();
+    /// A tagged track with measured loudness, marked for a new tag read (as after
+    /// the migration to version 4).
+    fn retag_fixture(c: &Catalog) -> TrackId {
         let m = TrackMeta {
             artist: Some("Artist".into()),
+            title: Some("Song".into()),
+            raw_genre: Some("Rock".into()),
             year: Some(1999),
             ..Default::default()
         };
-        let known = c.upsert_track("known.mp3", 10, 100, &m).unwrap();
-        let id = c
-            .record_scan_failure("known.mp3", 0, 0, &failure(FailCode::Timeout, "t"), true)
+        let id = c.upsert_track("known.mp3", 10, 100, &m).unwrap();
+        c.set_measured_lufs(id, -11.0).unwrap();
+        c.conn
+            .execute("UPDATE tracks SET needs_retag=1", [])
             .unwrap();
-        assert_eq!(id, known);
-        let row = c.track(known).unwrap();
-        assert_eq!(row.meta.artist.as_deref(), Some("Artist"), "tags kept");
-        assert!(!c.file_unchanged("known.mp3", 10, 100).unwrap(), "retried");
+        id
+    }
+
+    fn size_mtime(c: &Catalog, id: TrackId) -> (i64, i64) {
+        c.conn
+            .query_row("SELECT size, mtime FROM tracks WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_failed_re_read_keeps_tags_loudness_and_is_retried() {
+        for code in [
+            FailCode::Timeout,
+            FailCode::Unreachable,
+            FailCode::Io,
+            FailCode::NotFound,
+            FailCode::Tag,
+        ] {
+            let c = Catalog::open_in_memory().unwrap();
+            let id = retag_fixture(&c);
+            let got = c
+                .record_scan_failure("known.mp3", 10, 100, &failure(code, "x"))
+                .unwrap();
+            assert_eq!(got, id);
+            let row = c.track(id).unwrap();
+            assert_eq!(row.meta.artist.as_deref(), Some("Artist"), "{code:?}");
+            assert_eq!(row.meta.year, Some(1999), "{code:?}");
+            assert_eq!(row.measured_lufs, Some(-11.0), "{code:?}");
+            assert_eq!(size_mtime(&c, id), (10, 100), "never zeroed: {code:?}");
+            assert_eq!(
+                c.file_unchanged("known.mp3", 10, 100).unwrap(),
+                !code.is_retried(),
+                "retried unless the file is broken: {code:?}"
+            );
+            // A later successful read keeps the loudness of the unchanged file.
+            c.upsert_track("known.mp3", 10, 100, &row.meta).unwrap();
+            assert_eq!(c.track(id).unwrap().measured_lufs, Some(-11.0), "{code:?}");
+            assert!(c.file_unchanged("known.mp3", 10, 100).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_failed_read_of_a_changed_file_keeps_the_old_data_until_it_reads() {
+        let c = Catalog::open_in_memory().unwrap();
+        let id = retag_fixture(&c);
+        c.record_scan_failure("known.mp3", 20, 200, &failure(FailCode::Timeout, "t"))
+            .unwrap();
+        assert_eq!(size_mtime(&c, id), (10, 100));
+        assert_eq!(c.track(id).unwrap().meta.artist.as_deref(), Some("Artist"));
+        assert!(!c.file_unchanged("known.mp3", 20, 200).unwrap());
+        // Read at last: the file changed, so its old loudness goes.
+        c.upsert_track("known.mp3", 20, 200, &meta(None)).unwrap();
+        assert_eq!(c.track(id).unwrap().measured_lufs, None);
+
+        // Changed into a broken file: new size and time, old tags, no loudness.
+        let id = retag_fixture(&c);
+        c.record_scan_failure("known.mp3", 30, 300, &failure(FailCode::Tag, "bad"))
+            .unwrap();
+        assert_eq!(size_mtime(&c, id), (30, 300));
+        let row = c.track(id).unwrap();
+        assert_eq!(row.meta.artist.as_deref(), Some("Artist"));
+        assert_eq!(row.measured_lufs, None);
+        assert!(
+            c.file_unchanged("known.mp3", 30, 300).unwrap(),
+            "waits for a change"
+        );
+    }
+
+    #[test]
+    fn scan_failures_of_new_files_are_stored_and_retried() {
+        let c = Catalog::open_in_memory().unwrap();
         let broken = c
-            .record_scan_failure("broken.mp3", 5, 50, &failure(FailCode::Tag, "bad"), false)
+            .record_scan_failure("broken.mp3", 5, 50, &failure(FailCode::Tag, "bad"))
             .unwrap();
-        assert!(c.file_unchanged("broken.mp3", 5, 50).unwrap());
-        let codes: Vec<_> = c
+        let slow = c
+            .record_scan_failure("slow.mp3", 6, 60, &failure(FailCode::Timeout, "t"))
+            .unwrap();
+        assert_eq!(size_mtime(&c, broken), (5, 50));
+        assert_eq!(size_mtime(&c, slow), (6, 60));
+        assert!(
+            c.file_unchanged("broken.mp3", 5, 50).unwrap(),
+            "until it changes"
+        );
+        assert!(!c.file_unchanged("slow.mp3", 6, 60).unwrap(), "retried");
+        let listed: Vec<_> = c
             .unreadable()
             .unwrap()
             .into_iter()
             .map(|t| (t.id, t.code.unwrap(), t.fail_count))
             .collect();
-        assert!(codes.contains(&(known, "timeout".into(), 0)), "{codes:?}");
-        assert!(codes.contains(&(broken, "tag".into(), 0)), "{codes:?}");
+        assert_eq!(
+            listed,
+            vec![(broken, "tag".to_string(), 0)],
+            "network is not listed"
+        );
         assert!(
             c.playable_tracks(&[]).unwrap().contains(&broken),
             "still plays"
         );
+        c.upsert_track("broken.mp3", 5, 50, &meta(None)).unwrap();
+        assert!(
+            c.unreadable().unwrap().is_empty(),
+            "read: tag failure cleared"
+        );
+    }
 
-        // Reading the tags later clears a scan failure.
-        c.upsert_track("known.mp3", 10, 100, &m).unwrap();
-        c.upsert_track("broken.mp3", 5, 50, &m).unwrap();
+    #[test]
+    fn network_failures_of_playback_are_neither_counted_nor_listed() {
+        let c = Catalog::open_in_memory().unwrap();
+        let a = add(&c, "a.mp3", Some("Rock"));
+        for code in [FailCode::Timeout, FailCode::Unreachable] {
+            for _ in 0..3 {
+                assert_eq!(c.record_failure(a, &failure(code, "x"), None).unwrap(), 0);
+            }
+        }
         assert!(c.unreadable().unwrap().is_empty());
+        assert_eq!(c.unreadable_count().unwrap(), 0);
+        assert!(c.playable_tracks(&[]).unwrap().contains(&a), "not excluded");
+        // A file problem still counts.
+        assert_eq!(
+            c.record_failure(a, &failure(FailCode::Decode, "x"), None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(c.unreadable_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn writes_for_removed_tracks_are_ignored() {
+        let c = Catalog::open_in_memory().unwrap();
+        assert_eq!(
+            c.record_failure(42, &failure(FailCode::Decode, "x"), None)
+                .unwrap(),
+            0
+        );
+        c.set_last_first("*", 42).unwrap();
+        assert_eq!(
+            c.last_first("*").unwrap(),
+            None,
+            "no dangling selection row"
+        );
+    }
+
+    #[test]
+    fn reading_the_tags_clears_failures_it_disproves() {
+        let c = Catalog::open_in_memory().unwrap();
+        for code in [FailCode::NotFound, FailCode::Io, FailCode::Tag] {
+            let a = add(&c, "a.mp3", None);
+            c.record_scan_failure("a.mp3", 10, 100, &failure(code, "x"))
+                .unwrap();
+            c.begin_scan().unwrap();
+            assert_eq!(c.unreadable().unwrap().len(), 1, "{code:?}");
+            c.upsert_track("a.mp3", 10, 100, &meta(None)).unwrap();
+            assert!(c.unreadable().unwrap().is_empty(), "{code:?}");
+            assert_eq!(c.track(a).unwrap().rel_path, "a.mp3");
+        }
     }
 
     #[test]

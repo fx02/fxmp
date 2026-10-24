@@ -111,6 +111,10 @@ impl<R> TapErrors<R> {
 impl<R: std::io::Read> std::io::Read for TapErrors<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let r = self.inner.read(buf);
+        if matches!(r, Ok(n) if n > 0) {
+            // Data arrives again: an earlier error was got past.
+            self.last.lock().unwrap_or_else(|p| p.into_inner()).take();
+        }
         self.tap(r)
     }
 }
@@ -330,5 +334,51 @@ impl Deck {
 impl Drop for Deck {
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tap_tests {
+    use super::*;
+    use std::io::{ErrorKind, Read};
+
+    /// Fails its first read, then reads fine.
+    struct FlakyOnce(bool);
+
+    impl Read for FlakyOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if std::mem::replace(&mut self.0, false) {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "hiccup"));
+            }
+            buf[0] = 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn a_later_good_read_clears_the_tapped_error() {
+        let last = LastIoError::default();
+        let mut r = TapErrors {
+            inner: FlakyOnce(true),
+            last: last.clone(),
+        };
+        let mut buf = [0u8; 4];
+        assert!(r.read(&mut buf).is_err());
+        let blamed = source_cause(crate::Error::Decode("bad".into()), &last.clone());
+        assert!(
+            matches!(blamed, crate::Error::Io(_)),
+            "an error just now: blamed"
+        );
+        let mut r = TapErrors {
+            inner: FlakyOnce(true),
+            last: last.clone(),
+        };
+        assert!(r.read(&mut buf).is_err());
+        assert_eq!(r.read(&mut buf).unwrap(), 1);
+        let kept = source_cause(crate::Error::Decode("bad".into()), &last);
+        assert!(
+            matches!(kept, crate::Error::Decode(_)),
+            "recovered: not blamed"
+        );
     }
 }

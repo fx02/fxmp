@@ -19,7 +19,25 @@ pub enum FailCode {
     Io,
 }
 
+/// [`FailCode::is_transient`] codes as stored.
+pub const TRANSIENT_CODES: [&str; 2] = ["timeout", "unreachable"];
+
 impl FailCode {
+    /// Network trouble (including a rejected login), not a problem of the file: not
+    /// counted against the track and not listed as unreadable.
+    pub fn is_transient(self) -> bool {
+        matches!(self, FailCode::Timeout | FailCode::Unreachable)
+    }
+
+    /// Worth reading again on the next scan: the file itself may well be fine.
+    /// Tag, decode and unsupported-format failures wait until the file changes.
+    pub fn is_retried(self) -> bool {
+        matches!(
+            self,
+            FailCode::Timeout | FailCode::Unreachable | FailCode::Io | FailCode::NotFound
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             FailCode::NotFound => "not_found",
@@ -75,7 +93,7 @@ impl Failure {
     pub fn from_tag_error(e: &Error) -> Self {
         let keep = match e {
             Error::Source(_) => true,
-            Error::Io(io) => io_code(io) != FailCode::Io,
+            Error::Io(io) => source_error_of(io).is_some() || io_code(io) != FailCode::Io,
             _ => false,
         };
         if keep {
@@ -95,8 +113,16 @@ fn source_code(e: &SourceError) -> FailCode {
     }
 }
 
+/// The source error an I/O error carries (`SmbReader` wraps its errors this way).
+fn source_error_of(e: &std::io::Error) -> Option<&SourceError> {
+    e.get_ref()?.downcast_ref::<SourceError>()
+}
+
 fn io_code(e: &std::io::Error) -> FailCode {
     use std::io::ErrorKind::*;
+    if let Some(s) = source_error_of(e) {
+        return source_code(s);
+    }
     match e.kind() {
         TimedOut => FailCode::Timeout,
         NotFound => FailCode::NotFound,
@@ -108,17 +134,18 @@ fn io_code(e: &std::io::Error) -> FailCode {
 }
 
 /// One line, at most [`MESSAGE_MAX_CHARS`] characters, with any `user:password@`
-/// (or `user@`) after `//` removed so no credentials are stored or shown.
+/// (or `user@`) after `//` removed, up to the last `@` before a space, so no
+/// credentials are stored or shown.
 pub fn sanitize_message(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len().min(MESSAGE_MAX_CHARS * 4));
     let mut rest = msg;
     while let Some(i) = rest.find("//") {
         out.push_str(&rest[..i + 2]);
         rest = &rest[i + 2..];
-        let authority_end = rest
-            .find(|c: char| c == '/' || c.is_whitespace())
-            .unwrap_or(rest.len());
-        if let Some(at) = rest[..authority_end].rfind('@') {
+        // Up to the last `@` of the word: a password may hold a `/`. A path with an
+        // `@` loses more than needed, which is the safe side.
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if let Some(at) = rest[..word_end].rfind('@') {
             rest = &rest[at + 1..];
         }
     }
@@ -169,6 +196,56 @@ mod tests {
     }
 
     #[test]
+    fn source_errors_inside_io_errors_keep_their_codes() {
+        // What SmbReader returns from `read` (see `smb::to_io`).
+        let wrapped = |kind: ErrorKind, e: SourceError| {
+            Failure::from_tag_error(&Error::Io(IoError::new(kind, e))).code
+        };
+        assert_eq!(
+            wrapped(ErrorKind::Other, SourceError::Io("x".into())),
+            FailCode::Io
+        );
+        assert_eq!(
+            wrapped(ErrorKind::PermissionDenied, SourceError::Auth),
+            FailCode::Unreachable
+        );
+        assert_eq!(
+            wrapped(ErrorKind::NotFound, SourceError::NotFound),
+            FailCode::NotFound
+        );
+    }
+
+    #[test]
+    fn network_codes_are_transient() {
+        assert!(FailCode::Timeout.is_transient());
+        assert!(FailCode::Unreachable.is_transient());
+        for c in [
+            FailCode::NotFound,
+            FailCode::Decode,
+            FailCode::Unsupported,
+            FailCode::Tag,
+            FailCode::Io,
+        ] {
+            assert!(!c.is_transient(), "{c:?}");
+        }
+        assert_eq!(TRANSIENT_CODES, ["timeout", "unreachable"]);
+        let retried: Vec<_> = [
+            FailCode::NotFound,
+            FailCode::Timeout,
+            FailCode::Unreachable,
+            FailCode::Decode,
+            FailCode::Unsupported,
+            FailCode::Tag,
+            FailCode::Io,
+        ]
+        .into_iter()
+        .filter(|c| c.is_retried())
+        .map(FailCode::as_str)
+        .collect();
+        assert_eq!(retried, ["not_found", "timeout", "unreachable", "io"]);
+    }
+
+    #[test]
     fn tag_errors_keep_network_codes() {
         let f = Failure::from_tag_error(&Error::Decode("no tag".into()));
         assert_eq!(
@@ -194,6 +271,11 @@ mod tests {
             "//host/x and //h2"
         );
         assert_eq!(sanitize_message("a\nb\tc "), "a b c");
+        // A password with a slash, a domain user: everything up to the last @.
+        assert_eq!(
+            sanitize_message("smb://WG\\music:pa/ss@10.0.0.1/F/x.mp3: denied"),
+            "smb://10.0.0.1/F/x.mp3: denied"
+        );
         assert_eq!(sanitize_message("no // at sign"), "no // at sign");
         let long = sanitize_message(&"ž".repeat(500));
         assert_eq!(long.chars().count(), MESSAGE_MAX_CHARS);
