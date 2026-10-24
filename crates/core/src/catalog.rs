@@ -1,15 +1,18 @@
 //! SQLite catalog of tracks, genres and playback state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
-use crate::genre::{genre_key, pick_display, split_genres};
+use crate::genre::{
+    genre_key, known_genre, split_genres, KnownGenre, UNKNOWN_DISPLAY, UNKNOWN_KEY,
+};
 use crate::{Result, TrackId};
 
-const NONE_KEY: &str = "_none";
-const NONE_DISPLAY: &str = "(bez žanra)";
+/// Version of the genre rules. Opening a catalog older than this re-derives its genres
+/// from the stored tags, so a change to the rules needs no rescan.
+const GENRE_VERSION: i64 = 1;
 /// Consecutive failures after which a track leaves the shuffle until the next scan.
 const MAX_FAILS: i64 = 3;
 
@@ -123,7 +126,17 @@ impl Catalog {
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        let catalog = Self { conn };
+        let version: i64 = catalog
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < GENRE_VERSION {
+            catalog.rebuild_genres()?;
+            catalog
+                .conn
+                .execute_batch(&format!("PRAGMA user_version = {GENRE_VERSION}"))?;
+        }
+        Ok(catalog)
     }
 
     /// Run `f` in a single transaction (bulk upserts); rolled back on error.
@@ -226,19 +239,23 @@ impl Catalog {
     }
 
     /// Recompute `genres` and `track_genres` from `raw_genre`, folder names and rules.
+    ///
+    /// Only known genres (see [`known_genre`]) are kept. A track with no known genre
+    /// in its tag takes the genre its top folder is named after, if that is a known
+    /// genre, and otherwise goes to [`UNKNOWN_KEY`]. A rule whose target is not a
+    /// known genre is ignored.
     pub fn rebuild_genres(&self) -> Result<()> {
         let rules: HashMap<String, String> = self
             .conn
             .prepare("SELECT from_key, to_display FROM genre_rules")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        // Resolve a raw name to (key, forced display) applying merge/rename rules.
-        let resolve = |name: &str| -> (String, Option<String>) {
-            let key = genre_key(name);
-            match rules.get(&key) {
-                Some(to) => (genre_key(to), Some(to.clone())),
-                None => (key, None),
-            }
+        // A raw name -> the known genre it ends up in, merge/rename rules applied.
+        let resolve = |name: &str| -> Option<KnownGenre> {
+            rules
+                .get(&genre_key(name))
+                .and_then(|to| known_genre(to))
+                .or_else(|| known_genre(name))
         };
 
         let tracks: Vec<(TrackId, String, Option<String>)> = self
@@ -247,82 +264,55 @@ impl Catalog {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
 
-        let mut spellings: HashMap<String, HashMap<String, usize>> = HashMap::new();
-        let mut forced: HashMap<String, String> = HashMap::new();
+        let mut displays: HashMap<String, String> = HashMap::new();
         let mut assigned: Vec<(TrackId, Vec<String>)> = Vec::with_capacity(tracks.len());
-        let mut untagged: Vec<(TrackId, &str)> = Vec::new();
         for (id, rel_path, raw) in &tracks {
-            let mut keys: Vec<String> = Vec::new();
-            for name in raw.as_deref().map(split_genres).unwrap_or_default() {
-                let (key, disp) = resolve(&name);
-                if key.is_empty() {
-                    continue;
-                }
-                if let Some(d) = disp {
-                    forced.insert(key.clone(), d);
-                } else {
-                    *spellings
-                        .entry(key.clone())
-                        .or_default()
-                        .entry(name)
-                        .or_default() += 1;
-                }
-                if !keys.contains(&key) {
-                    keys.push(key);
+            let mut found: Vec<KnownGenre> = raw
+                .as_deref()
+                .map(split_genres)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|name| resolve(name))
+                .collect();
+            if found.is_empty() {
+                // Folder fallback: the first path component, if it names a known genre.
+                found.extend(
+                    rel_path
+                        .split_once('/')
+                        .and_then(|(folder, _)| resolve(folder)),
+                );
+            }
+            let mut keys: Vec<String> = Vec::with_capacity(found.len().max(1));
+            for g in found {
+                if !keys.contains(&g.key) {
+                    keys.push(g.key.clone());
+                    displays.entry(g.key).or_insert(g.display);
                 }
             }
             if keys.is_empty() {
-                untagged.push((*id, rel_path));
-            } else {
-                assigned.push((*id, keys));
+                keys.push(UNKNOWN_KEY.to_string());
+                displays
+                    .entry(UNKNOWN_KEY.to_string())
+                    .or_insert_with(|| UNKNOWN_DISPLAY.to_string());
             }
-        }
-
-        // Folder fallback: first path component matching an existing tag-derived key.
-        let known: HashSet<String> = assigned
-            .iter()
-            .flat_map(|(_, k)| k.iter().cloned())
-            .collect();
-        for (id, rel_path) in untagged {
-            let folder = rel_path.split_once('/').map(|(f, _)| resolve(f).0);
-            let key = match folder {
-                Some(k) if known.contains(&k) => k,
-                _ => NONE_KEY.to_string(),
-            };
-            assigned.push((id, vec![key]));
+            assigned.push((*id, keys));
         }
 
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM track_genres", [])?;
         tx.execute("DELETE FROM genres", [])?;
-        let mut genre_ids: HashMap<String, i64> = HashMap::new();
+        let mut genre_ids: HashMap<&str, i64> = HashMap::new();
         {
             let mut ins_genre = tx.prepare("INSERT INTO genres(key, display) VALUES(?1, ?2)")?;
-            let mut all_keys: HashSet<&String> = known.iter().collect();
-            let none_key = NONE_KEY.to_string();
-            if assigned.iter().any(|(_, k)| k[0] == NONE_KEY) {
-                all_keys.insert(&none_key);
-            }
-            for key in all_keys {
-                let display = if key == NONE_KEY {
-                    NONE_DISPLAY.to_string()
-                } else if let Some(d) = forced.get(key) {
-                    d.clone()
-                } else {
-                    let sp: Vec<(String, usize)> = spellings[key]
-                        .iter()
-                        .map(|(s, n)| (s.clone(), *n))
-                        .collect();
-                    pick_display(&sp)
-                };
+            for (key, display) in &displays {
                 ins_genre.execute(params![key, display])?;
-                genre_ids.insert(key.clone(), tx.last_insert_rowid());
+                genre_ids.insert(key, tx.last_insert_rowid());
             }
             let mut ins_link = tx
                 .prepare("INSERT OR IGNORE INTO track_genres(track_id, genre_id) VALUES(?1, ?2)")?;
             for (id, keys) in &assigned {
                 for key in keys {
-                    ins_link.execute(params![id, genre_ids[key]])?;
+                    ins_link.execute(params![id, genre_ids[key.as_str()]])?;
                 }
             }
         }
@@ -590,7 +580,7 @@ mod tests {
             .into_iter()
             .find(|g| g.key == "_none")
             .unwrap();
-        assert_eq!(g.display, "(bez žanra)");
+        assert_eq!(g.display, "Unknown");
     }
 
     #[test]
@@ -636,22 +626,123 @@ mod tests {
     }
 
     #[test]
-    fn genre_rule_merges_and_renames() {
+    fn genre_rule_merges_into_a_known_genre() {
         let c = Catalog::open_in_memory().unwrap();
         add(&c, "a.mp3", Some("Trance; Chillout"));
         add(&c, "b.mp3", Some("Chill Out"));
-        add(&c, "c.mp3", Some("Chillout"));
+        add(&c, "c.mp3", Some("Downtempo"));
         c.rebuild_genres().unwrap();
-        c.add_genre_rule("chillout", "Chill").unwrap();
+        c.add_genre_rule("chillout", "downtempo").unwrap();
         let g = c.genres().unwrap();
-        let chill: Vec<_> = g.iter().filter(|g| g.display == "Chill").collect();
-        assert_eq!(chill.len(), 1);
-        assert_eq!(chill[0].key, "chill");
-        assert_eq!(chill[0].count, 3);
+        let down: Vec<_> = g.iter().filter(|g| g.key == "downtempo").collect();
+        assert_eq!(down.len(), 1);
+        assert_eq!(
+            down[0].display, "Downtempo",
+            "canonical name, not the typed one"
+        );
+        assert_eq!(down[0].count, 3);
         assert!(g.iter().all(|g| g.key != "chillout"));
         // survives a later rebuild
         c.rebuild_genres().unwrap();
-        assert_eq!(count_of(&c, "chill"), Some(3));
+        assert_eq!(count_of(&c, "downtempo"), Some(3));
+    }
+
+    #[test]
+    fn rule_to_an_unknown_name_is_ignored() {
+        let c = Catalog::open_in_memory().unwrap();
+        add(&c, "a.mp3", Some("Chillout"));
+        c.add_genre_rule("chillout", "ZZ Test Preimenovano")
+            .unwrap();
+        assert_eq!(count_of(&c, "chillout"), Some(1));
+        assert!(c
+            .genres()
+            .unwrap()
+            .iter()
+            .all(|g| g.key != "zztestpreimenovano"));
+    }
+
+    #[test]
+    fn unknown_tag_genres_go_to_unknown() {
+        let c = Catalog::open_in_memory().unwrap();
+        let zz = add(&c, "a.mp3", Some("ZZ Test Preimenovano"));
+        let other = add(&c, "b.mp3", Some("Other"));
+        let num = add(&c, "c.mp3", Some("(250)"));
+        c.rebuild_genres().unwrap();
+        let g = c.genres().unwrap();
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(
+            (g[0].key.as_str(), g[0].display.as_str()),
+            ("_none", "Unknown")
+        );
+        assert_eq!(g[0].count, 3);
+        for id in [zz, other, num] {
+            assert_eq!(c.track_genres(id).unwrap(), vec!["Unknown"]);
+        }
+    }
+
+    #[test]
+    fn known_tokens_win_over_unknown_ones() {
+        let c = Catalog::open_in_memory().unwrap();
+        let t = add(&c, "a.mp3", Some("Trance; Foo"));
+        let d = add(&c, "b.mp3", Some("dnb"));
+        c.rebuild_genres().unwrap();
+        assert_eq!(c.track_genres(t).unwrap(), vec!["Trance"]);
+        assert_eq!(c.track_genres(d).unwrap(), vec!["Drum & Bass"]);
+        assert_eq!(count_of(&c, "_none"), None);
+        assert_eq!(count_of(&c, "drumandbass"), Some(1));
+    }
+
+    #[test]
+    fn folder_fallback_only_for_known_genre_folders() {
+        let c = Catalog::open_in_memory().unwrap();
+        let chill = add(&c, "Chillout/x.mp3", None);
+        let dnb = add(&c, "DnB/y.mp3", Some("Other"));
+        let artists = add(&c, "Artists/z.mp3", None);
+        c.rebuild_genres().unwrap();
+        assert_eq!(c.track_genres(chill).unwrap(), vec!["Chillout"]);
+        assert_eq!(c.track_genres(dnb).unwrap(), vec!["Drum & Bass"]);
+        assert_eq!(c.track_genres(artists).unwrap(), vec!["Unknown"]);
+    }
+
+    #[test]
+    fn existing_catalog_is_recategorized_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let (zz, rock) = {
+            let c = Catalog::open(&db).unwrap();
+            let zz = add(&c, "a.mp3", Some("ZZ Test Preimenovano"));
+            let rock = add(&c, "b.mp3", Some("Rock"));
+            add(&c, "c.mp3", None);
+            // What an older version left behind: every tag value a genre, Croatian
+            // name for the empty one, and no genre version.
+            c.conn
+                .execute_batch(
+                    "DELETE FROM track_genres; DELETE FROM genres;
+                     INSERT INTO genres(id, key, display) VALUES
+                        (1, 'zztestpreimenovano', 'ZZ Test Preimenovano'),
+                        (2, 'rock', 'Rock'), (3, '_none', '(bez žanra)');
+                     INSERT INTO track_genres VALUES (1, 1), (2, 2), (3, 3);
+                     INSERT INTO genre_rules VALUES ('rock', 'ZZ Test Preimenovano');
+                     PRAGMA user_version = 0;",
+                )
+                .unwrap();
+            (zz, rock)
+        };
+        let c = Catalog::open(&db).unwrap();
+        let g = c.genres().unwrap();
+        let shown: Vec<(&str, &str, usize)> = g
+            .iter()
+            .map(|g| (g.key.as_str(), g.display.as_str(), g.count))
+            .collect();
+        assert_eq!(shown, vec![("rock", "Rock", 1), ("_none", "Unknown", 2)]);
+        assert_eq!(c.track_genres(zz).unwrap(), vec!["Unknown"]);
+        assert_eq!(c.track_genres(rock).unwrap(), vec!["Rock"]);
+        // Ignored rules are kept, not deleted.
+        let rules: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM genre_rules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rules, 1);
     }
 
     #[test]
@@ -704,8 +795,9 @@ mod tests {
         use std::time::{Duration, Instant};
         let mut c = Catalog::open_in_memory().unwrap();
         c.transaction(|c| {
+            let names = crate::genre::known_genre_names();
             for i in 0..50_000 {
-                let m = meta(Some(&format!("Genre{}", i % 40)));
+                let m = meta(Some(&names[i % 40]));
                 c.upsert_track(&format!("g{}/t{}.mp3", i % 40, i), 1, 1, &m)?;
             }
             Ok(())
@@ -733,8 +825,8 @@ mod tests {
         add(&c, "c.mp3", Some("Trance"));
         let none = add(&c, "d.mp3", None);
         c.rebuild_genres().unwrap();
-        assert_eq!(c.track_genres(a).unwrap(), vec!["Chill Out", "Trance"]);
-        assert_eq!(c.track_genres(none).unwrap(), vec!["(bez žanra)"]);
+        assert_eq!(c.track_genres(a).unwrap(), vec!["Chillout", "Trance"]);
+        assert_eq!(c.track_genres(none).unwrap(), vec!["Unknown"]);
         assert!(c.track_genres(999).unwrap().is_empty());
     }
 }
