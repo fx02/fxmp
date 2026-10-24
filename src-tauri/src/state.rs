@@ -128,10 +128,8 @@ impl AppState {
         let writer = CatalogWriter::spawn(Catalog::open(&catalog_path)?)?;
         let creds: Arc<dyn CredentialStore> = Arc::new(Keychain);
 
+        // Servers are set once their passwords are read (see below).
         let source = Arc::new(AppSource::default());
-        if configured {
-            source.set(Some(Servers::from_settings(&settings, creds.as_ref())));
-        }
 
         let (events_tx, events_rx) = mpsc::channel();
         let player = Player::spawn(
@@ -185,11 +183,26 @@ impl AppState {
                 })
             })?;
 
-        if configured && catalog_empty {
-            log::info!("catalog is empty: starting the first scan");
-            if let Err(e) = start_scan(app) {
-                log::warn!("cannot start scan: {e}");
-            }
+        if configured {
+            // The keychain may ask the user for access (e.g. after an update):
+            // never on the main thread, so the window comes up meanwhile.
+            let handle = app.clone();
+            std::thread::Builder::new()
+                .name("credentials".into())
+                .spawn(move || {
+                    let st = handle.state::<AppState>();
+                    let servers = Servers::from_settings(&st.settings.get(), st.creds.as_ref());
+                    if !st.source.set_if_unset(servers) {
+                        return; // Settings were saved meanwhile.
+                    }
+                    st.wake_monitor();
+                    if catalog_empty {
+                        log::info!("catalog is empty: starting the first scan");
+                        if let Err(e) = start_scan(&handle) {
+                            log::warn!("cannot start scan: {e}");
+                        }
+                    }
+                })?;
         }
         Ok(())
     }

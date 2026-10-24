@@ -168,6 +168,11 @@ fn smb_connect(cfg: SmbConfig) -> Result<SmbSource, SourceError> {
 }
 
 impl LazySmb {
+    #[cfg(test)]
+    fn host(&self) -> &str {
+        &self.0.cfg.host
+    }
+
     pub fn new(cfg: SmbConfig) -> Self {
         Self::with_connector(cfg, smb_connect)
     }
@@ -308,6 +313,17 @@ impl AppSource {
         *self.servers.write().unwrap_or_else(|e| e.into_inner()) = servers.map(Arc::new);
     }
 
+    /// Sets `servers` unless some are already set (settings saved meanwhile are
+    /// newer). Returns whether they were taken.
+    pub fn set_if_unset(&self, servers: Servers) -> bool {
+        let mut slot = self.servers.write().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(Arc::new(servers));
+        true
+    }
+
     pub fn servers(&self) -> Option<Arc<Servers>> {
         self.servers
             .read()
@@ -372,6 +388,27 @@ pub fn monitor(source: Arc<AppSource>, wake: Receiver<()>, mut report: impl FnMu
 mod tests {
     use super::*;
     use crate::credentials::MemoryStore;
+
+    #[test]
+    fn set_if_unset_never_replaces_newer_servers() {
+        let creds = MemoryStore::default();
+        let host = |h: &str| Settings {
+            primary: ServerConfig {
+                host: h.into(),
+                username: "music".into(),
+                ..ServerConfig::default()
+            },
+            ..Settings::default()
+        };
+        let src = AppSource::default();
+        // Startup credentials arrive first: taken.
+        assert!(src.set_if_unset(Servers::from_settings(&host("a"), &creds)));
+        assert_eq!(src.servers().unwrap().primary.host(), "a");
+        // Settings were saved meanwhile: the late startup value is dropped.
+        src.set(Some(Servers::from_settings(&host("b"), &creds)));
+        assert!(!src.set_if_unset(Servers::from_settings(&host("a"), &creds)));
+        assert_eq!(src.servers().unwrap().primary.host(), "b");
+    }
 
     #[test]
     fn connection_status_maps_errors() {

@@ -11,9 +11,12 @@ mod writer;
 
 use tauri::Manager;
 
+/// Default log filter (`RUST_LOG` overrides it). The `smb` crate is noisy at info,
+/// but its directive also prefix-matches this crate, so ours is named explicitly.
+const LOG_FILTER: &str = "info,smb=warn,smb_music_player=info";
+
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,smb=warn"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(LOG_FILTER)).init();
     tauri::Builder::default()
         .setup(|app| {
             state::AppState::init(app.handle())?;
@@ -56,4 +59,25 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use log::{Level, Log, Metadata};
+
+    fn enabled(target: &str, level: Level) -> bool {
+        let logger = env_logger::Builder::new()
+            .parse_filters(super::LOG_FILTER)
+            .build();
+        logger.enabled(&Metadata::builder().target(target).level(level).build())
+    }
+
+    #[test]
+    fn log_filter_shows_app_info_but_keeps_smb_at_warn() {
+        assert!(enabled("smb_music_player::state", Level::Info));
+        assert!(enabled("smb_music_player", Level::Info));
+        assert!(enabled("smp_core::scan", Level::Info));
+        assert!(!enabled("smb::session::setup", Level::Info));
+        assert!(enabled("smb::session::setup", Level::Warn));
+    }
 }
