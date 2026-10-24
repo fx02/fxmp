@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use smp_core::audio::output::CpalSinkFactory;
 use smp_core::audio::player::{Command, Event, Player, PlayerConfig};
 use smp_core::catalog::Catalog;
-use smp_core::genre::UNKNOWN_DISPLAY;
+use smp_core::genre::{migrate_selection, UNKNOWN_DISPLAY};
 use smp_core::scan::{scan_with, ScanOptions, ScanProgress};
 use smp_core::source::{MusicSource, SourceError, Which};
 use smp_core::TrackId;
@@ -123,8 +123,10 @@ impl AppState {
         let configured = loaded
             .as_ref()
             .is_some_and(|s| !s.primary.username.trim().is_empty());
-        let settings = loaded.unwrap_or_default();
+        let mut settings = loaded.unwrap_or_default();
         i18n::set_current(&settings.language);
+        // Genre keys renamed by newer genre rules (saved with the next settings write).
+        settings.last_selection = migrate_selection(&settings.last_selection);
         let query = Catalog::open(&catalog_path)?;
         let catalog_empty = query.is_empty()?;
         let playback_db = Catalog::open(&catalog_path)?;

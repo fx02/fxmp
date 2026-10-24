@@ -132,18 +132,21 @@ export function connMessage(status, t) {
 const UNKNOWN_KEY = "_none";
 
 /**
- * Genres that genre `fromKey` can be merged into: the known genres plus the ones in
- * the library, without `fromKey` itself and without Unknown, sorted, matching `query`.
+ * Genres that genre `fromKey` can be merged into, matching `query`: first the genres
+ * that have tracks (without `fromKey` and Unknown), then, only while searching, the
+ * other known genres. Each group is sorted.
  */
 export function mergeChoices(knownNames, genres, fromKey, query) {
-  const from = genres.find((g) => g.key === fromKey);
-  const names = new Set(knownNames);
-  for (const g of genres) if (g.key !== UNKNOWN_KEY) names.add(g.display);
-  if (from) names.delete(from.display);
   const q = foldForSearch(query);
-  return [...names]
-    .filter((n) => !q || foldForSearch(n).includes(q))
-    .sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }));
+  const matches = (n) => !q || foldForSearch(n).includes(q);
+  const byName = (a, b) => a.localeCompare(b, "en", { sensitivity: "base" });
+  const present = genres.filter((g) => g.key !== UNKNOWN_KEY).map((g) => g.display);
+  const from = genres.find((g) => g.key === fromKey);
+  const withTracks = present.filter((n) => (!from || n !== from.display) && matches(n)).sort(byName);
+  if (!q) return withTracks;
+  const taken = new Set(present);
+  const others = knownNames.filter((n) => !taken.has(n) && matches(n)).sort(byName);
+  return [...withTracks, ...others];
 }
 
 /** Form values -> backend `ServerConfig`. */

@@ -77,13 +77,23 @@ pub fn languages() -> Vec<Language> {
         .collect()
 }
 
-/// The texts of `lang`, with English filling any gaps.
-pub fn locale(lang: &str) -> Map<String, Value> {
-    let mut all = tables()[DEFAULT_LANGUAGE].clone();
-    if let Some(own) = tables().get(lang) {
-        all.extend(own.clone());
-    }
-    all
+/// The texts of `lang`, with English filling any gaps (English for an unknown
+/// language). Built once per language.
+pub fn locale(lang: &str) -> &'static Map<String, Value> {
+    static MERGED: OnceLock<HashMap<&'static str, Map<String, Value>>> = OnceLock::new();
+    let merged = MERGED.get_or_init(|| {
+        tables()
+            .iter()
+            .map(|(code, own)| {
+                let mut all = tables()[DEFAULT_LANGUAGE].clone();
+                all.extend(own.clone());
+                (*code, all)
+            })
+            .collect()
+    });
+    merged
+        .get(lang)
+        .unwrap_or_else(|| &merged[DEFAULT_LANGUAGE])
 }
 
 /// The text for `key` in `lang` (English if missing there, else the key itself).

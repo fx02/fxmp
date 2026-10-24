@@ -369,14 +369,17 @@ fn merge_target(lang: &str, into: &str) -> CmdResult<String> {
         .ok_or_else(|| i18n::trf(lang, "err.not_a_genre", &[("name", into)]))
 }
 
+// The three commands below are cheap (tables built once), but async so that they
+// run on Tauri's runtime and not on the main thread.
+
 /// The UI texts of `lang` (English filling gaps), from `ui/locales`.
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_locale(lang: String) -> serde_json::Map<String, serde_json::Value> {
+pub async fn get_locale(lang: String) -> &'static serde_json::Map<String, serde_json::Value> {
     i18n::locale(&lang)
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn list_languages() -> Vec<i18n::Language> {
+pub async fn list_languages() -> Vec<i18n::Language> {
     i18n::languages()
 }
 
@@ -397,7 +400,7 @@ pub async fn set_language(app: AppHandle, lang: String) -> CmdResult<()> {
 
 /// Display names of all known genres: the choices for "Merge into…".
 #[tauri::command(rename_all = "snake_case")]
-pub fn known_genres() -> Vec<String> {
+pub async fn known_genres() -> Vec<String> {
     known_genre_names()
 }
 

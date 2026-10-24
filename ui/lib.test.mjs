@@ -197,16 +197,26 @@ test("connMessage maps statuses to the locale's text", () => {
   assert.equal(connMessage("nope", en), "");
 });
 
-test("mergeChoices lists known and existing genres except the source and Unknown", () => {
-  const known = ["Chillout", "Drum & Bass", "Downtempo", "Trance"];
+test("app.js never shadows the translator t", () => {
+  // The one module-level translator binding is allowed.
+  const src = read("./app.js").replace("let t = (key) => key;", "");
+  const shadow = /\b(?:const|let|var)\s+t\b|\bfor\s*\(\s*(?:const|let|var)\s+t\b|\(\s*t\s*\)\s*=>|\(\s*t\s*,|,\s*t\s*\)\s*=>|function\s*\w*\s*\([^)]*\bt\b[^)]*\)/g;
+  const hits = [...src.matchAll(shadow)].map((m) => m[0]);
+  assert.deepEqual(hits, [], "a local `t` hides the translator");
+});
+
+test("mergeChoices: genres with tracks first; other known genres only when searching", () => {
+  const known = ["Chillout", "Drum & bass", "Downtempo", "Trance", "Lounge"];
   const genres = [
     { key: "chillout", display: "Chillout", count: 3 },
     { key: "_none", display: "Unknown", count: 9 },
     { key: "lounge", display: "Lounge", count: 1 },
+    { key: "trance", display: "Trance", count: 2 },
   ];
-  assert.deepEqual(mergeChoices(known, genres, "chillout", ""), ["Downtempo", "Drum & Bass", "Lounge", "Trance"]);
-  assert.deepEqual(mergeChoices(known, genres, "chillout", " d "), ["Downtempo", "Drum & Bass"]);
+  assert.deepEqual(mergeChoices(known, genres, "chillout", ""), ["Lounge", "Trance"]);
+  assert.deepEqual(mergeChoices(known, genres, "chillout", "n"), ["Lounge", "Trance", "Downtempo"]);
   assert.deepEqual(mergeChoices(known, genres, "lounge", "chill"), ["Chillout"]);
+  assert.deepEqual(mergeChoices(known, genres, "lounge", "dow"), ["Downtempo"]);
   assert.deepEqual(mergeChoices([], [], "x", "zzz"), []);
 });
 

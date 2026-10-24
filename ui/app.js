@@ -583,15 +583,15 @@ async function loadBanned() {
   const rows = await run("list_banned");
   if (!rows) return;
   const frag = document.createDocumentFragment();
-  for (const t of rows) {
-    const label = trackLabel(t);
+  for (const row of rows) {
+    const label = trackLabel(row);
     const li = el(
       "li",
       {},
-      el("span", { className: "name", textContent: label === "—" ? t.rel_path : label, title: t.rel_path }),
+      el("span", { className: "name", textContent: label === "—" ? row.rel_path : label, title: row.rel_path }),
       el("button", { textContent: t("settings.restore") }),
     );
-    li.dataset.id = t.id;
+    li.dataset.id = row.id;
     frag.append(li);
   }
   $("banned-list").replaceChildren(frag);
