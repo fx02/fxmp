@@ -63,7 +63,9 @@ impl Downmix {
     fn new(channels: Channels) -> Self {
         let n = channels.count();
         if n == 1 {
-            return Self { gains: vec![(1.0, 1.0)] };
+            return Self {
+                gains: vec![(1.0, 1.0)],
+            };
         }
         let flags: Vec<Channels> = channels.iter().collect();
         let has = |c: Channels| flags.contains(&c);
@@ -84,7 +86,8 @@ impl Downmix {
         let center = has(Channels::FRONT_CENTRE);
         let surround = flags.iter().any(|c| left_side.contains(*c));
         // Normalise by the largest possible sum so the downmix cannot clip.
-        let norm = 1.0 + if center { CENTER_GAIN } else { 0.0 } + if surround { CENTER_GAIN } else { 0.0 };
+        let norm =
+            1.0 + if center { CENTER_GAIN } else { 0.0 } + if surround { CENTER_GAIN } else { 0.0 };
         let gains = flags
             .iter()
             .map(|&c| {
@@ -124,7 +127,12 @@ impl Resample {
         let rs = FftFixedIn::<f32>::new(src_rate as usize, out_rate as usize, RESAMPLE_CHUNK, 2, 2)
             .map_err(decode_err)?;
         let out = rs.output_buffer_allocate(true);
-        Ok(Self { rs, pending: [Vec::new(), Vec::new()], offset: 0, out })
+        Ok(Self {
+            rs,
+            pending: [Vec::new(), Vec::new()],
+            offset: 0,
+            out,
+        })
     }
 }
 
@@ -159,15 +167,31 @@ fn decode_err(e: impl std::fmt::Display) -> Error {
 }
 
 impl Decoder {
-    pub fn open(reader: Box<dyn ReadSeek>, len: Option<u64>, ext: &str, out_rate: u32) -> Result<Self> {
-        let src = Source { inner: Mutex::new(reader), len };
+    pub fn open(
+        reader: Box<dyn ReadSeek>,
+        len: Option<u64>,
+        ext: &str,
+        out_rate: u32,
+    ) -> Result<Self> {
+        let src = Source {
+            inner: Mutex::new(reader),
+            len,
+        };
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
         let mut hint = Hint::new();
         if !ext.is_empty() {
             hint.with_extension(ext.trim_start_matches('.'));
         }
         let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &FormatOptions { enable_gapless: true, ..Default::default() }, &MetadataOptions::default())
+            .format(
+                &hint,
+                mss,
+                &FormatOptions {
+                    enable_gapless: true,
+                    ..Default::default()
+                },
+                &MetadataOptions::default(),
+            )
             .map_err(map_open_err)?;
         let format = probed.format;
         let track = format
@@ -180,8 +204,12 @@ impl Decoder {
         let codec = symphonia::default::get_codecs()
             .make(&params, &DecoderOptions::default())
             .map_err(decode_err)?;
-        let src_rate = params.sample_rate.ok_or_else(|| Error::Decode("unknown sample rate".into()))?;
-        let channels = params.channels.ok_or_else(|| Error::Decode("unknown channel layout".into()))?;
+        let src_rate = params
+            .sample_rate
+            .ok_or_else(|| Error::Decode("unknown sample rate".into()))?;
+        let channels = params
+            .channels
+            .ok_or_else(|| Error::Decode("unknown channel layout".into()))?;
         let duration_ms = match (params.n_frames, params.sample_rate) {
             (Some(n), Some(r)) if r > 0 => Some(n * 1000 / r as u64),
             _ => None,
@@ -226,7 +254,10 @@ impl Decoder {
     /// untouched. `Ok(0)` means end of stream; otherwise `out` is filled unless the
     /// stream ends first.
     pub fn read(&mut self, out: &mut [f32]) -> Result<usize> {
-        debug_assert!(out.len() >= 2, "read needs room for at least one stereo frame");
+        debug_assert!(
+            out.len() >= 2,
+            "read needs room for at least one stereo frame"
+        );
         let want = out.len() & !1; // whole frames only
         let mut n = 0;
         while n < want {
@@ -262,7 +293,9 @@ impl Decoder {
                     log::debug!("skipping damaged container data: {msg}");
                     continue;
                 }
-                Err(SymError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return self.finish(),
+                Err(SymError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return self.finish()
+                }
                 Err(SymError::ResetRequired) => return self.finish(),
                 Err(SymError::IoError(e)) => return Err(Error::Io(e)),
                 Err(e) => return Err(decode_err(e)),
@@ -299,7 +332,10 @@ impl Decoder {
         if spec.rate != self.cur_rate || spec.channels != self.cur_channels {
             self.rebuild_for(spec.rate, spec.channels)?;
         }
-        let buf = self.sample_buf.as_ref().expect("sample buffer was just filled");
+        let buf = self
+            .sample_buf
+            .as_ref()
+            .expect("sample buffer was just filled");
         self.stereo.clear();
         for frame in buf.samples().chunks_exact(nch) {
             let (mut l, mut r) = (0.0f32, 0.0f32);
@@ -334,7 +370,9 @@ impl Decoder {
     fn finish(&mut self) -> Result<()> {
         self.ended = true;
         if !self.got_samples {
-            return Err(Error::Decode("stream ended before any samples were decoded".into()));
+            return Err(Error::Decode(
+                "stream ended before any samples were decoded".into(),
+            ));
         }
         self.flush_resampler()
     }
@@ -345,16 +383,37 @@ impl Decoder {
         let Some(r) = self.resample.take() else {
             return Ok(());
         };
-        let Resample { mut rs, pending, offset, mut out } = r;
+        let Resample {
+            mut rs,
+            pending,
+            offset,
+            mut out,
+        } = r;
         let expected = (self.seg_src_frames * self.out_rate as u64).div_ceil(self.cur_rate as u64);
         let mut budget = expected.saturating_sub(self.seg_out_frames) as usize;
         let rest = [&pending[0][offset..], &pending[1][offset..]];
         if !rest[0].is_empty() {
-            let (_, n) = rs.process_partial_into_buffer(Some(&rest), &mut out, None).map_err(decode_err)?;
-            Self::queue(&mut self.ready, &mut self.skip_frames, &out, n, Some(&mut budget));
+            let (_, n) = rs
+                .process_partial_into_buffer(Some(&rest), &mut out, None)
+                .map_err(decode_err)?;
+            Self::queue(
+                &mut self.ready,
+                &mut self.skip_frames,
+                &out,
+                n,
+                Some(&mut budget),
+            );
         }
-        let (_, n) = rs.process_partial_into_buffer(None::<&[&[f32]]>, &mut out, None).map_err(decode_err)?;
-        Self::queue(&mut self.ready, &mut self.skip_frames, &out, n, Some(&mut budget));
+        let (_, n) = rs
+            .process_partial_into_buffer(None::<&[&[f32]]>, &mut out, None)
+            .map_err(decode_err)?;
+        Self::queue(
+            &mut self.ready,
+            &mut self.skip_frames,
+            &out,
+            n,
+            Some(&mut budget),
+        );
         Ok(())
     }
 
@@ -372,8 +431,13 @@ impl Decoder {
             if r.pending[0].len() - r.offset < need {
                 break;
             }
-            let input = [&r.pending[0][r.offset..r.offset + need], &r.pending[1][r.offset..r.offset + need]];
-            let (_, n) = r.rs.process_into_buffer(&input, &mut r.out, None).map_err(decode_err)?;
+            let input = [
+                &r.pending[0][r.offset..r.offset + need],
+                &r.pending[1][r.offset..r.offset + need],
+            ];
+            let (_, n) =
+                r.rs.process_into_buffer(&input, &mut r.out, None)
+                    .map_err(decode_err)?;
             r.offset += need;
             let before = self.ready.len();
             Self::queue(&mut self.ready, &mut self.skip_frames, &r.out, n, None);
@@ -391,7 +455,13 @@ impl Decoder {
 
     /// Appends the first `frames` frames of planar `out` to `ready`, after dropping
     /// `skip` start-up frames and (when given) at most `budget` frames.
-    fn queue(ready: &mut VecDeque<f32>, skip: &mut usize, out: &[Vec<f32>], frames: usize, budget: Option<&mut usize>) {
+    fn queue(
+        ready: &mut VecDeque<f32>,
+        skip: &mut usize,
+        out: &[Vec<f32>],
+        frames: usize,
+        budget: Option<&mut usize>,
+    ) {
         let drop = (*skip).min(frames);
         *skip -= drop;
         let mut end = frames;
@@ -422,7 +492,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn path(dir: &str, name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join(dir).join(name)
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(dir)
+            .join(name)
     }
 
     fn open(dir: &str, name: &str, rate: u32) -> Result<Decoder> {
@@ -455,7 +528,10 @@ mod tests {
             let mut d = open("fixtures", name, 48000).unwrap();
             let s = drain(&mut d);
             let frames = s.len() / 2;
-            assert!((frames as i64 - 48000).abs() <= 2400, "{name}: {frames} frames");
+            assert!(
+                (frames as i64 - 48000).abs() <= 2400,
+                "{name}: {frames} frames"
+            );
             assert!(rms(&s) > 0.01, "{name}: rms {}", rms(&s));
             match (name, d.duration_ms()) {
                 ("tone.mp3", None) => {} // no frame count without a Xing/Info header
@@ -585,8 +661,14 @@ mod tests {
             | Channels::SIDE_LEFT
             | Channels::SIDE_RIGHT;
         let dm = Downmix::new(l51);
-        let (sl, sr) = dm.gains.iter().fold((0.0, 0.0), |a, g| (a.0 + g.0, a.1 + g.1));
+        let (sl, sr) = dm
+            .gains
+            .iter()
+            .fold((0.0, 0.0), |a, g| (a.0 + g.0, a.1 + g.1));
         assert!(sl <= 1.0001 && sr <= 1.0001, "{sl} {sr}");
-        assert!(sl > 0.99, "full-scale input should reach about full scale: {sl}");
+        assert!(
+            sl > 0.99,
+            "full-scale input should reach about full scale: {sl}"
+        );
     }
 }
