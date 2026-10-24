@@ -23,21 +23,21 @@ const ID_BAN: &str = "ban";
 const ID_SHOW: &str = "show";
 const ID_QUIT: &str = "quit";
 
-/// Genres in the "Žanr" submenu besides "Sve" and the last selection.
+/// Genres in the "Genre" submenu besides "All" and the last selection.
 pub const TOP_GENRES: usize = 30;
 const ALL_GENRES_ID: &str = "genre-all";
 const GENRE_ID_PREFIX: &str = "genre:";
 /// Longest track label in the menu, in characters.
 const LABEL_MAX_CHARS: usize = 60;
 
-/// One item of the "Žanr" submenu.
+/// One item of the "Genre" submenu.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenreEntry {
     pub id: String,
     pub label: String,
 }
 
-/// What a "Žanr" submenu item plays.
+/// What a "Genre" submenu item plays.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GenrePick {
     All,
@@ -58,12 +58,12 @@ struct Tray {
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let now = MenuItem::with_id(app, "now", track_label(None), false, None::<&str>)?;
     let pause = MenuItem::with_id(app, ID_TOGGLE, pause_label(None), false, None::<&str>)?;
-    let next = MenuItem::with_id(app, ID_NEXT, "Sljedeća", true, None::<&str>)?;
-    let ban = MenuItem::with_id(app, ID_BAN, "Nikad više ovu pjesmu", false, None::<&str>)?;
+    let next = MenuItem::with_id(app, ID_NEXT, "Next", true, None::<&str>)?;
+    let ban = MenuItem::with_id(app, ID_BAN, "Never play this again", false, None::<&str>)?;
     // Filled in the background: the catalog is not queried on the main thread.
-    let genres = Submenu::with_items(app, "Žanr", true, &[])?;
-    let show = MenuItem::with_id(app, ID_SHOW, "Prikaži prozor", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, ID_QUIT, "Izlaz", true, None::<&str>)?;
+    let genres = Submenu::with_items(app, "Genre", true, &[])?;
+    let show = MenuItem::with_id(app, ID_SHOW, "Show window", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -135,14 +135,14 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Schedules a rebuild of the "Žanr" submenu (no-op before the tray exists).
+/// Schedules a rebuild of the "Genre" submenu (no-op before the tray exists).
 pub fn refresh_genres(app: &AppHandle) {
     if let Some(tray) = app.try_state::<Tray>() {
         let _ = tray.rebuild_genres.send(());
     }
 }
 
-/// Replaces the "Žanr" items unless they would stay the same as `shown`.
+/// Replaces the "Genre" items unless they would stay the same as `shown`.
 fn rebuild_genre_menu(app: &AppHandle, shown: &mut Vec<GenreEntry>) -> Result<(), String> {
     let st = app.state::<AppState>();
     let genres = lock(&st.query).genres().map_err(|e| e.to_string())?;
@@ -228,7 +228,7 @@ pub fn show_main_window(app: &AppHandle) {
     let _ = w.set_focus();
 }
 
-/// "Sve", then the [`TOP_GENRES`] largest genres by track count, then the genres of
+/// "All", then the [`TOP_GENRES`] largest genres by track count, then the genres of
 /// `last_selection` that are not among them.
 pub fn genre_entries(genres: &[GenreCount], last_selection: &[String]) -> Vec<GenreEntry> {
     let mut by_count: Vec<&GenreCount> = genres.iter().collect();
@@ -244,7 +244,7 @@ pub fn genre_entries(genres: &[GenreCount], last_selection: &[String]) -> Vec<Ge
     };
     let mut entries = vec![GenreEntry {
         id: ALL_GENRES_ID.into(),
-        label: "Sve".into(),
+        label: "All".into(),
     }];
     entries.extend(by_count.iter().take(TOP_GENRES).map(|g| entry(g)));
     entries.extend(
@@ -267,7 +267,7 @@ pub fn genre_pick(menu_id: &str) -> Option<GenrePick> {
         .map(|key| GenrePick::One(key.to_string()))
 }
 
-/// "Izvođač – Naslov" for the menu and the tooltip.
+/// "Artist – Title" for the menu and the tooltip.
 pub fn track_label(np: Option<&NowPlaying>) -> String {
     let parts: Vec<&str> = np
         .map(|n| [n.artist.trim(), n.title.trim()])
@@ -276,7 +276,7 @@ pub fn track_label(np: Option<&NowPlaying>) -> String {
         .filter(|s| !s.is_empty())
         .collect();
     if parts.is_empty() {
-        return "Ništa ne svira".into();
+        return "Nothing playing".into();
     }
     let label = parts.join(" – ");
     if label.chars().count() <= LABEL_MAX_CHARS {
@@ -294,9 +294,9 @@ pub fn menu_text(s: &str) -> String {
 
 pub fn pause_label(np: Option<&NowPlaying>) -> &'static str {
     if np.is_some_and(|n| n.paused) {
-        "Nastavi"
+        "Resume"
     } else {
-        "Pauza"
+        "Pause"
     }
 }
 
@@ -328,7 +328,7 @@ mod tests {
         let genres = [genre("a", 5), genre("b", 50), genre("c", 7)];
         let e = genre_entries(&genres, &[]);
         let labels: Vec<_> = e.iter().map(|e| e.label.as_str()).collect();
-        assert_eq!(labels, ["Sve", "B", "C", "A"]);
+        assert_eq!(labels, ["All", "B", "C", "A"]);
         assert_eq!(genre_pick(&e[0].id), Some(GenrePick::All));
         assert_eq!(genre_pick(&e[1].id), Some(GenrePick::One("b".into())));
     }
@@ -356,7 +356,7 @@ mod tests {
             .into_iter()
             .map(|e| e.label)
             .collect();
-        assert_eq!(labels, ["Sve", "AA", "ZZ"]);
+        assert_eq!(labels, ["All", "AA", "ZZ"]);
         assert_eq!(genre_entries(&[], &["x".into()]).len(), 1);
     }
 
@@ -377,7 +377,7 @@ mod tests {
         );
         assert_eq!(track_label(Some(&np(" ", "Song", false))), "Song");
         assert_eq!(track_label(Some(&np("Artist", "", false))), "Artist");
-        assert_eq!(track_label(None), "Ništa ne svira");
+        assert_eq!(track_label(None), "Nothing playing");
     }
 
     #[test]
@@ -397,8 +397,8 @@ mod tests {
 
     #[test]
     fn pause_item_says_what_it_does() {
-        assert_eq!(pause_label(Some(&np("A", "B", false))), "Pauza");
-        assert_eq!(pause_label(Some(&np("A", "B", true))), "Nastavi");
-        assert_eq!(pause_label(None), "Pauza");
+        assert_eq!(pause_label(Some(&np("A", "B", false))), "Pause");
+        assert_eq!(pause_label(Some(&np("A", "B", true))), "Resume");
+        assert_eq!(pause_label(None), "Pause");
     }
 }

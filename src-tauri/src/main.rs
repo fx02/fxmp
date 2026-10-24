@@ -79,6 +79,7 @@ fn main() {
             commands::list_banned,
             commands::unban,
             commands::merge_genre,
+            commands::known_genres,
             commands::list_artists,
             commands::list_albums,
             commands::now_playing,

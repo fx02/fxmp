@@ -35,10 +35,10 @@ pub enum ConnStatus {
 impl ConnStatus {
     pub fn message(self) -> &'static str {
         match self {
-            ConnStatus::Ok => "Spojeno",
-            ConnStatus::Secondary => "Spojeno na rezervni server",
-            ConnStatus::Unreachable => "Disk nije dostupan. Je li uključen WireGuard/VPN?",
-            ConnStatus::Auth => "Pogrešno korisničko ime ili lozinka",
+            ConnStatus::Ok => "Connected",
+            ConnStatus::Secondary => "Connected to the backup server",
+            ConnStatus::Unreachable => "The music share is unreachable. Is WireGuard/VPN on?",
+            ConnStatus::Auth => "Wrong username or password",
         }
     }
 }
@@ -99,12 +99,12 @@ pub fn smb_config(server: &ServerConfig, password: String) -> SmbConfig {
     }
 }
 
-/// Connects to a server once, as "Testiraj vezu" does.
+/// Connects to a server once, as "Test connection" does.
 pub fn test_server(cfg: SmbConfig) -> Result<(), SourceError> {
     smb_connect(cfg).map(drop)
 }
 
-/// What "Testiraj vezu" checks for `which` ("primary"/"secondary"): the form's unsaved
+/// What "Test connection" checks for `which` ("primary"/"secondary"): the form's unsaved
 /// `server` when given, else the saved one; the form's `password` when non-empty,
 /// else the keychain's for that host and user.
 pub fn test_target(
@@ -120,8 +120,8 @@ pub fn test_target(
         ("secondary", None) => settings
             .secondary
             .clone()
-            .ok_or("Rezervni server nije postavljen.")?,
-        (other, _) => return Err(format!("Nepoznat server: {other}")),
+            .ok_or("No backup server is set up.")?,
+        (other, _) => return Err(format!("Unknown server: {other}")),
     };
     let password = password
         .filter(|p| !p.is_empty())
@@ -542,12 +542,18 @@ mod tests {
     }
 
     #[test]
-    fn status_payload_carries_croatian_text() {
+    fn status_payload_carries_english_text() {
         let json = serde_json::to_string(&StatusPayload::from(ConnStatus::Unreachable)).unwrap();
         assert_eq!(
             json,
-            r#"{"status":"unreachable","message":"Disk nije dostupan. Je li uključen WireGuard/VPN?"}"#
+            r#"{"status":"unreachable","message":"The music share is unreachable. Is WireGuard/VPN on?"}"#
         );
+        assert_eq!(ConnStatus::Ok.message(), "Connected");
+        assert_eq!(
+            ConnStatus::Secondary.message(),
+            "Connected to the backup server"
+        );
+        assert_eq!(ConnStatus::Auth.message(), "Wrong username or password");
     }
 
     #[test]

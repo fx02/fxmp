@@ -48,7 +48,7 @@ pub fn get(host: &str, username: &str) -> Option<String> {
 pub fn set(host: &str, username: &str, password: &str) -> Result<(), String> {
     keyring::Entry::new(SERVICE, &account(host, username))
         .and_then(|e| e.set_password(password))
-        .map_err(|e| format!("Lozinku nije moguće spremiti u keychain: {e}"))
+        .map_err(|e| format!("Cannot save the password in the keychain: {e}"))
 }
 
 #[cfg(test)]

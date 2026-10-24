@@ -5,6 +5,7 @@
 use serde::Serialize;
 use smp_core::audio::output::list_output_devices;
 use smp_core::audio::player::Command;
+use smp_core::genre::{known_genre, known_genre_names};
 use smp_core::TrackId;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -30,7 +31,8 @@ async fn run<T: Send + 'static>(
             let _ = tx.send(f(&app, &st));
         })
         .map_err(|e| e.to_string())?;
-    rx.await.map_err(|_| "Naredba nije dovršena.".to_string())?
+    rx.await
+        .map_err(|_| "The command did not finish.".to_string())?
 }
 
 /// Runs `f` on a new thread for callers that do not wait for the result (tray, media
@@ -56,7 +58,7 @@ pub fn spawn_action(
 
 fn db_err(e: smp_core::Error) -> String {
     log::warn!("catalog: {e}");
-    format!("Greška baze: {e}")
+    format!("Library database error: {e}")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,17 +108,17 @@ pub async fn save_settings(
                 servers_changed = old.primary != new.primary || old.secondary != new.secondary;
                 apply_player_settings(&st.player, new);
             })
-            .map_err(|e| format!("Postavke nije moguće spremiti: {e}"))?;
+            .map_err(|e| format!("Cannot save settings: {e}"))?;
         if servers_changed {
             state::cancel_scan(
                 st,
-                Some("Postavke servera su promijenjene pa je skeniranje prekinuto."),
+                Some("The server settings changed, so the scan was cancelled."),
             );
         }
         st.reconnect(&saved);
         autostart::apply(app, saved.autostart, false).map_err(|e| {
             log::warn!("start at login: {e}");
-            "Postavke su spremljene, ali automatsko pokretanje nije moguće promijeniti.".to_string()
+            "Settings saved, but start at login could not be changed.".to_string()
         })
     })
     .await
@@ -316,7 +318,7 @@ pub fn ban_current_now(st: &AppState) -> CmdResult<()> {
     let id = lock(&st.now_playing)
         .as_ref()
         .map(|n| n.id)
-        .ok_or("Ništa ne svira.")?;
+        .ok_or("Nothing is playing.")?;
     lock(&st.banned).insert(id);
     st.writer
         .call(move |c| c.set_banned(id, true))
@@ -359,14 +361,28 @@ pub async fn unban(app: AppHandle, id: TrackId) -> CmdResult<()> {
     .await
 }
 
-/// Merges (or renames) genre `from_key` into `into_display`; emits `genres-changed`.
+/// The known genre a merge goes into, by its canonical name.
+fn merge_target(into: &str) -> CmdResult<String> {
+    let into = into.trim();
+    if into.is_empty() {
+        return Err("Choose a genre.".into());
+    }
+    known_genre(into)
+        .map(|g| g.display)
+        .ok_or_else(|| format!("\u{201c}{into}\u{201d} is not a known genre."))
+}
+
+/// Display names of all known genres: the choices for "Merge into…".
+#[tauri::command(rename_all = "snake_case")]
+pub fn known_genres() -> Vec<String> {
+    known_genre_names()
+}
+
+/// Merges genre `from_key` into the known genre `into_display`; emits `genres-changed`.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn merge_genre(app: AppHandle, from_key: String, into_display: String) -> CmdResult<()> {
     run(app, move |app, st| {
-        let into = into_display.trim().to_string();
-        if into.is_empty() {
-            return Err("Naziv žanra ne smije biti prazan.".into());
-        }
+        let into = merge_target(&into_display)?;
         // Rebuilds genres over the whole library: on the writer's connection, so
         // playback and other queries are not held up.
         st.writer
@@ -394,4 +410,20 @@ pub async fn list_albums(app: AppHandle, artist: String) -> CmdResult<Vec<String
 #[tauri::command(rename_all = "snake_case")]
 pub async fn now_playing(app: AppHandle) -> CmdResult<Option<NowPlaying>> {
     run(app, |_, st| Ok(lock(&st.now_playing).clone())).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_target_must_be_a_known_genre() {
+        assert_eq!(merge_target(" dnb ").unwrap(), "Drum & Bass");
+        assert_eq!(merge_target("chillout").unwrap(), "Chillout");
+        assert_eq!(merge_target("  ").unwrap_err(), "Choose a genre.");
+        assert_eq!(
+            merge_target("ZZ Test Preimenovano").unwrap_err(),
+            "\u{201c}ZZ Test Preimenovano\u{201d} is not a known genre."
+        );
+    }
 }

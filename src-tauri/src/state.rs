@@ -342,10 +342,10 @@ fn on_player_event(app: &AppHandle, ev: Event) {
 pub fn start_scan(app: &AppHandle) -> Result<(), String> {
     let st = app.state::<AppState>();
     if st.source.servers().is_none() {
-        return Err("Najprije spremi postavke servera.".into());
+        return Err("Save the server settings first.".into());
     }
     if st.scanning.swap(true, Ordering::SeqCst) {
-        return Err("Skeniranje je već u tijeku.".into());
+        return Err("A scan is already running.".into());
     }
     st.cancel_scan.store(false, Ordering::SeqCst);
     *lock(&st.cancel_reason) = None;
@@ -356,7 +356,7 @@ pub fn start_scan(app: &AppHandle) -> Result<(), String> {
         .spawn(move || run_scan(&handle));
     if let Err(e) = spawned {
         st.scanning.store(false, Ordering::SeqCst);
-        return Err(format!("Skeniranje nije moguće pokrenuti: {e}"));
+        return Err(format!("Cannot start the scan: {e}"));
     }
     Ok(())
 }

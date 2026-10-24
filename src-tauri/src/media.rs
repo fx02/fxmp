@@ -126,7 +126,7 @@ fn notify_track(app: &AppHandle, np: &NowPlaying) {
     }
 }
 
-/// Notification title and body: the song title, and "Izvođač — Album".
+/// Notification title and body: the song title, and "Artist — Album".
 pub fn notification_text(np: &NowPlaying) -> (String, String) {
     let body = [np.artist.trim(), np.album.trim()]
         .into_iter()
