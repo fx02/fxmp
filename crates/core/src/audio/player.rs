@@ -5,27 +5,19 @@
 //! audible decks (outgoing + current), applies fades, normalisation and volume, and writes
 //! to the sink without blocking.
 
-use std::collections::VecDeque;
-use std::io::{Seek, SeekFrom};
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::decoder::Decoder;
+use super::deck::{Deck, LoadCtx, Ramp};
 use super::dsp::{apply_ceiling, db_to_lin, equal_power, LoudnessMeter};
 use super::output::{Sink, SinkFactory, SinkWrite};
-use super::prefetch::{PrefetchConfig, PrefetchReader};
+use super::prefetch::PrefetchConfig;
 use crate::source::MusicSource;
 use crate::TrackId;
 
 /// Frames mixed per block.
 const BLOCK: usize = 1024;
-/// Samples decoded per read on a deck thread.
-const DECODE_CHUNK: usize = 4096;
-/// Decoded audio a deck keeps ready; more than the longest crossfade, so the end of a
-/// track is known before its crossfade has to start, and a stalled read is bridged.
-const DECK_BUFFER_SECS: usize = 11;
 const NEXT_FADE_SECS: f32 = 0.7;
 const SKIP_FADE_SECS: f32 = 0.3;
 /// The next track is opened this long (plus the crossfade) before the current one ends.
@@ -34,6 +26,8 @@ const RAMP_SECS: f32 = 0.02;
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 /// How long the mix may hold at a crossfade point for a next track that is still opening.
 const READY_GRACE: Duration = Duration::from_millis(100);
+/// How long a fading outgoing deck may hold up the mix when its source stalls.
+const OUT_STALL_GRACE: Duration = Duration::from_millis(100);
 const SINK_RETRY: Duration = Duration::from_secs(1);
 const SINK_FULL_WAIT: Duration = Duration::from_millis(10);
 const IDLE_WAIT: Duration = Duration::from_millis(500);
@@ -125,261 +119,6 @@ impl Drop for Player {
 }
 
 // ---------------------------------------------------------------------------------------
-// Decks
-
-#[derive(Clone)]
-enum Phase {
-    Loading,
-    Decoding,
-    Ended,
-    Failed(String),
-}
-
-struct DeckBuf {
-    samples: VecDeque<f32>,
-    phase: Phase,
-    /// Some audio was decoded (the track did not fail before its first sample).
-    decoded_any: bool,
-    duration_ms: Option<u64>,
-    cancelled: bool,
-}
-
-struct DeckShared {
-    buf: Mutex<DeckBuf>,
-    /// Signalled when the engine takes samples or cancels.
-    space: Condvar,
-}
-
-impl DeckShared {
-    fn lock(&self) -> MutexGuard<'_, DeckBuf> {
-        self.buf.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-/// What a deck thread needs to open and decode a track.
-#[derive(Clone)]
-struct LoadCtx {
-    source: Arc<dyn MusicSource>,
-    prefetch: PrefetchConfig,
-    wake: Sender<Msg>,
-}
-
-fn spawn_deck_thread(
-    ctx: &LoadCtx,
-    rel_path: &str,
-    rate: u32,
-    skip_frames: u64,
-) -> Arc<DeckShared> {
-    let shared = Arc::new(DeckShared {
-        buf: Mutex::new(DeckBuf {
-            samples: VecDeque::new(),
-            phase: Phase::Loading,
-            decoded_any: false,
-            duration_ms: None,
-            cancelled: false,
-        }),
-        space: Condvar::new(),
-    });
-    let (s, ctx, path) = (shared.clone(), ctx.clone(), rel_path.to_string());
-    std::thread::Builder::new()
-        .name("player-deck".into())
-        .spawn(move || {
-            let run =
-                std::panic::AssertUnwindSafe(|| deck_thread(&s, &ctx, &path, rate, skip_frames));
-            if std::panic::catch_unwind(run).is_err() {
-                // A decoder panic must not leave the engine waiting on this deck forever.
-                s.lock().phase = Phase::Failed("decoder panicked".into());
-                let _ = ctx.wake.send(Msg::Wake);
-            }
-        })
-        .expect("spawn deck thread");
-    shared
-}
-
-fn open_decoder(ctx: &LoadCtx, rel_path: &str, rate: u32) -> crate::Result<Decoder> {
-    let mut reader = ctx.source.open(rel_path)?;
-    let len = reader.seek(SeekFrom::End(0))?;
-    reader.seek(SeekFrom::Start(0))?;
-    let prefetch = PrefetchReader::new(reader, len, ctx.prefetch.clone());
-    let ext = Path::new(rel_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    Decoder::open(Box::new(prefetch), Some(len), ext, rate)
-}
-
-fn deck_thread(shared: &DeckShared, ctx: &LoadCtx, rel_path: &str, rate: u32, skip_frames: u64) {
-    let set_phase = |phase: Phase| {
-        shared.lock().phase = phase;
-        let _ = ctx.wake.send(Msg::Wake);
-    };
-    let mut dec = match open_decoder(ctx, rel_path, rate) {
-        Ok(d) => d,
-        Err(e) => return set_phase(Phase::Failed(e.to_string())),
-    };
-    {
-        let mut b = shared.lock();
-        b.duration_ms = dec.duration_ms();
-        b.phase = Phase::Decoding;
-    }
-    let cap = DECK_BUFFER_SECS * rate as usize * 2;
-    let mut skip = skip_frames as usize * 2;
-    let mut chunk = vec![0.0f32; DECODE_CHUNK];
-    loop {
-        {
-            let mut b = shared.lock();
-            while b.samples.len() >= cap && !b.cancelled {
-                b = shared.space.wait(b).unwrap_or_else(|e| e.into_inner());
-            }
-            if b.cancelled {
-                return;
-            }
-        }
-        match dec.read(&mut chunk) {
-            Ok(0) => return set_phase(Phase::Ended),
-            Ok(n) => {
-                let drop_n = skip.min(n);
-                skip -= drop_n;
-                let mut b = shared.lock();
-                b.samples.extend(&chunk[drop_n..n]);
-                b.decoded_any = true;
-                drop(b);
-                let _ = ctx.wake.send(Msg::Wake);
-            }
-            Err(e) => return set_phase(Phase::Failed(e.to_string())),
-        }
-    }
-}
-
-/// A fade over `len` frames.
-struct Ramp {
-    pos: u64,
-    len: u64,
-}
-
-impl Ramp {
-    fn new(len: u64) -> Self {
-        Self {
-            pos: 0,
-            len: len.max(1),
-        }
-    }
-    fn progress(&self) -> f32 {
-        (self.pos as f32 / self.len as f32).min(1.0)
-    }
-    fn done(&self) -> bool {
-        self.pos >= self.len
-    }
-}
-
-struct Status {
-    buffered: usize,
-    /// No more data will arrive.
-    done: bool,
-    error: Option<String>,
-    decoded_any: bool,
-    duration_ms: Option<u64>,
-}
-
-struct Deck {
-    item: PlayItem,
-    shared: Arc<DeckShared>,
-    /// Loudness of what was played, before any gain.
-    meter: Option<LoudnessMeter>,
-    /// Frames consumed by the mixer.
-    played: u64,
-    fade_in: Option<Ramp>,
-    fade_out: Option<Ramp>,
-    /// Current normalisation gain (ramped towards its target).
-    norm: Option<f32>,
-    /// Played to its end; reported to the provider when dropped.
-    reached_end: bool,
-}
-
-impl Deck {
-    fn load(ctx: &LoadCtx, item: PlayItem, rate: u32) -> Self {
-        let shared = spawn_deck_thread(ctx, &item.rel_path, rate, 0);
-        Self {
-            item,
-            shared,
-            meter: Some(LoudnessMeter::new(rate)),
-            played: 0,
-            fade_in: None,
-            fade_out: None,
-            norm: None,
-            reached_end: false,
-        }
-    }
-
-    /// Restarts decoding at a new output rate, resuming where playback was.
-    fn reload(&mut self, ctx: &LoadCtx, old_rate: u32, rate: u32) {
-        self.cancel();
-        self.played = self.played * rate as u64 / old_rate.max(1) as u64;
-        self.shared = spawn_deck_thread(ctx, &self.item.rel_path, rate, self.played);
-        self.meter = Some(LoudnessMeter::new(rate));
-        self.fade_in = None;
-    }
-
-    fn status(&self) -> Status {
-        let b = self.shared.lock();
-        let (done, error) = match &b.phase {
-            Phase::Loading | Phase::Decoding => (false, None),
-            Phase::Ended => (true, None),
-            Phase::Failed(e) => (true, Some(e.clone())),
-        };
-        Status {
-            buffered: b.samples.len() / 2,
-            done,
-            error,
-            decoded_any: b.decoded_any,
-            duration_ms: b.duration_ms,
-        }
-    }
-
-    /// Opening or decoding failed before any audio came out.
-    fn failed_early(&self) -> Option<String> {
-        let s = self.status();
-        if s.decoded_any {
-            None
-        } else {
-            s.error
-        }
-    }
-
-    fn ready(&self) -> bool {
-        let s = self.status();
-        s.decoded_any && (s.buffered > 0 || s.done)
-    }
-
-    /// No buffered audio left and none coming.
-    fn drained(&self) -> bool {
-        let s = self.status();
-        s.done && s.buffered == 0
-    }
-
-    /// Appends up to `frames` frames to `out`; returns how many.
-    fn take(&mut self, frames: usize, out: &mut Vec<f32>) -> usize {
-        let mut b = self.shared.lock();
-        let n = (frames * 2).min(b.samples.len());
-        out.extend(b.samples.drain(..n));
-        drop(b);
-        self.shared.space.notify_all();
-        n / 2
-    }
-
-    fn cancel(&self) {
-        self.shared.lock().cancelled = true;
-        self.shared.space.notify_all();
-    }
-}
-
-impl Drop for Deck {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-// ---------------------------------------------------------------------------------------
 // Engine
 
 enum Step {
@@ -415,8 +154,14 @@ struct Engine {
     next: Option<Deck>,
     pending_skips: u32,
     grace_since: Option<Instant>,
+    /// Since when the outgoing deck has had too little audio.
+    out_starved_since: Option<Instant>,
 
     paused: bool,
+    /// `Paused(true)` has been emitted for the current pause (after its fade-out).
+    pause_reported: bool,
+    /// Fades output out on pause and in on resume.
+    pause_gain: f32,
     volume: f32,
     volume_target: f32,
     crossfade_secs: Option<u8>,
@@ -444,7 +189,9 @@ impl Engine {
             load: LoadCtx {
                 source,
                 prefetch: cfg.prefetch,
-                wake,
+                wake: Arc::new(move || {
+                    let _ = wake.send(Msg::Wake);
+                }),
             },
             sink: None,
             rate: 0,
@@ -461,7 +208,10 @@ impl Engine {
             next: None,
             pending_skips: 0,
             grace_since: None,
+            out_starved_since: None,
             paused: false,
+            pause_reported: false,
+            pause_gain: 1.0,
             volume: 1.0,
             volume_target: 1.0,
             crossfade_secs: Some(5),
@@ -515,7 +265,13 @@ impl Engine {
     fn command(&mut self, c: Command) {
         match c {
             Command::Play(p) => {
+                // A track that already played to its end belongs to the old provider.
+                if let Some(mut out) = self.out.take() {
+                    self.report_end(&mut out);
+                    self.out = Some(out);
+                }
                 self.next = None;
+                self.grace_since = None;
                 self.provider = Some(p);
                 self.stopped_feeding = false;
                 self.exhausted = false;
@@ -575,9 +331,20 @@ impl Engine {
         }
     }
 
+    /// Pausing fades out over 20 ms first; `Paused(true)` follows once the fade is written.
     fn set_paused(&mut self, p: bool) {
         self.paused = p;
-        self.emit(Event::Paused(p));
+        self.pause_reported = !p;
+        if !p {
+            self.emit(Event::Paused(false));
+        }
+    }
+
+    fn report_pause(&mut self) {
+        if self.paused && !self.pause_reported {
+            self.pause_reported = true;
+            self.emit(Event::Paused(true));
+        }
     }
 
     fn nothing_loaded(&self) -> bool {
@@ -683,6 +450,7 @@ impl Engine {
             let failed = self.slot(slot).as_ref().and_then(Deck::failed_early);
             if let Some(reason) = failed {
                 let deck = self.slot(slot).take().expect("checked above");
+                self.grace_since = None;
                 log::warn!("skipping {}: {reason}", deck.item.rel_path);
                 if let Some(p) = self.provider.as_mut() {
                     p.on_failed(deck.item.id);
@@ -723,15 +491,17 @@ impl Engine {
 
     /// Drops the outgoing deck, reporting it if it had played to its end.
     fn drop_outgoing(&mut self) {
-        if let Some(deck) = self.out.take() {
-            self.report_end(deck);
+        if let Some(mut deck) = self.out.take() {
+            self.report_end(&mut deck);
         }
     }
 
-    fn report_end(&mut self, deck: Deck) {
+    /// Reports a deck that played to its end (once).
+    fn report_end(&mut self, deck: &mut Deck) {
         if !deck.reached_end {
             return;
         }
+        deck.reached_end = false;
         let Some(p) = self.provider.as_mut() else {
             return;
         };
@@ -745,7 +515,6 @@ impl Engine {
                 });
             }
             None => {
-                let mut deck = deck;
                 let lufs = deck.meter.take().and_then(LoudnessMeter::finish);
                 p.on_played(deck.item.id, lufs);
             }
@@ -770,11 +539,12 @@ impl Engine {
                     self.out = Some(cur);
                 }
             } else if self.next_ready() {
-                // The press is for the track that was about to start.
+                // The press is for the track that was about to start: it fades in and
+                // straight out again (no click), ending any fade still running.
                 self.drop_outgoing();
-                self.start_next(None);
+                self.start_next(Some(self.secs_to_frames(SKIP_FADE_SECS)));
             } else {
-                self.drop_outgoing();
+                // Wait for the next track; a running fade continues meanwhile.
                 break;
             }
         }
@@ -797,7 +567,8 @@ impl Engine {
             if s.done && s.buffered == 0 {
                 let mut deck = self.cur.take().expect("checked");
                 deck.reached_end = true;
-                self.report_end(deck);
+                self.grace_since = None;
+                self.report_end(&mut deck);
             } else if s.done
                 && (s.buffered as u64) <= self.crossfade_frames()
                 && self.next.is_some()
@@ -859,10 +630,15 @@ impl Engine {
     // --- mixing and output -------------------------------------------------------------
 
     fn step(&mut self) -> Step {
-        if self.paused || !self.active() {
+        if self.paused && (!self.active() || self.sink.is_none()) {
+            self.pause_gain = 0.0;
+        }
+        if !self.active() {
+            self.report_pause();
             return Step::Wait(IDLE_WAIT);
         }
         if self.sink.is_none() {
+            self.report_pause();
             let wait = self
                 .sink_retry_at
                 .map_or(SINK_RETRY, |t| t.saturating_duration_since(Instant::now()));
@@ -870,6 +646,10 @@ impl Engine {
         }
         if self.pending_pos < self.pending.len() {
             return self.write_pending();
+        }
+        if self.paused && self.pause_gain <= 0.0 {
+            self.report_pause();
+            return Step::Wait(IDLE_WAIT);
         }
         if let Some(since) = self.grace_since {
             let cf_point = self.cur.as_ref().is_some_and(|c| {
@@ -885,6 +665,14 @@ impl Engine {
             }
         }
         if self.mix_block() == 0 {
+            if self.paused {
+                // Nothing to fade out: pause at once.
+                self.pause_gain = 0.0;
+                return Step::Progress;
+            }
+            if let Some(since) = self.out_starved_since {
+                return Step::Wait(OUT_STALL_GRACE.saturating_sub(since.elapsed()));
+            }
             // Waiting for a deck: its thread wakes us when data arrives.
             return Step::Wait(IDLE_WAIT);
         }
@@ -918,15 +706,36 @@ impl Engine {
     fn mix_block(&mut self) -> usize {
         let mut frames = BLOCK;
         let mut any = false;
+        if self.out.is_none() {
+            self.out_starved_since = None;
+        }
         let cf = self.crossfade_frames();
         for (i, deck) in [&self.out, &self.cur].into_iter().enumerate() {
             let Some(deck) = deck else { continue };
             any = true;
             let s = deck.status();
+            let is_cur = i == 1;
+            let starved = !s.done && s.buffered < frames;
+            if !is_cur {
+                if !starved {
+                    self.out_starved_since = None;
+                } else if deck.fade_out.is_some() {
+                    // A fading outgoing deck whose source stalls holds up the mix only
+                    // briefly, then contributes silence so the fade (and Next) goes on.
+                    let since = *self.out_starved_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() < OUT_STALL_GRACE {
+                        frames = s.buffered;
+                    }
+                    continue;
+                }
+            }
             if !s.done {
                 frames = frames.min(s.buffered);
             }
-            let is_cur = i == 1;
+            if is_cur && s.done && s.buffered > 0 && deck.fade_out.is_none() {
+                // End the block with the track so the next one follows without a gap.
+                frames = frames.min(s.buffered);
+            }
             if !is_cur || cf == 0 || deck.fade_out.is_some() {
                 continue;
             }
@@ -940,12 +749,16 @@ impl Engine {
                 frames = frames.min(buffered.saturating_sub(cf) as usize);
             }
         }
+        let step = 1.0 / (RAMP_SECS * self.rate as f32);
+        if self.paused {
+            // Only the rest of the pause fade-out.
+            frames = frames.min((self.pause_gain / step).ceil().max(1.0) as usize);
+        }
         if !any || frames == 0 {
             return 0;
         }
         self.pending.clear();
         self.pending.resize(frames * 2, 0.0);
-        let step = 1.0 / (RAMP_SECS * self.rate as f32);
         for deck in [&mut self.out, &mut self.cur].into_iter().flatten() {
             mix_deck(
                 deck,
@@ -956,10 +769,13 @@ impl Engine {
                 step,
             );
         }
+        let pause_target = if self.paused { 0.0 } else { 1.0 };
         for f in self.pending.as_chunks_mut::<2>().0 {
             self.volume += (self.volume_target - self.volume).clamp(-step, step);
+            self.pause_gain += (pause_target - self.pause_gain).clamp(-step, step);
+            let g = self.volume * self.pause_gain;
             for s in f {
-                *s *= self.volume;
+                *s *= g;
                 if !s.is_finite() {
                     *s = 0.0;
                 }
@@ -988,10 +804,7 @@ fn mix_deck(
 ) {
     scratch.clear();
     let got = deck.take(frames, scratch);
-    if got == 0 {
-        return;
-    }
-    if let Some(m) = deck.meter.as_mut() {
+    if let Some(m) = deck.meter.as_mut().filter(|_| got > 0) {
         m.push(scratch);
     }
     let target = if normalize {
@@ -1020,6 +833,13 @@ fn mix_deck(
         out[1] += inp[1] * g;
     }
     deck.norm = Some(norm);
+    // Fades run on the output clock, also through frames the deck could not fill.
+    for r in [deck.fade_in.as_mut(), deck.fade_out.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        r.pos += (frames - got) as u64;
+    }
     if deck.fade_in.as_ref().is_some_and(Ramp::done) {
         deck.fade_in = None;
     }

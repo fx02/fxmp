@@ -53,11 +53,11 @@ impl TrackProvider for FakeProvider {
 }
 
 /// Records everything written at 48 kHz. Unpaced sinks take samples as fast as they come;
-/// paced ones behave like a real device with a 200 ms buffer.
+/// paced ones behave like a real device with a 200 ms buffer, running `speed` times real time.
 struct FakeSink {
     out: Arc<Mutex<Vec<f32>>>,
     rate: u32,
-    paced: Option<Instant>,
+    paced: Option<(Instant, f64)>,
     written: usize,
     lose_after: Option<usize>,
 }
@@ -71,8 +71,9 @@ impl Sink for FakeSink {
             return SinkWrite::DeviceLost;
         }
         let mut n = stereo.len();
-        if let Some(start) = self.paced {
-            let allowed = ((start.elapsed().as_secs_f64() + 0.2) * RATE as f64) as usize * 2;
+        if let Some((start, speed)) = self.paced {
+            let allowed =
+                ((start.elapsed().as_secs_f64() * speed + 0.2) * RATE as f64) as usize * 2;
             n = n.min(allowed.saturating_sub(self.written));
         }
         n &= !1;
@@ -85,7 +86,8 @@ impl Sink for FakeSink {
 struct FakeFactory {
     out: Arc<Mutex<Vec<f32>>>,
     opened: Arc<Mutex<Vec<Option<String>>>>,
-    paced: bool,
+    /// Pacing speed (multiple of real time); `None` = unpaced.
+    speed: Option<f64>,
     /// The first sink opened reports `DeviceLost` after this many samples.
     lose_first_after: Option<usize>,
     /// Sample rate of sinks after the first one.
@@ -109,7 +111,7 @@ impl SinkFactory for FakeFactory {
         let sink = FakeSink {
             out: self.out.clone(),
             rate,
-            paced: self.paced.then(Instant::now),
+            paced: self.speed.map(|v| (Instant::now(), v)),
             written: 0,
             lose_after,
         };
@@ -120,6 +122,8 @@ impl SinkFactory for FakeFactory {
 #[derive(Default)]
 struct Opts {
     paced: bool,
+    /// Paced at this multiple of real time (overrides `paced`).
+    speed: Option<f64>,
     lose_first_after: Option<usize>,
     later_rate: Option<u32>,
     cfg: PlayerConfig,
@@ -142,7 +146,7 @@ impl Harness {
         let factory = FakeFactory {
             out: out.clone(),
             opened: opened.clone(),
-            paced: opts.paced,
+            speed: opts.speed.or(opts.paced.then_some(1.0)),
             lose_first_after: opts.lose_first_after,
             later_rate: opts.later_rate.unwrap_or(RATE),
         };
@@ -162,9 +166,13 @@ impl Harness {
     }
 
     fn play(&self, items: Vec<PlayItem>) {
+        self.play_logged(items, self.calls.clone());
+    }
+
+    fn play_logged(&self, items: Vec<PlayItem>, calls: Arc<Mutex<Vec<Call>>>) {
         let provider = FakeProvider {
             items: items.into(),
-            calls: self.calls.clone(),
+            calls,
         };
         self.player.send(Command::Play(Box::new(provider)));
     }
@@ -199,6 +207,15 @@ impl Harness {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Waits until at least `secs` of audio have been written.
+    fn wait_output_secs(&self, secs: f32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (self.out.lock().unwrap().len() as f32) < secs * 2.0 * RATE as f32 {
+            assert!(Instant::now() < deadline, "output stuck before {secs} s");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn output(&self) -> Vec<f32> {
@@ -430,8 +447,12 @@ fn no_crossfade_means_no_gap() {
     h.play(vec![tone(1, 500), tone(2, 1500)]);
     h.wait("idle", 60, |e| *e == Event::Idle);
     let out = left(&h.output());
-    let secs = out.len() as f32 / RATE as f32;
-    assert!((secs - 40.0).abs() < 0.1, "output is {secs} s");
+    // Exactly two 20 s tracks back to back (within 1 ms).
+    let frames = out.len() as i64;
+    assert!(
+        (frames - 40 * RATE as i64).abs() <= RATE as i64 / 1000,
+        "output is {frames} frames"
+    );
     let first = out.iter().position(|s| s.abs() > 1e-3).unwrap();
     let last = out.iter().rposition(|s| s.abs() > 1e-3).unwrap();
     let (mut run, mut longest) = (0, 0);
@@ -439,7 +460,8 @@ fn no_crossfade_means_no_gap() {
         run = if s.abs() < 1e-3 { run + 1 } else { 0 };
         longest = longest.max(run);
     }
-    assert!(longest <= RATE as usize / 20, "silence of {longest} frames");
+    // A sine passes zero in a sample or two; anything longer is inserted silence.
+    assert!(longest <= 4, "silence of {longest} frames");
     // Both tracks are there, one after the other.
     assert!(amplitude(&out[10 * RATE as usize..11 * RATE as usize], 500) > AMP * 0.8);
     assert!(amplitude(&out[30 * RATE as usize..31 * RATE as usize], 1500) > AMP * 0.8);
@@ -577,4 +599,227 @@ fn normalization_applies_gain() {
     assert!((on - 0.5).abs() <= 0.05, "normalised ratio {on}");
     let off = gain_ratio(false);
     assert!((off - 1.0).abs() <= 0.1, "unnormalised ratio {off}");
+}
+
+/// Serves `stall-after.flac`: the bytes of tone500.flac up to 20 %, then reads never return.
+struct StallAfterSource(LocalSource);
+
+struct StallAfter {
+    data: std::io::Cursor<Vec<u8>>,
+    limit: u64,
+}
+
+impl Read for StallAfter {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let pos = self.data.position();
+        if pos >= self.limit {
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+        let n = buf.len().min((self.limit - pos) as usize);
+        self.data.read(&mut buf[..n])
+    }
+}
+
+impl Seek for StallAfter {
+    fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
+        self.data.seek(p)
+    }
+}
+
+impl MusicSource for StallAfterSource {
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> std::result::Result<(), SourceError> {
+        self.0.walk(on_entry)
+    }
+    fn open(&self, rel_path: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+        if rel_path == "stall-after.flac" {
+            let data = std::fs::read(tests_dir().join("fixtures-audio/tone500.flac")).unwrap();
+            let limit = data.len() as u64 / 5;
+            return Ok(Box::new(StallAfter {
+                data: std::io::Cursor::new(data),
+                limit,
+            }));
+        }
+        self.0.open(rel_path)
+    }
+    fn describe(&self) -> String {
+        "stall-after".into()
+    }
+}
+
+#[test]
+fn next_on_stalled_track_is_immediate() {
+    let cfg = PlayerConfig {
+        prefetch: PrefetchConfig {
+            read_timeout: Duration::from_secs(60),
+            ..Default::default()
+        },
+    };
+    let source: Arc<dyn MusicSource> = Arc::new(StallAfterSource(LocalSource::new(tests_dir())));
+    let mut h = Harness::new(Opts {
+        cfg,
+        source: Some(source),
+        ..Default::default()
+    });
+    let stalling = PlayItem {
+        id: 1,
+        rel_path: "stall-after.flac".into(),
+        gain_db: 0.0,
+    };
+    h.play(vec![stalling, tone(2, 1500)]);
+    h.wait("first track", 5, |e| *e == Event::TrackStarted { id: 1 });
+    // Let the mixer run dry on the stalled source.
+    let mut len = 0;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(20));
+        let now = h.output().len();
+        if now == len && now > 0 {
+            break;
+        }
+        len = now;
+    }
+    h.player.send(Command::Next);
+    h.wait("next track", 3, |e| *e == Event::TrackStarted { id: 2 });
+}
+
+#[test]
+fn play_during_crossfade_reports_to_old_provider() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    // A 1 s first track is crossfaded into the second over its whole length.
+    let short = PlayItem {
+        id: 1,
+        rel_path: "fixtures-audio/mono.flac".into(),
+        gain_db: 0.0,
+    };
+    h.play(vec![short, tone(2, 500)]);
+    h.wait("crossfade", 5, |e| *e == Event::TrackStarted { id: 2 });
+    let new_calls = Arc::new(Mutex::new(Vec::new()));
+    h.play_logged(vec![tone(3, 1500)], new_calls.clone());
+    h.wait("new selection", 5, |e| *e == Event::TrackStarted { id: 3 });
+    h.player.send(Command::Stop);
+    h.wait("stop", 5, |e| *e == Event::Idle);
+    assert_eq!(h.calls(), [Call::Played(1, None)]);
+    assert!(
+        new_calls.lock().unwrap().is_empty(),
+        "{:?}",
+        new_calls.lock().unwrap()
+    );
+}
+
+#[test]
+fn queued_skips_fade_in_skipped_tracks() {
+    let mut h = Harness::new(Opts::default());
+    h.play(vec![tone(1, 500), tone(2, 1500), tone(3, 2500)]);
+    // Both presses arrive before anything has loaded.
+    h.player.send(Command::Next);
+    h.player.send(Command::Next);
+    h.wait("third track", 10, |e| *e == Event::TrackStarted { id: 3 });
+    h.player.send(Command::Stop);
+    h.wait("stop", 5, |e| *e == Event::Idle);
+    assert_eq!(h.started(), [1, 2, 3]);
+    let out = left(&h.output());
+    let spectrum = spectrum(&out, 240);
+    for (k, f) in [(0, 500), (1, 1500)] {
+        let first = spectrum
+            .iter()
+            .position(|a| a[k] > AMP * 0.01)
+            .expect("track audible");
+        // Skipped tracks fade in and out (peak gain 0.5) instead of starting at full level.
+        assert!(
+            spectrum[first][k] < AMP * 0.2,
+            "{f} Hz starts at {}",
+            spectrum[first][k]
+        );
+        let peak = spectrum.iter().map(|a| a[k]).fold(0.0, f32::max);
+        assert!(peak < AMP * 0.6, "{f} Hz peaks at {peak}");
+    }
+}
+
+#[test]
+fn pause_and_resume_fade() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    h.play(vec![tone(1, 500)]);
+    h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    std::thread::sleep(Duration::from_millis(200));
+    h.player.send(Command::Pause);
+    h.wait("paused", 5, |e| *e == Event::Paused(true));
+    let paused_at = left(&h.output()).len();
+    h.player.send(Command::Resume);
+    h.wait("resumed", 5, |e| *e == Event::Paused(false));
+    std::thread::sleep(Duration::from_millis(300));
+    h.player.send(Command::Stop);
+    h.wait("stop", 5, |e| *e == Event::Idle);
+    let out = left(&h.output());
+    let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let period = (RATE / 500) as usize;
+    // Full level 20 ms before the pause point, near silence in its last period, and the
+    // resumed audio starts near silence too.
+    let ramp = RATE as usize / 50;
+    assert!(peak(&out[paused_at - ramp - 2 * period..paused_at - ramp]) > AMP * 0.9);
+    assert!(
+        peak(&out[paused_at - period..paused_at]) < AMP * 0.15,
+        "no fade-out"
+    );
+    assert!(
+        peak(&out[paused_at..paused_at + period]) < AMP * 0.15,
+        "no fade-in"
+    );
+    assert!(peak(&out[paused_at + ramp + period..paused_at + ramp + 3 * period]) > AMP * 0.9);
+}
+
+#[test]
+fn volume_changes_are_ramped() {
+    let mut h = Harness::new(Opts::default());
+    h.player.send(Command::SetVolume(0.5));
+    h.play(vec![tone(1, 500)]);
+    h.wait("idle", 30, |e| *e == Event::Idle);
+    let out = left(&h.output());
+    let r = RATE as usize;
+    let ratio = rms(&out[r..2 * r]) / (AMP / 2f32.sqrt());
+    assert!((ratio - 0.5).abs() < 0.03, "volume 0.5 gave {ratio}");
+
+    let mut h = Harness::new(Opts::default());
+    h.player.send(Command::SetVolume(0.0));
+    h.play(vec![tone(1, 500)]);
+    h.wait("idle", 30, |e| *e == Event::Idle);
+    let out = left(&h.output());
+    let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    // From 1.0 to 0.0 over 20 ms (960 frames): about 0.75..0.5 in frames 240..480.
+    let early = peak(&out[240..480]);
+    assert!(early > AMP * 0.4 && early < AMP * 0.8, "ramp level {early}");
+    assert!(peak(&out[1000..r]) < 1e-4, "not silent after the ramp");
+}
+
+#[test]
+fn next_with_ready_track_crossfades_for_0_7_s() {
+    let mut h = Harness::new(Opts {
+        speed: Some(5.0),
+        ..Default::default()
+    });
+    h.play(vec![tone(1, 500), tone(2, 1500)]);
+    h.wait("first track", 5, |e| *e == Event::TrackStarted { id: 1 });
+    // 7 s into the track the next one has been preloaded (from 5 s).
+    h.wait_output_secs(7.0);
+    h.player.send(Command::Next);
+    h.wait("second track", 5, |e| *e == Event::TrackStarted { id: 2 });
+    h.wait_output_secs(9.0);
+    h.player.send(Command::Stop);
+    h.wait("stop", 5, |e| *e == Event::Idle);
+    let window = 480;
+    let both = spectrum(&left(&h.output()), window)
+        .iter()
+        .filter(|a| a[0] > AMP * 0.02 && a[1] > AMP * 0.02)
+        .count();
+    let secs = both as f32 * window as f32 / RATE as f32;
+    assert!(
+        (secs - 0.7).abs() <= 0.05,
+        "both tones present for {secs} s"
+    );
 }
