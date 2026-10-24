@@ -7,3 +7,4 @@ edition = "2021"
 lofty = "0.25.4"
 rand = "0.8"
 thiserror = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
