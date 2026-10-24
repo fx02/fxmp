@@ -1,12 +1,16 @@
 pub mod shuffle;
 pub mod genre;
 pub mod catalog;
+pub mod source;
+pub mod tags;
 
 /// Identifier of a track in the catalog.
 pub type TrackId = i64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("source error: {0}")]
+    Source(#[from] source::SourceError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
