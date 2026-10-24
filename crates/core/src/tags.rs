@@ -8,6 +8,19 @@ use lofty::tag::{Accessor, ItemKey};
 
 use crate::{Error, Result};
 
+/// An I/O failure underneath the parser stays `Error::Io` (so callers can tell a
+/// network hiccup from a broken file); anything else is `Error::Decode`.
+fn parse_error(e: &(dyn std::error::Error + 'static)) -> Error {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return Error::Io(std::io::Error::new(io.kind(), io.to_string()));
+        }
+        cur = err.source();
+    }
+    Error::Decode(e.to_string())
+}
+
 /// Reads tags and duration from a stream. `ext` (without dot, any case) selects
 /// the format; when unknown, the format is guessed from the content.
 pub fn read_meta(reader: &mut dyn ReadSeek, ext: &str) -> Result<TrackMeta> {
@@ -16,7 +29,7 @@ pub fn read_meta(reader: &mut dyn ReadSeek, ext: &str) -> Result<TrackMeta> {
         Some(ft) => probe.set_file_type(ft),
         None => probe.guess_file_type().map_err(Error::Io)?,
     };
-    let file = probe.read().map_err(|e| Error::Decode(e.to_string()))?;
+    let file = probe.read().map_err(|e| parse_error(&e))?;
 
     let mut meta = TrackMeta {
         duration_ms: Some(file.properties().duration().as_millis() as u64),

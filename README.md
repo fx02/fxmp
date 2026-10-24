@@ -36,10 +36,13 @@ Usput pronađena dva problema u crateu i kako su riješena:
 Ostalo:
 - Čitanje ide u komadima od 256 KiB (read-ahead buffer po otvorenoj datoteci),
   nikad se ne skida cijela datoteka.
-- Svaka mrežna operacija ima timeout 10 s (`SourceError::Timeout`); prekinuta
-  veza se jednom ponovno uspostavi, a tek onda se vraća greška.
-- Nečitljive podmape se preskaču (log), greška je samo ako se ne može
-  izlistati korijen.
+- Svaka mrežna operacija ima timeout 10 s (`SourceError::Timeout`). Nakon
+  prekinute veze ili timeouta veza se jednom ponovno uspostavi (npr. poluotvorena
+  veza nakon spavanja), a tek onda se vraća greška.
+- Podmapa koja se ne može izlistati zbog vlastitog razloga (pristup odbijen,
+  nestala, I/O greška) se preskače uz log. Prekid veze ili timeout prekida cijeli
+  obilazak greškom, inače bi skener obrisao pjesme iz neobiđenih mapa. Greška je
+  i kad se ne može izlistati korijen.
 
 Live testovi (samo čitanje, ništa se ne piše na servere):
 

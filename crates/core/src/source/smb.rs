@@ -160,7 +160,7 @@ impl SmbSource {
     ) -> Result<Vec<FileEntry>, SourceError> {
         let mut out = Vec::new();
         if max > 0 {
-            self.walk_dir("", &mut |e| {
+            self.walk_dir(&mut |e| {
                 if keep(&e) {
                     out.push(e);
                 }
@@ -170,77 +170,107 @@ impl SmbSource {
         Ok(out)
     }
 
-    /// Recurses into `rel`; `on_entry` returns `false` to stop the walk.
-    /// Returns `Ok(false)` once stopped. Only a failure to list the root is an error.
-    fn walk_dir(
-        &self,
-        rel: &str,
-        on_entry: &mut dyn FnMut(FileEntry) -> bool,
-    ) -> Result<bool, SourceError> {
-        let items = match self.list_dir(rel) {
-            Ok(items) => items,
-            Err(e) if rel.is_empty() => return Err(e),
-            Err(e) => {
-                log::warn!("SMB: skipping unreadable folder '{rel}': {e}");
-                return Ok(true);
-            }
-        };
-        for item in items {
-            let name = item.file_name.to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            let rel_path = if rel.is_empty() {
-                name
-            } else {
-                format!("{rel}/{name}")
-            };
-            if item.file_attributes.directory() {
-                if !self.walk_dir(&rel_path, on_entry)? {
-                    return Ok(false);
-                }
-            } else if is_supported(&rel_path) {
-                let mtime = item
-                    .last_write_time
-                    .since_epoch()
-                    .as_secs()
-                    .saturating_sub(FILETIME_TO_UNIX_SECS) as i64;
-                let entry = FileEntry {
-                    rel_path,
-                    size: item.end_of_file,
-                    mtime,
-                };
-                if !on_entry(entry) {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
+    fn walk_dir(&self, on_entry: &mut dyn FnMut(FileEntry) -> bool) -> Result<bool, SourceError> {
+        walk_tree(&mut |rel| self.list_dir(rel), "", on_entry)
     }
 
-    fn list_dir(&self, rel: &str) -> Result<Vec<FileFullDirectoryInformation>, SourceError> {
+    fn list_dir(&self, rel: &str) -> Result<Vec<DirItem>, SourceError> {
         let path = self.shared.unc(rel);
         let access = DirAccessMask::new()
             .with_list_directory(true)
             .with_synchronize(true);
         let args = FileCreateArgs::make_open_existing(access.into());
         let (path, args) = (&path, &args);
-        self.shared.with_retry(|conn| async move {
-            let dir = match conn.client().create_file(path, args).await? {
-                Resource::Directory(dir) => Arc::new(dir),
-                other => {
-                    close_resource(other).await;
-                    return Err(smb::Error::NotFound(format!("{rel} is not a folder")));
-                }
-            };
-            let items = match Directory::query::<FileFullDirectoryInformation>(&dir, "*").await {
-                Ok(stream) => stream.collect::<Vec<_>>().await.into_iter().collect(),
-                Err(e) => Err(e),
-            };
-            dir.close().await.ok();
-            items
-        })
+        self.shared
+            .with_retry(|conn| async move {
+                let dir = match conn.client().create_file(path, args).await? {
+                    Resource::Directory(dir) => Arc::new(dir),
+                    other => {
+                        close_resource(other).await;
+                        return Err(smb::Error::NotFound(format!("{rel} is not a folder")));
+                    }
+                };
+                let items: smb::Result<Vec<FileFullDirectoryInformation>> =
+                    match Directory::query::<FileFullDirectoryInformation>(&dir, "*").await {
+                        Ok(stream) => stream.collect::<Vec<_>>().await.into_iter().collect(),
+                        Err(e) => Err(e),
+                    };
+                dir.close().await.ok();
+                items
+            })
+            .map(|(_, items)| items.into_iter().map(DirItem::from).collect())
     }
+}
+
+/// One folder entry, as the walk needs it.
+#[derive(Debug, Clone)]
+struct DirItem {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    mtime: i64,
+}
+
+impl From<FileFullDirectoryInformation> for DirItem {
+    fn from(i: FileFullDirectoryInformation) -> Self {
+        Self {
+            name: i.file_name.to_string(),
+            is_dir: i.file_attributes.directory(),
+            size: i.end_of_file,
+            mtime: i
+                .last_write_time
+                .since_epoch()
+                .as_secs()
+                .saturating_sub(FILETIME_TO_UNIX_SECS) as i64,
+        }
+    }
+}
+
+/// Recurses into `rel` using `list`; `on_entry` returns `false` to stop the walk.
+/// Returns `Ok(false)` once stopped. A subfolder that fails for its own reasons
+/// (access denied, vanished, odd I/O) is logged and skipped. A failure on the
+/// root, or a lost/timed-out connection anywhere, aborts the walk: reporting a
+/// partial tree as complete would make the scanner delete the missing tracks.
+fn walk_tree(
+    list: &mut dyn FnMut(&str) -> Result<Vec<DirItem>, SourceError>,
+    rel: &str,
+    on_entry: &mut dyn FnMut(FileEntry) -> bool,
+) -> Result<bool, SourceError> {
+    let items = match list(rel) {
+        Ok(items) => items,
+        Err(e @ (SourceError::Auth | SourceError::NotFound | SourceError::Io(_)))
+            if !rel.is_empty() =>
+        {
+            log::warn!("SMB: skipping unreadable folder '{rel}': {e}");
+            return Ok(true);
+        }
+        Err(e) => return Err(e),
+    };
+    for item in items {
+        if item.name.starts_with('.') {
+            continue;
+        }
+        let rel_path = if rel.is_empty() {
+            item.name
+        } else {
+            format!("{rel}/{}", item.name)
+        };
+        if item.is_dir {
+            if !walk_tree(list, &rel_path, on_entry)? {
+                return Ok(false);
+            }
+        } else if is_supported(&rel_path) {
+            let entry = FileEntry {
+                rel_path,
+                size: item.size,
+                mtime: item.mtime,
+            };
+            if !on_entry(entry) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 impl Shared {
@@ -270,20 +300,23 @@ impl Shared {
         Ok((s.generation, s.conn.clone()))
     }
 
-    /// Runs `op` on the shared connection; if the connection was lost,
-    /// reconnects once and retries.
-    fn with_retry<T, F, Fut>(&self, op: F) -> Result<T, SourceError>
+    /// Runs `op` on the shared connection; if the connection was lost or timed
+    /// out (e.g. half-open after sleep), reconnects once and retries.
+    /// Returns the generation of the connection that produced the result.
+    fn with_retry<T, F, Fut>(&self, op: F) -> Result<(u64, T), SourceError>
     where
         F: Fn(Arc<Conn>) -> Fut,
         Fut: Future<Output = smb::Result<T>>,
     {
         let (generation, conn) = self.current();
         match block_on(op(conn)).map_err(|e| map_err(&e)) {
-            Err(SourceError::Unreachable) => {
-                let (_, conn) = self.reconnect(generation)?;
-                block_on(op(conn)).map_err(|e| map_err(&e))
+            Ok(v) => Ok((generation, v)),
+            Err(e) if needs_reconnect(&e) => {
+                let (generation, conn) = self.reconnect(generation)?;
+                let v = block_on(op(conn)).map_err(|e| map_err(&e))?;
+                Ok((generation, v))
             }
-            other => other,
+            Err(e) => Err(e),
         }
     }
 
@@ -293,7 +326,7 @@ impl Shared {
         let args =
             FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
         let (path, args) = (&path, &args);
-        let (file, size) = self.with_retry(|conn| async move {
+        let (generation, (file, size)) = self.with_retry(|conn| async move {
             match conn.client().create_file(path, args).await? {
                 Resource::File(f) => match f.get_len().await {
                     Ok(size) => Ok((f, size)),
@@ -308,7 +341,7 @@ impl Shared {
                 }
             }
         })?;
-        Ok((self.current().0, file, size))
+        Ok((generation, file, size))
     }
 }
 
@@ -348,6 +381,11 @@ async fn close_resource(r: Resource) {
         Resource::Directory(d) => d.close().await,
         Resource::Pipe(p) => p.close().await,
     };
+}
+
+/// Errors after which the connection is suspect and worth one reconnect.
+fn needs_reconnect(e: &SourceError) -> bool {
+    matches!(e, SourceError::Unreachable | SourceError::Timeout)
 }
 
 fn status_of(e: &smb::Error) -> Option<u32> {
@@ -450,7 +488,7 @@ impl SmbReader {
         self.buf.resize(want, 0);
         self.buf_start = pos;
         let result = match self.read_chunk(pos) {
-            Err(SourceError::Unreachable) => self.reopen().and_then(|()| self.read_chunk(pos)),
+            Err(e) if needs_reconnect(&e) => self.reopen().and_then(|()| self.read_chunk(pos)),
             other => other,
         };
         match result {
@@ -557,7 +595,7 @@ impl Drop for SmbReader {
 
 impl MusicSource for SmbSource {
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
-        self.walk_dir("", &mut |e| {
+        self.walk_dir(&mut |e| {
             on_entry(e);
             true
         })
@@ -673,6 +711,71 @@ mod tests {
             map_err(&status(Status::U32_SHARING_VIOLATION)),
             SourceError::Io(_)
         ));
+    }
+
+    /// Lists a fake tree: root has `ok/` (one song), `bad/` (fails with
+    /// `bad_err`) and `z.mp3`.
+    fn fake_list(bad_err: SourceError) -> impl FnMut(&str) -> Result<Vec<DirItem>, SourceError> {
+        let item = |name: &str, is_dir| DirItem {
+            name: name.into(),
+            is_dir,
+            size: 1,
+            mtime: 1,
+        };
+        move |rel: &str| match rel {
+            "" => Ok(vec![
+                item("ok", true),
+                item("bad", true),
+                item("z.mp3", false),
+            ]),
+            "ok" => Ok(vec![item("a.mp3", false), item(".hidden.mp3", false)]),
+            "bad" => Err(bad_err.clone()),
+            other => panic!("unexpected folder {other}"),
+        }
+    }
+
+    fn walk_fake(bad_err: SourceError) -> (Result<bool, SourceError>, Vec<String>) {
+        let mut seen = Vec::new();
+        let res = walk_tree(&mut fake_list(bad_err), "", &mut |e| {
+            seen.push(e.rel_path);
+            true
+        });
+        (res, seen)
+    }
+
+    #[test]
+    fn walk_skips_folder_specific_errors() {
+        for err in [
+            SourceError::Auth,
+            SourceError::NotFound,
+            SourceError::Io("x".into()),
+        ] {
+            let (res, seen) = walk_fake(err.clone());
+            assert_eq!(res, Ok(true), "{err:?}");
+            assert_eq!(seen, ["ok/a.mp3", "z.mp3"], "{err:?}");
+        }
+    }
+
+    #[test]
+    fn walk_aborts_on_connection_errors() {
+        for err in [SourceError::Unreachable, SourceError::Timeout] {
+            let (res, _) = walk_fake(err.clone());
+            assert_eq!(res, Err(err));
+        }
+    }
+
+    #[test]
+    fn walk_fails_when_root_unreadable() {
+        let res = walk_tree(&mut |_| Err(SourceError::NotFound), "", &mut |_| true);
+        assert_eq!(res, Err(SourceError::NotFound));
+    }
+
+    #[test]
+    fn retry_policy_covers_timeouts() {
+        assert!(needs_reconnect(&SourceError::Unreachable));
+        assert!(needs_reconnect(&SourceError::Timeout));
+        assert!(!needs_reconnect(&SourceError::NotFound));
+        assert!(!needs_reconnect(&SourceError::Auth));
     }
 
     #[test]

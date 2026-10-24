@@ -1,8 +1,11 @@
 # Local patch
 
-Unmodified `smb-transport` 0.12.1 from crates.io (MIT, see LICENSE in the
-upstream repo https://github.com/afiffon/smb-rs) except for one change in
-`src/tcp/transport.rs` (`do_connect`): `socket.set_nodelay(true)`.
+Unmodified `smb-transport` 0.12.1 from crates.io (MIT; the crate package has
+no licence file, so `LICENSE` here is copied from `LICENSE.md` in the upstream
+repo https://github.com/afiffon/smb-rs) except for:
+
+- `src/tcp/transport.rs` (`do_connect`): `socket.set_nodelay(true)` plus a comment;
+- packaging leftovers removed: `Cargo.toml.orig`, `.cargo_vcs_info.json`, `Cargo.lock`.
 
 Why: the transport writes each request as several small writes (4-byte header,
 then the body). With Nagle's algorithm on, the second write waits for the

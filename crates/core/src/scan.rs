@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::catalog::{Catalog, TrackMeta};
 use crate::source::{FileEntry, MusicSource, SourceError};
 use crate::tags::read_meta;
-use crate::Result;
+use crate::{Error, Result};
 
 /// Files committed per catalog transaction.
 const CHUNK: usize = 500;
@@ -39,17 +39,27 @@ struct Reporter<'a> {
 
 impl Reporter<'_> {
     fn tick(&mut self) {
-        if self.last.map_or(true, |t| t.elapsed() >= PROGRESS_INTERVAL) {
+        if self.last.is_none_or(|t| t.elapsed() >= PROGRESS_INTERVAL) {
             self.last = Some(Instant::now());
             (self.cb)(&self.state);
         }
     }
 }
 
+/// I/O error kinds that mean the connection failed, not the file
+/// (what `SmbReader` reports for timeouts and lost connections).
+fn is_network_io(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        TimedOut | NotConnected | ConnectionReset | ConnectionAborted | BrokenPipe
+    )
+}
+
 /// Syncs `catalog` with `source`: unchanged files are only marked seen, new or
 /// modified ones are tagged and upserted, vanished ones are removed. A file whose
 /// tags cannot be read stays in the catalog with empty metadata and counts as failed;
-/// if it could not even be opened because of a network problem, it is stored with
+/// if opening or reading it failed because of a network problem, it is stored with
 /// size/mtime 0 so the next scan retries it.
 /// On cancel the walk stops and nothing is removed (`finish_scan` is skipped).
 pub fn scan(
@@ -87,7 +97,12 @@ pub fn scan(
                 } else {
                     let ext = e.rel_path.rsplit_once('.').map_or("", |(_, x)| x);
                     let (meta, size, mtime) = match source.open(&e.rel_path) {
-                        Ok(mut r) => (read_meta(&mut *r, ext).ok(), e.size, e.mtime),
+                        Ok(mut r) => match read_meta(&mut *r, ext) {
+                            Ok(meta) => (Some(meta), e.size, e.mtime),
+                            // Connection trouble while reading: retry next scan.
+                            Err(Error::Io(io)) if is_network_io(&io) => (None, 0, 0),
+                            Err(_) => (None, e.size, e.mtime),
+                        },
                         // Network trouble: store size/mtime 0 so the next scan retries it.
                         Err(
                             SourceError::Unreachable | SourceError::Timeout | SourceError::Io(_),
@@ -211,8 +226,32 @@ mod tests {
         assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 4);
     }
 
-    /// Source whose files fail to open with a per-file error (or decode as garbage).
-    struct FlakySource(Vec<(FileEntry, Option<SourceError>)>);
+    /// How a [`FlakySource`] file behaves.
+    #[derive(Clone)]
+    enum Behaviour {
+        OpenFails(SourceError),
+        /// Opens, but every read fails with this kind (as SmbReader's `to_io` produces).
+        ReadFails(std::io::ErrorKind),
+        Garbage,
+    }
+
+    /// Reader whose reads always fail.
+    struct FailingReader(std::io::ErrorKind);
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "simulated network failure"))
+        }
+    }
+
+    impl std::io::Seek for FailingReader {
+        fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Source whose files fail in a per-file way.
+    struct FlakySource(Vec<(FileEntry, Behaviour)>);
 
     impl MusicSource for FlakySource {
         fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> std::result::Result<(), SourceError> {
@@ -220,10 +259,11 @@ mod tests {
             Ok(())
         }
         fn open(&self, rel_path: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
-            let (_, err) = self.0.iter().find(|(e, _)| e.rel_path == rel_path).unwrap();
-            match err {
-                Some(err) => Err(err.clone()),
-                None => Ok(Box::new(std::io::Cursor::new(b"not audio".to_vec()))),
+            let (_, b) = self.0.iter().find(|(e, _)| e.rel_path == rel_path).unwrap();
+            match b.clone() {
+                Behaviour::OpenFails(err) => Err(err),
+                Behaviour::ReadFails(kind) => Ok(Box::new(FailingReader(kind))),
+                Behaviour::Garbage => Ok(Box::new(std::io::Cursor::new(b"not audio".to_vec()))),
             }
         }
         fn describe(&self) -> String {
@@ -233,26 +273,35 @@ mod tests {
 
     #[test]
     fn network_failures_are_retried_next_scan() {
+        use std::io::ErrorKind;
         let entry = |name: &str| FileEntry { rel_path: name.into(), size: 1000, mtime: 1_700_000_000 };
-        let src = FlakySource(vec![
-            (entry("timeout.mp3"), Some(SourceError::Timeout)),
-            (entry("unreachable.mp3"), Some(SourceError::Unreachable)),
-            (entry("io.mp3"), Some(SourceError::Io("reset".into()))),
-            (entry("missing.mp3"), Some(SourceError::NotFound)),
-            (entry("garbage.mp3"), None),
-        ]);
+        let retried = [
+            ("timeout.mp3", Behaviour::OpenFails(SourceError::Timeout)),
+            ("unreachable.mp3", Behaviour::OpenFails(SourceError::Unreachable)),
+            ("io.mp3", Behaviour::OpenFails(SourceError::Io("reset".into()))),
+            ("read-timeout.mp3", Behaviour::ReadFails(ErrorKind::TimedOut)),
+            ("read-dropped.flac", Behaviour::ReadFails(ErrorKind::NotConnected)),
+            ("read-reset.ogg", Behaviour::ReadFails(ErrorKind::ConnectionReset)),
+        ];
+        let kept = [
+            ("missing.mp3", Behaviour::OpenFails(SourceError::NotFound)),
+            ("garbage.mp3", Behaviour::Garbage),
+        ];
+        let src = FlakySource(
+            retried.iter().chain(&kept).map(|(n, b)| (entry(n), b.clone())).collect(),
+        );
         let mut cat = Catalog::open_in_memory().unwrap();
         let no = AtomicBool::new(false);
         let first = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
-        assert_eq!((first.read, first.failed), (5, 5));
-        for name in ["timeout.mp3", "unreachable.mp3", "io.mp3"] {
+        assert_eq!((first.read, first.failed), (8, 8));
+        for (name, _) in &retried {
             assert!(!cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(), "{name}");
         }
-        for name in ["missing.mp3", "garbage.mp3"] {
+        for (name, _) in &kept {
             assert!(cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(), "{name}");
         }
         let second = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
-        assert_eq!((second.read, second.unchanged), (3, 2));
+        assert_eq!((second.read, second.unchanged), (6, 2));
     }
 
     #[test]
