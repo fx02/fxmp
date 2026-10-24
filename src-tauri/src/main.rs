@@ -1,15 +1,18 @@
 // Prevents an additional console window on Windows in release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod commands;
 mod connection;
 mod credentials;
+mod media;
 mod provider;
 mod settings;
 mod state;
+mod tray;
 mod writer;
 
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 /// Default log filter (`RUST_LOG` overrides it). The `smb` crate is noisy at info,
 /// but its directive also prefix-matches this crate, so ours is named explicitly.
@@ -18,9 +21,41 @@ const LOG_FILTER: &str = "info,smb=warn,smb_music_player=info";
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(LOG_FILTER)).init();
     tauri::Builder::default()
+        // First, so a second launch exits before anything else starts.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !autostart::is_autostart_launch(&args) {
+                tray::show_main_window(app);
+            }
+        }))
+        .plugin(tauri_plugin_notification::init())
+        .plugin(autostart::plugin())
         .setup(|app| {
-            state::AppState::init(app.handle())?;
+            // Menu bar app: no Dock icon.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            let handle = app.handle();
+            state::AppState::init(handle)?;
+            tray::init(handle)?;
+            media::init(handle);
+            let st = handle.state::<state::AppState>();
+            let settings = st.settings.get();
+            if let Err(e) = autostart::apply(handle, settings.autostart) {
+                log::warn!("start at login: {e}");
+            }
+            // The window starts hidden: a start at login stays in the menu bar unless
+            // the server still has to be set up.
+            let configured = !settings.primary.username.trim().is_empty();
+            if !(configured && autostart::is_autostart_launch(std::env::args())) {
+                tray::show_main_window(handle);
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing only hides the window; the music and the tray icon stay.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,

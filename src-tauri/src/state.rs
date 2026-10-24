@@ -7,14 +7,14 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use smp_core::audio::output::CpalSinkFactory;
 use smp_core::audio::player::{Command, Event, Player, PlayerConfig};
 use smp_core::catalog::Catalog;
 use smp_core::scan::{scan_with, ScanOptions, ScanProgress};
 use smp_core::source::{MusicSource, SourceError, Which};
 use smp_core::TrackId;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 
 use crate::connection::{monitor, AppSource, ConnStatus, Servers, StatusPayload};
 use crate::credentials::{CredentialStore, Keychain};
@@ -25,7 +25,7 @@ use crate::writer::CatalogWriter;
 /// How often the UI is told to reload genres while a scan runs.
 const GENRES_REFRESH: Duration = Duration::from_secs(3);
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NowPlaying {
     pub id: TrackId,
     pub artist: String,
@@ -274,8 +274,20 @@ fn now_playing_of(catalog: &Catalog, id: TrackId, paused: bool) -> smp_core::Res
     })
 }
 
+const NOW_PLAYING_EVENT: &str = "now-playing";
+
 fn emit_now_playing(app: &AppHandle, np: &Option<NowPlaying>) {
-    let _ = app.emit("now-playing", np);
+    let _ = app.emit(NOW_PLAYING_EVENT, np);
+}
+
+/// Calls `f` with every `now-playing` update (on the thread that sent it).
+pub fn on_now_playing(app: &AppHandle, f: impl Fn(Option<NowPlaying>) + Send + 'static) {
+    app.listen_any(NOW_PLAYING_EVENT, move |e| {
+        match serde_json::from_str::<Option<NowPlaying>>(e.payload()) {
+            Ok(np) => f(np),
+            Err(err) => log::warn!("bad {NOW_PLAYING_EVENT} payload: {err}"),
+        }
+    });
 }
 
 fn on_player_event(app: &AppHandle, ev: Event) {

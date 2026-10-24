@@ -8,10 +8,12 @@ use smp_core::audio::player::Command;
 use smp_core::TrackId;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::autostart;
 use crate::connection::{status_of, test_server, test_target, ConnStatus, StatusPayload};
 use crate::provider::CatalogProvider;
 use crate::settings::{ServerConfig, Settings};
 use crate::state::{self, apply_player_settings, lock, AppState, NowPlaying, ScanStatus};
+use crate::tray;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -29,6 +31,27 @@ async fn run<T: Send + 'static>(
         })
         .map_err(|e| e.to_string())?;
     rx.await.map_err(|_| "Naredba nije dovršena.".to_string())?
+}
+
+/// Runs `f` on a new thread for callers that do not wait for the result (tray, media
+/// keys); a failure is logged.
+pub fn spawn_action(
+    app: &AppHandle,
+    what: &'static str,
+    f: impl FnOnce(&AppHandle, &AppState) -> CmdResult<()> + Send + 'static,
+) {
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("action".into())
+        .spawn(move || {
+            let st = app.state::<AppState>();
+            if let Err(e) = f(&app, &st) {
+                log::warn!("{what}: {e}");
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("{what}: {e}");
+    }
 }
 
 fn db_err(e: smp_core::Error) -> String {
@@ -65,7 +88,7 @@ pub async fn save_settings(
     primary_password: Option<String>,
     secondary_password: Option<String>,
 ) -> CmdResult<()> {
-    run(app, move |_, st| {
+    run(app, move |app, st| {
         let settings = settings.clamped();
         let store = |server: Option<&crate::settings::ServerConfig>, pw: Option<String>| match (
             server,
@@ -91,7 +114,11 @@ pub async fn save_settings(
             );
         }
         st.reconnect(&saved);
-        Ok(())
+        autostart::apply(app, saved.autostart).map_err(|e| {
+            format!(
+                "Postavke su spremljene, ali automatsko pokretanje nije moguće promijeniti: {e}"
+            )
+        })
     })
     .await
 }
@@ -179,16 +206,19 @@ pub async fn get_genres(app: AppHandle) -> CmdResult<Vec<Genre>> {
 }
 
 /// Shuffles the selected genres (empty = everything) and remembers the selection.
+pub fn play_genres_now(app: &AppHandle, st: &AppState, keys: Vec<String>) -> CmdResult<()> {
+    let provider =
+        CatalogProvider::shuffle(&lock(&st.query), st.playback(), &keys).map_err(db_err)?;
+    st.player.send(Command::Play(Box::new(provider)));
+    st.settings.update(|s| s.last_selection = keys, |_| {});
+    // The tray's genre menu lists the last selection.
+    tray::refresh_genres(app);
+    Ok(())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn play_genres(app: AppHandle, keys: Vec<String>) -> CmdResult<()> {
-    run(app, move |_, st| {
-        let provider =
-            CatalogProvider::shuffle(&lock(&st.query), st.playback(), &keys).map_err(db_err)?;
-        st.player.send(Command::Play(Box::new(provider)));
-        st.settings.update(|s| s.last_selection = keys, |_| {});
-        Ok(())
-    })
-    .await
+    run(app, move |app, st| play_genres_now(app, st, keys)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -283,21 +313,22 @@ pub async fn set_normalize(app: AppHandle, b: bool) -> CmdResult<()> {
 }
 
 /// Bans the playing track for good and skips to the next one.
+pub fn ban_current_now(st: &AppState) -> CmdResult<()> {
+    let id = lock(&st.now_playing)
+        .as_ref()
+        .map(|n| n.id)
+        .ok_or("Ništa ne svira.")?;
+    lock(&st.banned).insert(id);
+    st.writer
+        .call(move |c| c.set_banned(id, true))
+        .map_err(db_err)?;
+    st.player.send(Command::Next);
+    Ok(())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn ban_current(app: AppHandle) -> CmdResult<()> {
-    run(app, |_, st| {
-        let id = lock(&st.now_playing)
-            .as_ref()
-            .map(|n| n.id)
-            .ok_or("Ništa ne svira.")?;
-        lock(&st.banned).insert(id);
-        st.writer
-            .call(move |c| c.set_banned(id, true))
-            .map_err(db_err)?;
-        st.player.send(Command::Next);
-        Ok(())
-    })
-    .await
+    run(app, |_, st| ban_current_now(st)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
