@@ -5,9 +5,13 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   # Keep in sync with rust-toolchain.toml.
   RUST_TOOLCHAIN: "1.99.1"
+  TAURI_CLI_VERSION: "2.12.4"
 
 jobs:
   macos:
@@ -24,10 +28,13 @@ jobs:
         run: cargo test -p smp-core
       - name: App tests
         run: cargo test -p smb-music-player
+      - name: Install tauri CLI
+        run: cargo install tauri-cli --version ${{ env.TAURI_CLI_VERSION }} --locked
       - name: UI tests
         run: node --test ui/*.test.mjs
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@1ddc7b49b13c3038297360482fcb3e058764d7c9 # v0.6.2
         with:
+          tauriScript: cargo tauri
           args: --target universal-apple-darwin
       - uses: actions/upload-artifact@v4
         with:
@@ -45,7 +52,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Core tests (live tests stay ignored)
         run: cargo test -p smp-core
-      - uses: tauri-apps/tauri-action@v0
+      - name: App tests
+        run: cargo test -p smb-music-player
+      - name: Install tauri CLI
+        run: cargo install tauri-cli --version ${{ env.TAURI_CLI_VERSION }} --locked
+      - uses: tauri-apps/tauri-action@1ddc7b49b13c3038297360482fcb3e058764d7c9 # v0.6.2
+        with:
+          tauriScript: cargo tauri
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installers

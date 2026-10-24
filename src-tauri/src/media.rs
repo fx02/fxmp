@@ -4,13 +4,17 @@
 use std::cell::RefCell;
 use std::sync::Mutex;
 
+#[cfg(target_os = "macos")]
 use smp_core::audio::player::Command;
 use smp_core::TrackId;
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
+#[cfg(target_os = "macos")]
+use souvlaki::{MediaControlEvent, PlatformConfig};
+use souvlaki::{MediaControls, MediaMetadata, MediaPlayback};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::state::{self, lock, AppState, NowPlaying};
+#[cfg(target_os = "macos")]
 use crate::tray::show_main_window;
 
 thread_local! {
@@ -61,6 +65,7 @@ fn create_controls(app: &AppHandle) -> Result<MediaControls, String> {
     Ok(controls)
 }
 
+#[cfg(target_os = "macos")]
 fn on_media_event(app: &AppHandle, event: MediaControlEvent) {
     log::debug!("media key: {event:?}");
     let command = match event {
