@@ -50,9 +50,13 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
 
 - **Genres** tab: clicking a genre plays only that genre. Tick several genres and
   use "Play selected (n)". **All** plays the whole library.
-  Only well-known genres are listed (the ID3/Winamp list plus common modern ones,
-  such as Chillout, Drum & Bass or Hip-Hop, with their usual spellings). Tracks
-  with no known genre in the tag or in the top folder name are under **Unknown**.
+  Only the 192 ID3v1 genres are listed, named as in Wikipedia's
+  [List of ID3v1 genres](https://en.wikipedia.org/wiki/List_of_ID3v1_genres)
+  (matched without regard to case or punctuation, with a few aliases such as
+  "DnB" for "Drum & bass"). A few common subgenres go to their parent, e.g.
+  "Deep House" to "House" (see `crates/core/src/genre.rs`). Tracks with no known
+  genre in the tag or in the top folder name, or tagged "Other", are under
+  **Unknown**.
   Right-click (or ⋯) on a genre: "Merge into…" picks another known genre from a
   filterable list.
 - **Artists** tab: search for an artist, click it to list the albums, click an
@@ -60,12 +64,37 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
 - Window controls: ⏯ pause, ⏭ next, 🚫 "never play this track again" (asks for
   confirmation: click again within 3 s), and a volume slider. Banned tracks come
   back with the **Restore** button in Settings.
+- **Settings → Language**: English (default) or Hrvatski; it switches at once,
+  the menu bar menu included.
 - **Settings → Playback**: output device, crossfade on/off and its length
   (1–10 s), and "Normalize volume".
 - Menu bar: **left click on the icon = next track**; right click opens the menu
   (current track, pause, genre, ban, show window, quit).
 - **F8** is pause/resume, **F9** next (Control Center works too).
 - Closing the window does not quit the app; quit from the menu bar menu.
+
+## Translations
+
+All user-facing texts, in the window and from the backend (menu bar menu,
+error and status texts), live in `ui/locales/<code>.json`: flat `"area.name"`
+keys, `{name}` placeholders, and plural texts as an object with one entry per
+plural category of the language (`one`/`other` in English; `one`/`few`/`other`
+in Croatian). English (`en.json`) is the fallback for any missing key. The
+backend compiles the same files in (`src-tauri/src/i18n.rs`) and hands them to
+the window, so each text exists once.
+
+To add a language, e.g. German (`de`):
+
+1. Copy `ui/locales/en.json` to `ui/locales/de.json` and translate every value;
+   set `"language.name"` to the language's own name ("Deutsch").
+2. Add `("de", include_str!("../../ui/locales/de.json"))` to `LOCALES` in
+   `src-tauri/src/i18n.rs`.
+3. Add the language's plural rule to `PLURAL_RULES` and its categories to
+   `PLURAL_CATEGORIES` in `ui/lib.mjs`.
+4. Run `node --test ui/*.test.mjs`: it checks that the new file has exactly the
+   same keys, placeholders and plural categories as `en.json`.
+
+The language then appears in Settings → Language.
 
 ## Known limitations
 
