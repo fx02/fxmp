@@ -90,7 +90,7 @@ fn spawn_deck_thread(
 }
 
 /// The last I/O error a reader returned, shared with whoever classifies a failure.
-type LastIoError = Arc<Mutex<Option<(std::io::ErrorKind, String)>>>;
+type LastIoError = Arc<Mutex<Option<std::io::Error>>>;
 
 /// Remembers the reader's I/O errors: the decoder may hide them (symphonia's probe
 /// reports a read timeout as "no suitable format reader").
@@ -102,7 +102,8 @@ struct TapErrors<R> {
 impl<R> TapErrors<R> {
     fn tap<T>(&self, r: std::io::Result<T>) -> std::io::Result<T> {
         if let Err(e) = &r {
-            *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some((e.kind(), e.to_string()));
+            *self.last.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some(crate::source::clone_io_error(e));
         }
         r
     }
@@ -130,10 +131,8 @@ impl<R: Seek> Seek for TapErrors<R> {
 /// error, so it is classified as a source problem.
 fn source_cause(e: crate::Error, last: &LastIoError) -> crate::Error {
     match (e, last.lock().unwrap_or_else(|p| p.into_inner()).take()) {
-        (crate::Error::Decode(_), Some((kind, msg)))
-            if kind != std::io::ErrorKind::UnexpectedEof =>
-        {
-            crate::Error::Io(std::io::Error::new(kind, msg))
+        (crate::Error::Decode(_), Some(io)) if io.kind() != std::io::ErrorKind::UnexpectedEof => {
+            crate::Error::Io(io)
         }
         (e, _) => e,
     }

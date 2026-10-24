@@ -527,17 +527,52 @@ impl Catalog {
         Ok(())
     }
 
-    /// Delete tracks not seen since `begin_scan`; returns how many were removed.
-    pub fn finish_scan(&self) -> Result<usize> {
-        self.conn.execute(
-            "DELETE FROM track_genres WHERE track_id IN (SELECT id FROM tracks WHERE present=0)",
-            [],
-        )?;
+    /// Delete tracks not seen since `begin_scan`, except those under `keep_under`
+    /// (folders the walk could not list: their files were not seen, not deleted),
+    /// which count as present again. Returns how many were removed.
+    pub fn finish_scan(&self, keep_under: &[String]) -> Result<usize> {
+        self.savepoint(|| {
+            let mut keep = self.conn.prepare_cached(
+                "UPDATE tracks SET present=1
+                 WHERE present=0 AND substr(rel_path, 1, length(?1) + 1) = ?1 || '/'",
+            )?;
+            for dir in keep_under.iter().map(|d| d.trim_matches('/')) {
+                if dir.is_empty() {
+                    // The whole library unseen: sweep nothing.
+                    self.conn.execute("UPDATE tracks SET present=1", [])?;
+                } else {
+                    keep.execute([dir])?;
+                }
+            }
+            self.conn.execute(
+                "DELETE FROM track_genres WHERE track_id IN (SELECT id FROM tracks WHERE present=0)",
+                [],
+            )?;
+            self.conn.execute(
+                "DELETE FROM selection_state
+                 WHERE last_first IN (SELECT id FROM tracks WHERE present=0)",
+                [],
+            )?;
+            Ok(self.conn.execute("DELETE FROM tracks WHERE present=0", [])?)
+        })
+    }
+
+    /// A scan that stopped early (cancelled or failed): every track counts as
+    /// present again, as before `begin_scan`.
+    pub fn abort_scan(&self) -> Result<()> {
         self.conn
-            .execute("DELETE FROM selection_state WHERE last_first IN (SELECT id FROM tracks WHERE present=0)", [])?;
-        Ok(self
-            .conn
-            .execute("DELETE FROM tracks WHERE present=0", [])?)
+            .execute("UPDATE tracks SET present=1 WHERE present=0", [])?;
+        Ok(())
+    }
+
+    /// Tracks marked not present (between `begin_scan` and `finish_scan`).
+    #[cfg(test)]
+    pub(crate) fn absent_count(&self) -> usize {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM tracks WHERE present=0", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap() as usize
     }
 
     /// Recompute `genres` and `track_genres` from `raw_genre`, folder names and rules.
@@ -1049,7 +1084,7 @@ mod tests {
         assert!(!c.playable_tracks(&[]).unwrap().contains(&id));
         c.begin_scan().unwrap();
         c.mark_seen("a.mp3").unwrap();
-        assert_eq!(c.finish_scan().unwrap(), 0);
+        assert_eq!(c.finish_scan(&[]).unwrap(), 0);
         assert!(c.playable_tracks(&[]).unwrap().contains(&id));
     }
 
@@ -1408,7 +1443,7 @@ mod tests {
         for p in ["a.mp3", "b.mp3", "c.mp3", "ok.mp3"] {
             c.mark_seen(p).unwrap();
         }
-        c.finish_scan().unwrap();
+        c.finish_scan(&[]).unwrap();
         assert_eq!(c.unreadable().unwrap().len(), 2);
         assert!(c.playable_tracks(&[]).unwrap().contains(&b));
 
@@ -1840,10 +1875,47 @@ mod tests {
         c.rebuild_genres().unwrap();
         c.begin_scan().unwrap();
         c.mark_seen("b.mp3").unwrap();
-        assert_eq!(c.finish_scan().unwrap(), 1);
+        assert_eq!(c.finish_scan(&[]).unwrap(), 1);
         assert!(c.track(a).is_err());
         c.rebuild_genres().unwrap();
         assert_eq!(count_of(&c, "rock"), Some(1));
+    }
+
+    #[test]
+    fn finish_scan_keeps_tracks_under_folders_the_walk_skipped() {
+        let c = Catalog::open_in_memory().unwrap();
+        let jazz = add(&c, "Jazz/a.mp3", Some("Jazz"));
+        let deep = add(&c, "Jazz/Live/b.mp3", Some("Jazz"));
+        let jazzy = add(&c, "Jazzy/c.mp3", Some("Jazz"));
+        let gone = add(&c, "Rock/d.mp3", Some("Rock"));
+        let seen = add(&c, "Rock/e.mp3", Some("Rock"));
+        c.set_banned(jazz, true).unwrap();
+        c.set_measured_lufs(deep, -9.0).unwrap();
+        c.set_last_first("jazz", deep).unwrap();
+        c.begin_scan().unwrap();
+        assert_eq!(c.absent_count(), 5);
+        c.mark_seen("Rock/e.mp3").unwrap();
+        assert_eq!(c.finish_scan(&["Jazz".to_string()]).unwrap(), 2);
+        assert!(c.track(gone).is_err(), "not seen elsewhere: swept");
+        assert!(c.track(jazzy).is_err(), "Jazzy is not under Jazz");
+        assert!(c.track(seen).is_ok());
+        assert_eq!(c.banned().unwrap()[0].id, jazz, "ban kept");
+        assert_eq!(c.track(deep).unwrap().measured_lufs, Some(-9.0));
+        assert_eq!(c.last_first("jazz").unwrap(), Some(deep));
+        assert_eq!(c.absent_count(), 0, "kept rows are present again");
+    }
+
+    #[test]
+    fn abort_scan_makes_every_track_present_again() {
+        let c = Catalog::open_in_memory().unwrap();
+        add(&c, "a.mp3", None);
+        add(&c, "b.mp3", None);
+        c.begin_scan().unwrap();
+        c.mark_seen("a.mp3").unwrap();
+        assert_eq!(c.absent_count(), 1);
+        c.abort_scan().unwrap();
+        assert_eq!(c.absent_count(), 0);
+        assert_eq!(c.finish_scan(&[]).unwrap(), 0, "nothing to sweep");
     }
 
     #[test]

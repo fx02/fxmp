@@ -29,6 +29,8 @@ pub struct ScanProgress {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanReport {
     pub total: usize,
+    /// Folders that could not be listed; their tracks were kept as they were.
+    pub skipped_dirs: Vec<String>,
     pub read: usize,
     pub unchanged: usize,
     pub failed: usize,
@@ -98,19 +100,51 @@ pub fn scan_with(
     cancel: &AtomicBool,
     opts: &ScanOptions,
 ) -> Result<ScanReport> {
-    catalog.begin_scan()?;
-
+    // Walk first: tracks are only marked unseen once the listing has succeeded.
     let mut entries: Vec<FileEntry> = Vec::new();
-    source.walk(&mut |e| {
+    let walk = source.walk(&mut |e| {
         if !cancel.load(Ordering::Relaxed) {
             entries.push(e);
         }
     })?;
-
-    let mut report = ScanReport {
+    if !walk.skipped_dirs.is_empty() {
+        log::warn!(
+            "scan: {} folder(s) could not be listed; their tracks are kept: {:?}",
+            walk.skipped_dirs.len(),
+            walk.skipped_dirs
+        );
+    }
+    let report = ScanReport {
         total: entries.len(),
+        skipped_dirs: walk.skipped_dirs,
         ..Default::default()
     };
+    if cancel.load(Ordering::Relaxed) {
+        progress(&ScanProgress::default());
+        return Ok(report);
+    }
+    catalog.begin_scan()?;
+    let result = sync_catalog(source, catalog, &entries, report, progress, cancel, opts);
+    // Stopped early: nothing may stay marked unseen.
+    if result.is_err() || cancel.load(Ordering::Relaxed) {
+        if let Err(e) = catalog.abort_scan() {
+            log::warn!("scan: cannot restore the tracks after stopping: {e}");
+        }
+    }
+    result
+}
+
+/// The part of [`scan_with`] after the walk: marks, tags and upserts `entries`,
+/// then sweeps what was not seen (unless cancelled).
+fn sync_catalog(
+    source: &dyn MusicSource,
+    catalog: &mut Catalog,
+    entries: &[FileEntry],
+    mut report: ScanReport,
+    progress: &mut dyn FnMut(&ScanProgress),
+    cancel: &AtomicBool,
+    opts: &ScanOptions,
+) -> Result<ScanReport> {
     let mut rep = Reporter {
         cb: progress,
         state: ScanProgress::default(),
@@ -163,7 +197,7 @@ pub fn scan_with(
         (rep.cb)(&rep.state);
         return Ok(report);
     }
-    report.removed = catalog.finish_scan()?;
+    report.removed = catalog.finish_scan(&report.skipped_dirs)?;
     catalog.rebuild_genres()?;
     (rep.cb)(&rep.state);
     Ok(report)
@@ -282,7 +316,7 @@ fn read_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{LocalSource, ReadSeek, SourceError};
+    use crate::source::{LocalSource, ReadSeek, SourceError, WalkReport};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicI64;
@@ -439,9 +473,9 @@ mod tests {
         fn walk(
             &self,
             on_entry: &mut dyn FnMut(FileEntry),
-        ) -> std::result::Result<(), SourceError> {
+        ) -> std::result::Result<WalkReport, SourceError> {
             self.0.iter().for_each(|(e, _)| on_entry(e.clone()));
-            Ok(())
+            Ok(WalkReport::default())
         }
         fn open(&self, rel_path: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
             let (_, b) = self.0.iter().find(|(e, _)| e.rel_path == rel_path).unwrap();
@@ -776,7 +810,7 @@ mod tests {
         fn walk(
             &self,
             on_entry: &mut dyn FnMut(FileEntry),
-        ) -> std::result::Result<(), SourceError> {
+        ) -> std::result::Result<WalkReport, SourceError> {
             let n = self.visible.load(Ordering::SeqCst).min(self.files);
             for i in 0..n {
                 on_entry(FileEntry {
@@ -785,7 +819,7 @@ mod tests {
                     mtime: self.mtime.load(Ordering::SeqCst),
                 });
             }
-            Ok(())
+            Ok(WalkReport::default())
         }
         fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -859,7 +893,7 @@ mod tests {
         fn walk(
             &self,
             on_entry: &mut dyn FnMut(FileEntry),
-        ) -> std::result::Result<(), SourceError> {
+        ) -> std::result::Result<WalkReport, SourceError> {
             for i in 0..self.files {
                 on_entry(FileEntry {
                     rel_path: format!("Rock/f{i}.mp3"),
@@ -867,7 +901,7 @@ mod tests {
                     mtime: 1_700_000_000,
                 });
             }
-            Ok(())
+            Ok(WalkReport::default())
         }
         fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
             if self.opens.fetch_add(1, Ordering::SeqCst) + 1 == self.cancel_after {
@@ -932,7 +966,7 @@ mod tests {
         fn walk(
             &self,
             on_entry: &mut dyn FnMut(FileEntry),
-        ) -> std::result::Result<(), SourceError> {
+        ) -> std::result::Result<WalkReport, SourceError> {
             for i in 0..self.files {
                 on_entry(FileEntry {
                     rel_path: format!("Rock/f{i}.mp3"),
@@ -940,7 +974,7 @@ mod tests {
                     mtime: 1_700_000_000,
                 });
             }
-            Ok(())
+            Ok(WalkReport::default())
         }
         fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
             if self.opens.fetch_add(1, Ordering::SeqCst) + 1 == self.probe_at {
@@ -1029,6 +1063,89 @@ mod tests {
         assert!(r.read < 30, "{r:?}");
         assert_eq!(r.removed, 0);
         assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 40);
+    }
+
+    /// Music folder with `Rock/` and `Jazz/` (two copies of tone.mp3 each).
+    fn two_folders() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["Rock", "Jazz"] {
+            fs::create_dir(dir.path().join(d)).unwrap();
+            for f in ["1.mp3", "2.mp3"] {
+                fs::copy(fixtures().join("tone.mp3"), dir.path().join(d).join(f)).unwrap();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn an_unreadable_folder_keeps_its_tracks_bans_and_loudness() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = two_folders();
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let no = AtomicBool::new(false);
+        run(dir.path(), &mut cat, &no);
+        let by_path = |cat: &Catalog, p: &str| {
+            cat.playable_tracks(&[])
+                .unwrap()
+                .into_iter()
+                .chain(cat.banned().unwrap().into_iter().map(|t| t.id))
+                .find(|&id| cat.track(id).unwrap().rel_path == p)
+        };
+        let j1 = by_path(&cat, "Jazz/1.mp3").unwrap();
+        let j2 = by_path(&cat, "Jazz/2.mp3").unwrap();
+        cat.set_banned(j1, true).unwrap();
+        cat.set_measured_lufs(j2, -14.0).unwrap();
+        fs::remove_file(dir.path().join("Rock/2.mp3")).unwrap();
+        let jazz = dir.path().join("Jazz");
+        fs::set_permissions(&jazz, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&jazz).is_ok() {
+            fs::set_permissions(&jazz, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root: cannot make a folder unreadable
+        }
+        let r = run(dir.path(), &mut cat, &no);
+        fs::set_permissions(&jazz, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(r.skipped_dirs, ["Jazz"]);
+        assert_eq!(r.removed, 1, "Rock/2.mp3 is gone; Jazz is not swept");
+        assert_eq!(cat.banned().unwrap()[0].id, j1);
+        assert_eq!(cat.track(j2).unwrap().measured_lufs, Some(-14.0));
+        assert!(by_path(&cat, "Rock/2.mp3").is_none());
+        assert_eq!(cat.absent_count(), 0);
+    }
+
+    #[test]
+    fn a_failed_walk_leaves_no_track_hidden() {
+        let dir = two_folders();
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let no = AtomicBool::new(false);
+        run(dir.path(), &mut cat, &no);
+        let src = LocalSource::new(dir.path().join("no-such-root"));
+        assert!(scan(&src, &mut cat, &mut |_| {}, &no).is_err());
+        assert_eq!(cat.absent_count(), 0);
+        assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_cancelled_scan_leaves_no_track_hidden() {
+        // Cancelled while reading (after the walk): see cancel_mid_scan_keeps_catalog.
+        let src = SlowSource::new(40, Duration::from_millis(30));
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let no = AtomicBool::new(false);
+        scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
+        src.mtime.store(1_800_000_000, Ordering::SeqCst);
+        let cancel = AtomicBool::new(false);
+        scan(
+            &src,
+            &mut cat,
+            &mut |p| {
+                if p.seen > 0 {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            },
+            &cancel,
+        )
+        .unwrap();
+        assert!(cancel.load(Ordering::SeqCst));
+        assert_eq!(cat.absent_count(), 0);
     }
 
     #[test]

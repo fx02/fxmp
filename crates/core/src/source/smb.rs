@@ -23,7 +23,7 @@ use smb::{
 };
 use tokio::runtime::Runtime;
 
-use super::{is_supported, FileEntry, MusicSource, ReadSeek, SourceError};
+use super::{is_supported, FileEntry, MusicSource, ReadSeek, SourceError, WalkReport};
 use crate::SetOnDrop;
 
 /// Timeout for every network operation (connect, open, read a chunk) except listing.
@@ -176,7 +176,7 @@ impl SmbSource {
     ) -> Result<Vec<FileEntry>, SourceError> {
         let mut out = Vec::new();
         if max > 0 {
-            self.walk_dir(&mut |e| {
+            self.walk_dir(&mut Vec::new(), &mut |e| {
                 if keep(&e) {
                     out.push(e);
                 }
@@ -186,8 +186,17 @@ impl SmbSource {
         Ok(out)
     }
 
-    fn walk_dir(&self, on_entry: &mut dyn FnMut(FileEntry) -> bool) -> Result<bool, SourceError> {
-        walk_tree(&|rel| self.list_dir(rel), WALK_CONCURRENCY, on_entry)
+    fn walk_dir(
+        &self,
+        skipped: &mut Vec<String>,
+        on_entry: &mut dyn FnMut(FileEntry) -> bool,
+    ) -> Result<bool, SourceError> {
+        walk_tree(
+            &|rel| self.list_dir(rel),
+            WALK_CONCURRENCY,
+            skipped,
+            on_entry,
+        )
     }
 
     fn list_dir(&self, rel: &str) -> Result<Vec<DirItem>, SourceError> {
@@ -255,6 +264,7 @@ impl From<FileFullDirectoryInformation> for DirItem {
 fn walk_tree(
     list: &(dyn Fn(&str) -> Result<Vec<DirItem>, SourceError> + Sync),
     workers: usize,
+    skipped: &mut Vec<String>,
     on_entry: &mut dyn FnMut(FileEntry) -> bool,
 ) -> Result<bool, SourceError> {
     let (job_tx, job_rx) = mpsc::channel::<String>();
@@ -299,6 +309,7 @@ fn walk_tree(
                         if !rel.is_empty() =>
                     {
                         log::warn!("SMB: skipping unreadable folder '{rel}': {e}");
+                        skipped.push(rel);
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -656,12 +667,13 @@ impl Drop for SmbReader {
 }
 
 impl MusicSource for SmbSource {
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
-        self.walk_dir(&mut |e| {
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
+        let mut skipped_dirs = Vec::new();
+        self.walk_dir(&mut skipped_dirs, &mut |e| {
             on_entry(e);
             true
-        })
-        .map(|_| ())
+        })?;
+        Ok(WalkReport { skipped_dirs })
     }
 
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
@@ -807,14 +819,15 @@ mod tests {
     fn walk_collect(
         list: &(dyn Fn(&str) -> Result<Vec<DirItem>, SourceError> + Sync),
         workers: usize,
-    ) -> (Result<bool, SourceError>, Vec<String>) {
+    ) -> (Result<bool, SourceError>, Vec<String>, Vec<String>) {
         let mut seen = Vec::new();
-        let res = walk_tree(list, workers, &mut |e| {
+        let mut skipped = Vec::new();
+        let res = walk_tree(list, workers, &mut skipped, &mut |e| {
             seen.push(e.rel_path);
             true
         });
         seen.sort();
-        (res, seen)
+        (res, seen, skipped)
     }
 
     #[test]
@@ -825,9 +838,10 @@ mod tests {
                 SourceError::NotFound,
                 SourceError::Io("x".into()),
             ] {
-                let (res, seen) = walk_collect(&fake_list(err.clone()), workers);
+                let (res, seen, skipped) = walk_collect(&fake_list(err.clone()), workers);
                 assert_eq!(res, Ok(true), "{err:?}");
                 assert_eq!(seen, ["ok/a.mp3", "z.mp3"], "{err:?}");
+                assert_eq!(skipped, ["bad"], "reported: {err:?}");
             }
         }
     }
@@ -836,7 +850,7 @@ mod tests {
     fn walk_aborts_on_connection_errors() {
         for workers in [1, WALK_CONCURRENCY] {
             for err in [SourceError::Unreachable, SourceError::Timeout] {
-                let (res, _) = walk_collect(&fake_list(err.clone()), workers);
+                let (res, _, _) = walk_collect(&fake_list(err.clone()), workers);
                 assert_eq!(res, Err(err));
             }
         }
@@ -844,7 +858,7 @@ mod tests {
 
     #[test]
     fn walk_fails_when_root_unreadable() {
-        let (res, _) = walk_collect(&|_: &str| Err(SourceError::NotFound), WALK_CONCURRENCY);
+        let (res, _, _) = walk_collect(&|_: &str| Err(SourceError::NotFound), WALK_CONCURRENCY);
         assert_eq!(res, Err(SourceError::NotFound));
     }
 
@@ -891,7 +905,7 @@ mod tests {
     #[test]
     fn walk_lists_folders_concurrently() {
         let tree = WideTree::new(vec![]);
-        let (res, seen) = walk_collect(&|rel: &str| tree.list(rel), WALK_CONCURRENCY);
+        let (res, seen, _) = walk_collect(&|rel: &str| tree.list(rel), WALK_CONCURRENCY);
         assert_eq!(res, Ok(true));
         assert_eq!(seen.len(), 16 * 3);
         assert!(seen.contains(&"d7/sub/c.ogg".to_string()));
@@ -902,7 +916,7 @@ mod tests {
     #[test]
     fn single_worker_walk_lists_one_folder_at_a_time() {
         let tree = WideTree::new(vec![]);
-        let (res, seen) = walk_collect(&|rel: &str| tree.list(rel), 1);
+        let (res, seen, _) = walk_collect(&|rel: &str| tree.list(rel), 1);
         assert_eq!(res, Ok(true));
         assert_eq!(seen.len(), 16 * 3);
         assert_eq!(tree.peak.load(Ordering::SeqCst), 1);
@@ -916,7 +930,7 @@ mod tests {
             ("d5/sub", SourceError::NotFound),
             ("d9", SourceError::Io("odd".into())),
         ]);
-        let (res, seen) = walk_collect(&|rel: &str| tree.list(rel), WALK_CONCURRENCY);
+        let (res, seen, _) = walk_collect(&|rel: &str| tree.list(rel), WALK_CONCURRENCY);
         assert_eq!(res, Ok(true));
         assert_eq!(seen.len(), 16 * 3 - 3 - 1 - 3);
         assert!(!seen
@@ -926,7 +940,7 @@ mod tests {
         // ...while a lost or timed-out connection anywhere aborts the walk.
         for err in [SourceError::Unreachable, SourceError::Timeout] {
             let tree = WideTree::new(vec![("d11/sub", err.clone())]);
-            let (res, _) = walk_collect(&|rel: &str| tree.list(rel), WALK_CONCURRENCY);
+            let (res, _, _) = walk_collect(&|rel: &str| tree.list(rel), WALK_CONCURRENCY);
             assert_eq!(res, Err(err));
         }
     }
@@ -935,10 +949,15 @@ mod tests {
     fn walk_stops_when_callback_says_so() {
         let tree = WideTree::new(vec![]);
         let mut n = 0;
-        let res = walk_tree(&|rel: &str| tree.list(rel), WALK_CONCURRENCY, &mut |_| {
-            n += 1;
-            n < 5
-        });
+        let res = walk_tree(
+            &|rel: &str| tree.list(rel),
+            WALK_CONCURRENCY,
+            &mut Vec::new(),
+            &mut |_| {
+                n += 1;
+                n < 5
+            },
+        );
         assert_eq!(res, Ok(false));
         assert_eq!(n, 5);
     }
@@ -957,7 +976,9 @@ mod tests {
                 }
             }
         };
-        let res = std::panic::catch_unwind(AssertUnwindSafe(|| walk_tree(&list, 2, &mut |_| true)));
+        let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            walk_tree(&list, 2, &mut Vec::new(), &mut |_| true)
+        }));
         assert!(res.is_err(), "panic must propagate");
         // Root + d0 + at most the folders in hand / just picked up; not all 50.
         let n = listed.load(Ordering::SeqCst);

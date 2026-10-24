@@ -1,7 +1,7 @@
 use super::*;
 use crate::audio::output::{Sink, SinkWrite};
 use crate::failure::Failure;
-use crate::source::{FileEntry, LocalSource, ReadSeek, SourceError};
+use crate::source::{FileEntry, LocalSource, ReadSeek, SourceError, WalkReport};
 use crate::Result;
 use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -405,7 +405,10 @@ impl Seek for Stall {
 }
 
 impl MusicSource for StallSource {
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> std::result::Result<(), SourceError> {
+    fn walk(
+        &self,
+        on_entry: &mut dyn FnMut(FileEntry),
+    ) -> std::result::Result<WalkReport, SourceError> {
         self.0.walk(on_entry)
     }
     fn open(&self, rel_path: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
@@ -643,12 +646,20 @@ struct StallAfterSource(LocalSource);
 struct StallAfter {
     data: std::io::Cursor<Vec<u8>>,
     limit: u64,
+    /// Fail as SmbReader does when a reconnect's login is rejected, instead of stalling.
+    auth_fails: bool,
 }
 
 impl Read for StallAfter {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let pos = self.data.position();
         if pos >= self.limit {
+            if self.auth_fails {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    SourceError::Auth,
+                ));
+            }
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
@@ -665,14 +676,18 @@ impl Seek for StallAfter {
 }
 
 impl MusicSource for StallAfterSource {
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> std::result::Result<(), SourceError> {
+    fn walk(
+        &self,
+        on_entry: &mut dyn FnMut(FileEntry),
+    ) -> std::result::Result<WalkReport, SourceError> {
         self.0.walk(on_entry)
     }
     fn open(&self, rel_path: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
-        if let Some(spec) = rel_path
-            .strip_prefix("stall-")
-            .and_then(|r| r.strip_suffix(".flac"))
-        {
+        let (auth_fails, rest) = match rel_path.strip_prefix("authfail-") {
+            Some(rest) => (true, Some(rest)),
+            None => (false, rel_path.strip_prefix("stall-")),
+        };
+        if let Some(spec) = rest.and_then(|r| r.strip_suffix(".flac")) {
             let (pct, freq) = spec.split_once('-').unwrap();
             let path = tests_dir().join(format!("fixtures-audio/tone{freq}.flac"));
             let data = std::fs::read(path).unwrap();
@@ -680,6 +695,7 @@ impl MusicSource for StallAfterSource {
             return Ok(Box::new(StallAfter {
                 data: std::io::Cursor::new(data),
                 limit,
+                auth_fails,
             }));
         }
         self.0.open(rel_path)
@@ -687,6 +703,26 @@ impl MusicSource for StallAfterSource {
     fn describe(&self) -> String {
         "stall-after".into()
     }
+}
+
+#[test]
+fn a_rejected_login_mid_track_is_reported_as_unreachable() {
+    let mut h = Harness::new(Opts {
+        source: Some(Arc::new(StallAfterSource(LocalSource::new(tests_dir())))),
+        ..Default::default()
+    });
+    h.play(vec![
+        PlayItem {
+            id: 1,
+            rel_path: "authfail-50-500.flac".into(),
+            gain_db: 0.0,
+        },
+        tone(2, 1500),
+    ]);
+    h.wait("skip", 30, |e| {
+        matches!(e, Event::TrackSkipped { id: 1, .. })
+    });
+    assert_eq!(h.calls().first(), Some(&Call::Failed(1, "unreachable")));
 }
 
 #[test]

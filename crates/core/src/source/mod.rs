@@ -50,10 +50,28 @@ pub struct FileEntry {
     pub mtime: i64,
 }
 
+/// A copy of an I/O error (they are not `Clone`), keeping a [`SourceError`] it
+/// carries (as `SmbReader` errors do), so the copy is classified like the original.
+pub(crate) fn clone_io_error(e: &std::io::Error) -> std::io::Error {
+    match e.get_ref().and_then(|i| i.downcast_ref::<SourceError>()) {
+        Some(src) => std::io::Error::new(e.kind(), src.clone()),
+        None => std::io::Error::new(e.kind(), e.to_string()),
+    }
+}
+
+/// What a walk could not cover.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalkReport {
+    /// Folders (`/`-separated, relative to the music root) whose listing failed and
+    /// that were skipped: their files may still exist, they were just not seen.
+    pub skipped_dirs: Vec<String>,
+}
+
 pub trait MusicSource: Send + Sync {
     /// Calls `on_entry` for every `.mp3`/`.flac`/`.ogg` file (case-insensitive),
-    /// skipping hidden files and directories.
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError>;
+    /// skipping hidden files and directories. A subfolder that cannot be listed is
+    /// skipped and reported; failing to list the root is an error.
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError>;
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError>;
     fn describe(&self) -> String;
 }

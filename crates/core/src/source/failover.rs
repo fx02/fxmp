@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{FileEntry, MusicSource, ReadSeek, SourceError};
+use super::{FileEntry, MusicSource, ReadSeek, SourceError, WalkReport};
 
 /// Which server served the most recent successful operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,13 +56,13 @@ impl MusicSource for FailoverSource {
     /// Walks the primary; entries are buffered so a mid-walk failure never
     /// delivers a partial listing before the secondary's full one.
     /// On failure the primary's error is returned if the secondary fails too.
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
         let mut buf = Vec::new();
         let err = match self.primary.walk(&mut |e| buf.push(e)) {
-            Ok(()) => {
+            Ok(report) => {
                 self.mark(Which::Primary);
                 buf.into_iter().for_each(on_entry);
-                return Ok(());
+                return Ok(report);
             }
             Err(e) => e,
         };
@@ -70,12 +70,12 @@ impl MusicSource for FailoverSource {
             return Err(err);
         };
         let mut buf = Vec::new();
-        if secondary.walk(&mut |e| buf.push(e)).is_err() {
+        let Ok(report) = secondary.walk(&mut |e| buf.push(e)) else {
             return Err(err);
-        }
+        };
         self.mark(Which::Secondary);
         buf.into_iter().for_each(on_entry);
-        Ok(())
+        Ok(report)
     }
 
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
@@ -118,6 +118,7 @@ mod tests {
         open_errors: HashMap<String, SourceError>,
         walk_error: Option<SourceError>,
         entries: Vec<FileEntry>,
+        skipped: Vec<String>,
     }
 
     impl FakeSource {
@@ -127,7 +128,12 @@ mod tests {
                 open_errors: HashMap::new(),
                 walk_error: None,
                 entries: vec![],
+                skipped: vec![],
             }
+        }
+        fn skip(mut self, dir: &str) -> Self {
+            self.skipped.push(dir.into());
+            self
         }
         fn open_err(mut self, path: &str, e: SourceError) -> Self {
             self.open_errors.insert(path.into(), e);
@@ -148,12 +154,17 @@ mod tests {
     }
 
     impl MusicSource for FakeSource {
-        fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
+        fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
             // Emit entries first, then fail: simulates a mid-walk failure.
             for e in &self.entries {
                 on_entry(e.clone());
             }
-            self.walk_error.clone().map_or(Ok(()), Err)
+            match self.walk_error.clone() {
+                Some(e) => Err(e),
+                None => Ok(WalkReport {
+                    skipped_dirs: self.skipped.clone(),
+                }),
+            }
         }
         fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
             match self.open_errors.get(rel_path) {
@@ -245,6 +256,24 @@ mod tests {
         f.walk(&mut |e| got.push(e.rel_path)).unwrap();
         assert_eq!(got, ["a.mp3"]);
         assert_eq!(f.active(), Which::Primary);
+    }
+
+    #[test]
+    fn walk_reports_the_folders_the_walking_server_skipped() {
+        let f = failover(
+            FakeSource::new("p").entry("a.mp3").skip("Jazz"),
+            Some(FakeSource::new("s").skip("Rock")),
+        );
+        let report = f.walk(&mut |_| {}).unwrap();
+        assert_eq!(report.skipped_dirs, ["Jazz"]);
+        let f = failover(
+            FakeSource::new("p")
+                .walk_err(SourceError::Unreachable)
+                .skip("Jazz"),
+            Some(FakeSource::new("s").entry("x.mp3").skip("Rock")),
+        );
+        let report = f.walk(&mut |_| {}).unwrap();
+        assert_eq!(report.skipped_dirs, ["Rock"], "the secondary's");
     }
 
     #[test]

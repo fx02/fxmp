@@ -36,7 +36,7 @@ struct State {
     /// Inner reached its end before `len` (data ends at the end of `buf`).
     eof: bool,
     /// Inner failed at the end of `buf`; surfaces once the reader gets there.
-    error: Option<(io::ErrorKind, String)>,
+    error: Option<io::Error>,
     shutdown: bool,
 }
 
@@ -131,7 +131,7 @@ fn fetch_loop(shared: Arc<Shared>, mut inner: Box<dyn ReadSeek>, len: u64, cfg: 
         match result {
             Ok(0) => st.eof = true,
             Ok(n) => st.buf.extend(&scratch[..n]),
-            Err(e) => st.error = Some((e.kind(), e.to_string())),
+            Err(e) => st.error = Some(e),
         }
         shared.cond.notify_all();
     }
@@ -173,8 +173,8 @@ impl Read for PrefetchReader {
                 self.shared.cond.notify_all();
                 return Ok(n);
             }
-            if let Some((kind, msg)) = &st.error {
-                return Err(io::Error::new(*kind, msg.clone()));
+            if let Some(e) = &st.error {
+                return Err(crate::source::clone_io_error(e));
             }
             if st.eof {
                 return Ok(0);
@@ -253,6 +253,8 @@ mod tests {
         Normal,
         Stall,
         FailAt(usize),
+        /// Fails like SmbReader after a rejected reconnect: the source error inside.
+        AuthAt(usize),
     }
 
     struct SlowReader {
@@ -283,6 +285,17 @@ mod tests {
                 Mode::Stall => loop {
                     std::thread::sleep(Duration::from_secs(3600));
                 },
+                Mode::AuthAt(limit) if self.inner.position() as usize >= limit => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        crate::source::SourceError::Auth,
+                    ));
+                }
+                Mode::AuthAt(limit) => {
+                    let pos = self.inner.position() as usize;
+                    let n = buf.len().min(limit - pos);
+                    return self.inner.read(&mut buf[..n]);
+                }
                 Mode::FailAt(limit) => {
                     let pos = self.inner.position() as usize;
                     if pos >= limit {
@@ -378,6 +391,23 @@ mod tests {
         let e = r.read(&mut [0u8; 16]).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut);
         assert!(t.elapsed() < Duration::from_millis(400));
+    }
+
+    #[test]
+    fn inner_source_error_survives() {
+        let (s, _) = SlowReader::new(data(), Duration::ZERO, Mode::AuthAt(1000));
+        let mut r = PrefetchReader::new(Box::new(s), SIZE as u64, PrefetchConfig::default());
+        let e = r.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let inner = e
+            .get_ref()
+            .and_then(|i| i.downcast_ref::<crate::source::SourceError>());
+        assert_eq!(inner, Some(&crate::source::SourceError::Auth));
+        // Reported again on the next read, still with the source error.
+        let e = r.read(&mut [0u8; 8]).unwrap_err();
+        assert!(e
+            .get_ref()
+            .is_some_and(|i| i.is::<crate::source::SourceError>()));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use super::{is_supported, FileEntry, MusicSource, ReadSeek, SourceError};
+use super::{is_supported, FileEntry, MusicSource, ReadSeek, SourceError, WalkReport};
 
 pub struct LocalSource {
     root: PathBuf,
@@ -16,13 +16,25 @@ impl LocalSource {
         Self { root: root.into() }
     }
 
+    /// Walks `dir`; a subfolder that cannot be listed is skipped and added to
+    /// `skipped` (the root failing is an error).
     fn walk_dir(
         &self,
         dir: &Path,
         rel: &str,
+        skipped: &mut Vec<String>,
         on_entry: &mut dyn FnMut(FileEntry),
     ) -> Result<(), SourceError> {
-        for item in fs::read_dir(dir).map_err(map_io)? {
+        let items = match fs::read_dir(dir) {
+            Ok(items) => items,
+            Err(e) if !rel.is_empty() => {
+                log::warn!("skipping unreadable folder '{rel}': {e}");
+                skipped.push(rel.to_string());
+                return Ok(());
+            }
+            Err(e) => return Err(map_io(e)),
+        };
+        for item in items {
             let item = item.map_err(map_io)?;
             let name = item.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
@@ -40,7 +52,7 @@ impl LocalSource {
                 Err(e) => return Err(map_io(e)),
             };
             if md.is_dir() {
-                self.walk_dir(&item.path(), &rel_path, on_entry)?;
+                self.walk_dir(&item.path(), &rel_path, skipped, on_entry)?;
             } else if md.is_file() && is_supported(&rel_path) {
                 let mtime = md
                     .modified()
@@ -67,8 +79,10 @@ fn map_io(e: io::Error) -> SourceError {
 }
 
 impl MusicSource for LocalSource {
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
-        self.walk_dir(&self.root, "", on_entry)
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
+        let mut skipped_dirs = Vec::new();
+        self.walk_dir(&self.root, "", &mut skipped_dirs, on_entry)?;
+        Ok(WalkReport { skipped_dirs })
     }
 
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
@@ -153,5 +167,35 @@ mod tests {
             Some(SourceError::NotFound)
         );
         assert!(src.describe().contains("fixtures"));
+    }
+
+    #[test]
+    fn local_walk_skips_and_reports_an_unreadable_subfolder() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["ok", "locked"] {
+            fs::create_dir(tmp.path().join(d)).unwrap();
+            fs::copy(
+                fixtures().join("tone.mp3"),
+                tmp.path().join(d).join("a.mp3"),
+            )
+            .unwrap();
+        }
+        let locked = tmp.path().join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            // Running as root: permissions do not stop us; nothing to test.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let mut seen = Vec::new();
+        let report = LocalSource::new(tmp.path()).walk(&mut |e| seen.push(e.rel_path));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(seen, ["ok/a.mp3"]);
+        assert_eq!(report.unwrap().skipped_dirs, ["locked"]);
+        // The root itself unreadable is an error.
+        assert!(LocalSource::new(tmp.path().join("nope"))
+            .walk(&mut |_| {})
+            .is_err());
     }
 }

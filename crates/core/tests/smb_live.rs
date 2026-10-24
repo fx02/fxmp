@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use smp_core::catalog::Catalog;
 use smp_core::scan::{scan, scan_with, ScanOptions};
 use smp_core::source::smb::{SmbConfig, SmbSource};
-use smp_core::source::{FileEntry, MusicSource, SourceError};
+use smp_core::source::{FileEntry, MusicSource, SourceError, WalkReport};
 use smp_core::Error;
 
 const CHUNK: usize = 64 * 1024;
@@ -233,9 +233,9 @@ struct Sample<'a> {
 }
 
 impl MusicSource for Sample<'_> {
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
         self.files.iter().cloned().for_each(on_entry);
-        Ok(())
+        Ok(WalkReport::default())
     }
     fn open(&self, rel_path: &str) -> Result<Box<dyn smp_core::source::ReadSeek>, SourceError> {
         self.src.open(rel_path)
