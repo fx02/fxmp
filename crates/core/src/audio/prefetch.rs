@@ -181,7 +181,10 @@ impl Read for PrefetchReader {
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "prefetch read timed out"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "prefetch read timed out",
+                ));
             }
             st = self
                 .shared
@@ -202,7 +205,10 @@ impl Seek for PrefetchReader {
             SeekFrom::End(d) => self.len.checked_add_signed(d),
         }
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "seek to a negative or overflowing position")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek to a negative or overflowing position",
+            )
         })?;
         if target < st.start || target > st.end() {
             st.generation += 1;
@@ -260,7 +266,12 @@ mod tests {
         fn new(d: Vec<u8>, delay: Duration, mode: Mode) -> (Self, Arc<AtomicUsize>) {
             let c = Arc::new(AtomicUsize::new(0));
             (
-                Self { inner: Cursor::new(d), delay, read_bytes: c.clone(), mode },
+                Self {
+                    inner: Cursor::new(d),
+                    delay,
+                    read_bytes: c.clone(),
+                    mode,
+                },
                 c,
             )
         }
@@ -317,7 +328,16 @@ mod tests {
     fn seek_forward_backward_match_source() {
         let (mut r, d, _) = reader(0);
         let mut b = vec![0u8; 1000];
-        for &off in &[0usize, 4000, 100, 3_000_000, 2_999_000, 10, SIZE - 1000, 500_000] {
+        for &off in &[
+            0usize,
+            4000,
+            100,
+            3_000_000,
+            2_999_000,
+            10,
+            SIZE - 1000,
+            500_000,
+        ] {
             assert_eq!(r.seek(SeekFrom::Start(off as u64)).unwrap(), off as u64);
             r.read_exact(&mut b).unwrap();
             assert!(b[..] == d[off..off + 1000], "mismatch at {off}");
@@ -326,7 +346,10 @@ mod tests {
         let mut tail = Vec::new();
         r.read_to_end(&mut tail).unwrap();
         assert!(tail[..] == d[SIZE - 500..]);
-        assert_eq!(r.seek(SeekFrom::Current(-100)).unwrap(), (SIZE - 100) as u64);
+        assert_eq!(
+            r.seek(SeekFrom::Current(-100)).unwrap(),
+            (SIZE - 100) as u64
+        );
         r.read_exact(&mut b[..100]).unwrap();
         assert!(b[..100] == d[SIZE - 100..]);
         assert_eq!(r.read(&mut b).unwrap(), 0);
@@ -336,13 +359,20 @@ mod tests {
     fn prefetches_ahead() {
         let (_r, _, c) = reader(2);
         std::thread::sleep(Duration::from_millis(50));
-        assert!(c.load(Ordering::SeqCst) >= 1024 * 1024, "got {}", c.load(Ordering::SeqCst));
+        assert!(
+            c.load(Ordering::SeqCst) >= 1024 * 1024,
+            "got {}",
+            c.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
     fn read_times_out_when_inner_stalls() {
         let (s, _) = SlowReader::new(data(), Duration::ZERO, Mode::Stall);
-        let cfg = PrefetchConfig { read_timeout: Duration::from_millis(200), ..Default::default() };
+        let cfg = PrefetchConfig {
+            read_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
         let mut r = PrefetchReader::new(Box::new(s), SIZE as u64, cfg);
         let t = Instant::now();
         let e = r.read(&mut [0u8; 16]).unwrap_err();

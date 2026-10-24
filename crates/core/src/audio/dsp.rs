@@ -47,7 +47,11 @@ pub struct LoudnessMeter {
 
 impl LoudnessMeter {
     pub fn new(rate: u32) -> Self {
-        Self { ebu: EbuR128::new(2, rate, Mode::I).ok(), rate, frames: 0 }
+        Self {
+            ebu: EbuR128::new(2, rate, Mode::I).ok(),
+            rate,
+            frames: 0,
+        }
     }
 
     pub fn push(&mut self, interleaved: &[f32]) {
