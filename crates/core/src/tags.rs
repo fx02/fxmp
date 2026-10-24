@@ -2,7 +2,7 @@
 
 use crate::catalog::TrackMeta;
 use crate::source::ReadSeek;
-use lofty::config::ParseOptions;
+use lofty::config::{ParseOptions, ParsingMode};
 use lofty::file::{AudioFile, FileType, TaggedFile, TaggedFileExt};
 use lofty::id3::v2::FrameId;
 use lofty::mpeg::MpegFile;
@@ -27,7 +27,10 @@ fn parse_error(e: &(dyn std::error::Error + 'static)) -> Error {
 /// Reads tags and duration from a stream. `ext` (without dot, any case) selects
 /// the format; when unknown, the format is guessed from the content.
 pub fn read_meta(reader: &mut dyn ReadSeek, ext: &str) -> Result<TrackMeta> {
-    let mut probe = Probe::new(reader);
+    // Relaxed: a malformed frame (a date such as "unknown", say) is dropped instead
+    // of failing the whole file.
+    let options = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
+    let mut probe = Probe::new(reader).options(options);
     probe = match FileType::from_ext(ext.to_ascii_lowercase()) {
         Some(ft) => probe.set_file_type(ft),
         None => probe.guess_file_type().map_err(Error::Io)?,
@@ -37,8 +40,7 @@ pub fn read_meta(reader: &mut dyn ReadSeek, ext: &str) -> Result<TrackMeta> {
     let (file, raw_tcon) = if probe.file_type() == Some(FileType::Mpeg) {
         let mut reader = probe.into_inner();
         reader.rewind().map_err(Error::Io)?;
-        let mpeg =
-            MpegFile::read_from(&mut reader, ParseOptions::new()).map_err(|e| parse_error(&e))?;
+        let mpeg = MpegFile::read_from(&mut reader, options).map_err(|e| parse_error(&e))?;
         let tcon = mpeg
             .id3v2()
             .and_then(|t| t.get_text(&FrameId::Valid("TCON".into())))
@@ -58,11 +60,42 @@ pub fn read_meta(reader: &mut dyn ReadSeek, ext: &str) -> Result<TrackMeta> {
         meta.title = tag.title().map(|s| s.into_owned());
         meta.track_no = tag.track();
         meta.raw_genre = raw_tcon.or_else(|| tag.genre().map(|s| s.into_owned()));
+        meta.year = [
+            ItemKey::RecordingDate,
+            ItemKey::Year,
+            ItemKey::ReleaseDate,
+            ItemKey::OriginalReleaseDate,
+        ]
+        .into_iter()
+        .find_map(|k| tag.get_string(k).and_then(parse_year));
         meta.rg_track_gain_db = tag
             .get_string(ItemKey::ReplayGainTrackGain)
             .and_then(parse_gain_db);
     }
     Ok(meta)
+}
+
+/// The first 4-digit year in `s` (a digit run of exactly four), if within 1900–2100.
+fn parse_year(s: &str) -> Option<u16> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i - start == 4 {
+            return s[start..i]
+                .parse()
+                .ok()
+                .filter(|y| (1900..=2100).contains(y));
+        }
+    }
+    None
 }
 
 /// Parses ReplayGain values such as `-6.50 dB`.
@@ -167,6 +200,102 @@ mod tests {
                 Some("Test Title"),
                 "{file}: other tags kept"
             );
+        }
+    }
+
+    #[test]
+    fn parse_year_takes_the_first_four_digit_year_in_range() {
+        assert_eq!(parse_year("1991"), Some(1991));
+        assert_eq!(parse_year("1991-05-01"), Some(1991));
+        assert_eq!(parse_year(" 2003/2004 "), Some(2003));
+        assert_eq!(parse_year("(P) 1987 Label"), Some(1987));
+        assert_eq!(
+            parse_year("12345 then 1999"),
+            Some(1999),
+            "digit runs longer than 4"
+        );
+        assert_eq!(parse_year("0000"), None);
+        assert_eq!(parse_year("1899"), None);
+        assert_eq!(parse_year("2101"), None);
+        assert_eq!(parse_year("1899 2001"), None, "the first year counts");
+        assert_eq!(parse_year("91"), None);
+        assert_eq!(parse_year(""), None);
+    }
+
+    /// A copy of a fixture with `key` set to `value` in its primary tag.
+    fn with_item(name: &str, key: ItemKey, value: &str) -> tempfile::NamedTempFile {
+        use lofty::config::WriteOptions;
+        use lofty::tag::TagExt;
+        let tmp = tempfile::Builder::new()
+            .suffix(&format!(".{}", name.rsplit('.').next().unwrap()))
+            .tempfile()
+            .unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+            tmp.path(),
+        )
+        .unwrap();
+        let mut file = lofty::read_from_path(tmp.path()).unwrap();
+        let tag = file.primary_tag_mut().unwrap();
+        tag.remove_key(ItemKey::Year);
+        tag.remove_key(ItemKey::RecordingDate);
+        tag.insert_text(key, value.to_string());
+        tag.save_to_path(tmp.path(), WriteOptions::default())
+            .unwrap();
+        tmp
+    }
+
+    /// The fixture MP3 with its ID3v2.3 tag replaced by one holding these text
+    /// frames (ISO-8859-1), as older taggers write it (e.g. the year in TYER).
+    fn mp3_with_id3v23(frames: &[(&str, &str)]) -> Vec<u8> {
+        let orig = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tone.mp3"),
+        )
+        .unwrap();
+        assert_eq!(&orig[..3], b"ID3");
+        let old_len = orig[6..10]
+            .iter()
+            .fold(0usize, |n, b| (n << 7) | (*b as usize & 0x7f));
+        let mut body = Vec::new();
+        for (id, text) in frames {
+            body.extend_from_slice(id.as_bytes());
+            body.extend_from_slice(&(text.len() as u32 + 1).to_be_bytes());
+            body.extend_from_slice(&[0, 0, 0]);
+            body.extend_from_slice(text.as_bytes());
+        }
+        let n = body.len();
+        let mut out = b"ID3\x03\x00\x00".to_vec();
+        out.extend([21, 14, 7, 0].map(|shift| ((n >> shift) & 0x7f) as u8));
+        out.extend(body);
+        out.extend_from_slice(&orig[10 + old_len..]);
+        out
+    }
+
+    #[test]
+    fn read_meta_reads_the_year() {
+        for file in ["tone.mp3", "tone.flac", "tone.ogg"] {
+            let ext = file.rsplit('.').next().unwrap();
+            for (key, value, want) in [
+                (ItemKey::RecordingDate, "1991-05-01", Some(1991)),
+                (ItemKey::Year, "2003", Some(2003)),
+                (ItemKey::RecordingDate, "unknown", None),
+            ] {
+                if file.ends_with(".mp3") && key == ItemKey::Year {
+                    continue; // ID3v2.4 has no year frame: TYER is checked below.
+                }
+                let tmp = with_item(file, key, value);
+                let m = read_meta(&mut File::open(tmp.path()).unwrap(), ext).unwrap();
+                assert_eq!(m.year, want, "{file} {key:?}={value}");
+                assert_eq!(m.title.as_deref(), Some("Test Title"), "{file}");
+            }
+        }
+        for (frame, value, want) in [("TYER", "1987", Some(1987)), ("TYER", "n/a", None)] {
+            let bytes = mp3_with_id3v23(&[("TIT2", "Test Title"), (frame, value)]);
+            let m = read_meta(&mut std::io::Cursor::new(bytes), "mp3").unwrap();
+            assert_eq!(m.year, want, "{frame}");
+            assert_eq!(m.title.as_deref(), Some("Test Title"));
         }
     }
 

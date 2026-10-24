@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::catalog::{Catalog, TrackMeta};
+use crate::failure::{FailCode, Failure};
 use crate::source::{FileEntry, MusicSource, SourceError};
 use crate::tags::read_meta;
 use crate::{Error, Result, SetOnDrop};
@@ -94,10 +95,11 @@ pub fn scan(
 }
 
 /// Syncs `catalog` with `source`: unchanged files are only marked seen, new or
-/// modified ones are tagged and upserted, vanished ones are removed. A file whose
-/// tags cannot be read stays in the catalog with empty metadata and counts as failed;
-/// if opening or reading it failed because of a network problem, it is stored with
-/// size/mtime 0 so the next scan retries it.
+/// modified ones (and those marked for a new tag read) are tagged and upserted,
+/// vanished ones are removed. A file whose tags cannot be read stays in the catalog
+/// with empty metadata, its failure stored, and counts as failed; if opening or
+/// reading it failed because of a network problem, it is stored with size/mtime 0
+/// so the next scan retries it, and a known track keeps its tags.
 /// Tagging runs on `opts.workers` threads; only the calling thread writes to the catalog.
 /// On cancel the walk stops and nothing is removed (`finish_scan` is skipped).
 pub fn scan_with(
@@ -178,33 +180,57 @@ pub fn scan_with(
     Ok(report)
 }
 
-/// Outcome of opening and tagging one file: `None` meta means it failed.
+/// Outcome of opening and tagging one file.
 struct ReadResult {
     index: usize,
-    meta: Option<TrackMeta>,
+    meta: std::result::Result<TrackMeta, ReadFailure>,
     size: u64,
     mtime: i64,
+}
+
+struct ReadFailure {
+    failure: Failure,
+    /// A network problem: size/mtime are stored as 0 so the next scan retries it,
+    /// and a known track keeps its tags meanwhile.
+    retry: bool,
 }
 
 /// Opens and tags `entry`, classifying failures (see [`scan_with`]). A panic
 /// while doing so (a tag-parser bug, say) counts as an undecodable file.
 fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult {
     let ext = e.rel_path.rsplit_once('.').map_or("", |(_, x)| x);
+    let failed = |err: &Error, retry: bool| {
+        let failure = Failure::from_tag_error(err);
+        let (size, mtime) = if retry { (0, 0) } else { (e.size, e.mtime) };
+        (Err(ReadFailure { failure, retry }), size, mtime)
+    };
     let read = || match source.open(&e.rel_path) {
         Ok(mut r) => match read_meta(&mut *r, ext) {
-            Ok(meta) => (Some(meta), e.size, e.mtime),
+            Ok(meta) => (Ok(meta), e.size, e.mtime),
             // Connection trouble while reading: retry next scan.
-            Err(Error::Io(io)) if is_network_io(&io) => (None, 0, 0),
-            Err(_) => (None, e.size, e.mtime),
+            Err(err @ Error::Io(_)) if matches!(&err, Error::Io(io) if is_network_io(io)) => {
+                failed(&err, true)
+            }
+            Err(err) => failed(&err, false),
         },
-        // Network trouble: store size/mtime 0 so the next scan retries it.
-        Err(SourceError::Unreachable | SourceError::Timeout | SourceError::Io(_)) => (None, 0, 0),
-        Err(_) => (None, e.size, e.mtime),
+        // Network trouble: retry next scan.
+        Err(err @ (SourceError::Unreachable | SourceError::Timeout | SourceError::Io(_))) => {
+            failed(&Error::Source(err), true)
+        }
+        Err(err) => failed(&Error::Source(err), false),
     };
     let (meta, size, mtime) =
         std::panic::catch_unwind(AssertUnwindSafe(read)).unwrap_or_else(|_| {
             log::warn!("scan: reading tags of '{}' panicked", e.rel_path);
-            (None, e.size, e.mtime)
+            let failure = Failure::new(FailCode::Tag, "reading the tags panicked");
+            (
+                Err(ReadFailure {
+                    failure,
+                    retry: false,
+                }),
+                e.size,
+                e.mtime,
+            )
         });
     ReadResult {
         index,
@@ -274,9 +300,17 @@ fn read_parallel(
             catalog.transaction(|c| {
                 for r in batch.drain(..) {
                     let e = files[r.index];
-                    let failed = r.meta.is_none();
-                    let meta = r.meta.unwrap_or_default();
-                    c.upsert_track(&e.rel_path, r.size, r.mtime, &meta)?;
+                    let failed = r.meta.is_err();
+                    match &r.meta {
+                        Ok(meta) => c.upsert_track(&e.rel_path, r.size, r.mtime, meta)?,
+                        Err(f) => c.record_scan_failure(
+                            &e.rel_path,
+                            r.size,
+                            r.mtime,
+                            &f.failure,
+                            f.retry,
+                        )?,
+                    };
                     on_written(e, failed);
                 }
                 Ok(())
@@ -519,8 +553,54 @@ mod tests {
                 "{name}"
             );
         }
+        let codes: std::collections::BTreeMap<String, String> = cat
+            .unreadable()
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.rel_path, t.code.unwrap()))
+            .collect();
+        let want = [
+            ("timeout.mp3", "timeout"),
+            ("unreachable.mp3", "unreachable"),
+            ("io.mp3", "io"),
+            ("read-timeout.mp3", "timeout"),
+            ("read-dropped.flac", "unreachable"),
+            ("read-reset.ogg", "unreachable"),
+            ("missing.mp3", "not_found"),
+            ("garbage.mp3", "tag"),
+        ];
+        assert_eq!(
+            codes,
+            want.iter()
+                .map(|(p, c)| (p.to_string(), c.to_string()))
+                .collect()
+        );
         let second = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((second.read, second.unchanged), (6, 2));
+    }
+
+    #[test]
+    fn tracks_marked_for_retag_are_read_again_keeping_bans_and_loudness() {
+        let dir = music_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("catalog.db");
+        let mut cat = Catalog::open(&db).unwrap();
+        let no = AtomicBool::new(false);
+        run(dir.path(), &mut cat, &no);
+        let ids = cat.playable_tracks(&[]).unwrap();
+        cat.set_banned(ids[0], true).unwrap();
+        cat.set_measured_lufs(ids[1], -12.0).unwrap();
+        // What the migration to catalog version 4 does.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("UPDATE tracks SET needs_retag=1", [])
+            .unwrap();
+        let r = run(dir.path(), &mut cat, &no);
+        assert_eq!((r.read, r.unchanged, r.removed), (4, 0, 0));
+        assert_eq!(cat.banned().unwrap().len(), 1);
+        assert_eq!(cat.track(ids[1]).unwrap().measured_lufs, Some(-12.0));
+        let r = run(dir.path(), &mut cat, &no);
+        assert_eq!((r.read, r.unchanged), (0, 4), "read once");
     }
 
     /// Tempdir with `copies` copies of the four fixtures spread over nested folders.
@@ -683,6 +763,13 @@ mod tests {
                 .file_unchanged("panics.mp3", 1000, 1_700_000_000)
                 .unwrap());
             assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 2);
+            let codes: Vec<_> = cat
+                .unreadable()
+                .unwrap()
+                .into_iter()
+                .map(|t| t.code.unwrap())
+                .collect();
+            assert_eq!(codes, ["tag", "tag"]);
         }
     }
 

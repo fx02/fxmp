@@ -1,5 +1,6 @@
 use super::*;
 use crate::audio::output::{Sink, SinkWrite};
+use crate::failure::Failure;
 use crate::source::{FileEntry, LocalSource, ReadSeek, SourceError};
 use crate::Result;
 use std::collections::VecDeque;
@@ -28,7 +29,8 @@ fn tone(id: TrackId, freq: u32) -> PlayItem {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
-    Failed(TrackId),
+    /// The track and its failure code.
+    Failed(TrackId, &'static str),
     Played(TrackId, Option<f32>),
 }
 
@@ -41,8 +43,11 @@ impl TrackProvider for FakeProvider {
     fn next_track(&mut self) -> Option<PlayItem> {
         self.items.pop_front()
     }
-    fn on_failed(&mut self, id: TrackId) {
-        self.calls.lock().unwrap().push(Call::Failed(id));
+    fn on_failed(&mut self, id: TrackId, failure: &Failure) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::Failed(id, failure.code.as_str()));
     }
     fn on_played(&mut self, id: TrackId, measured_lufs: Option<f32>) {
         self.calls
@@ -330,9 +335,25 @@ fn broken_track_is_skipped_and_reported() {
     h.wait("start of 2", 10, |e| *e == Event::TrackStarted { id: 2 });
     h.wait("idle", 30, |e| *e == Event::Idle);
     assert_eq!(h.started(), [2]);
-    assert_eq!(h.calls(), [Call::Failed(1), Call::Played(2, None)]);
+    assert_eq!(
+        h.calls(),
+        [Call::Failed(1, "decode"), Call::Played(2, None)]
+    );
     let out = left(&h.output());
     assert!(amplitude(&out[RATE as usize..2 * RATE as usize], 500) > AMP * 0.8);
+}
+
+#[test]
+fn missing_track_is_reported_as_not_found() {
+    let mut h = Harness::new(Opts::default());
+    let missing = PlayItem {
+        id: 1,
+        rel_path: "fixtures/no-such-file.mp3".into(),
+        gain_db: 0.0,
+    };
+    h.play(vec![missing, tone(2, 500)]);
+    h.wait("start of 2", 10, |e| *e == Event::TrackStarted { id: 2 });
+    assert_eq!(h.calls().first(), Some(&Call::Failed(1, "not_found")));
 }
 
 #[test]
@@ -430,7 +451,7 @@ fn stalled_source_skips_track() {
         t.elapsed()
     );
     h.wait("start of 2", 5, |e| *e == Event::TrackStarted { id: 2 });
-    assert_eq!(h.calls().first(), Some(&Call::Failed(1)));
+    assert_eq!(h.calls().first(), Some(&Call::Failed(1, "timeout")));
 }
 
 #[test]

@@ -13,6 +13,7 @@ use super::deck::{Deck, LoadCtx, Ramp};
 use super::dsp::{apply_ceiling, db_to_lin, equal_power, LoudnessMeter};
 use super::output::{Sink, SinkFactory, SinkWrite};
 use super::prefetch::PrefetchConfig;
+use crate::failure::Failure;
 use crate::source::MusicSource;
 use crate::TrackId;
 
@@ -44,7 +45,8 @@ pub struct PlayItem {
 /// Decides what plays next and hears how it went.
 pub trait TrackProvider: Send {
     fn next_track(&mut self) -> Option<PlayItem>;
-    fn on_failed(&mut self, id: TrackId);
+    /// `id` could not be opened or decoded, for this reason.
+    fn on_failed(&mut self, id: TrackId, failure: &Failure);
     fn on_played(&mut self, id: TrackId, measured_lufs: Option<f32>);
 }
 
@@ -466,16 +468,16 @@ impl Engine {
     fn check_early_failures(&mut self) {
         for slot in [Slot::Cur, Slot::Next] {
             let failed = self.slot(slot).as_ref().and_then(Deck::failed_early);
-            if let Some(reason) = failed {
+            if let Some(failure) = failed {
                 let deck = self.slot(slot).take().expect("checked above");
                 self.grace_since = None;
-                log::warn!("skipping {}: {reason}", deck.item.rel_path);
+                log::warn!("skipping {}: {failure}", deck.item.rel_path);
                 if let Some(p) = self.provider.as_mut() {
-                    p.on_failed(deck.item.id);
+                    p.on_failed(deck.item.id, &failure);
                 }
                 self.emit(Event::TrackSkipped {
                     id: deck.item.id,
-                    reason,
+                    reason: failure.message,
                 });
                 self.failures += 1;
                 if self.failures >= MAX_CONSECUTIVE_FAILURES {
@@ -525,12 +527,12 @@ impl Engine {
             return;
         };
         match deck.status().error {
-            Some(reason) => {
-                log::warn!("{} broke off: {reason}", deck.item.rel_path);
-                p.on_failed(deck.item.id);
+            Some(failure) => {
+                log::warn!("{} broke off: {failure}", deck.item.rel_path);
+                p.on_failed(deck.item.id, &failure);
                 self.emit(Event::TrackSkipped {
                     id: deck.item.id,
-                    reason,
+                    reason: failure.message,
                 });
             }
             None => {

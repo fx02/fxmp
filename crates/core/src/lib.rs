@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod catalog;
+pub mod failure;
 pub mod genre;
 pub mod scan;
 pub mod shuffle;

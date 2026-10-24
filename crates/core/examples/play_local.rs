@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use smp_core::audio::output::{CpalSink, Sink, SinkFactory};
 use smp_core::audio::player::{Command, Event, PlayItem, Player, PlayerConfig, TrackProvider};
+use smp_core::failure::Failure;
 use smp_core::source::{LocalSource, MusicSource};
 use smp_core::{Result, TrackId};
 
@@ -20,8 +21,8 @@ impl TrackProvider for Queue {
     fn next_track(&mut self) -> Option<PlayItem> {
         self.0.pop_front()
     }
-    fn on_failed(&mut self, id: TrackId) {
-        println!("failed: {id}");
+    fn on_failed(&mut self, id: TrackId, failure: &Failure) {
+        println!("failed: {id} ({}: {failure})", failure.code.as_str());
     }
     fn on_played(&mut self, id: TrackId, lufs: Option<f32>) {
         println!("played: {id} (lufs {lufs:?})");

@@ -11,6 +11,7 @@ use rand::rngs::StdRng;
 use smp_core::audio::dsp::track_gain_db;
 use smp_core::audio::player::{PlayItem, TrackProvider};
 use smp_core::catalog::{selection_key, Catalog};
+use smp_core::failure::Failure;
 use smp_core::shuffle::{entropy_shuffler, Shuffler};
 use smp_core::TrackId;
 
@@ -139,10 +140,11 @@ impl TrackProvider for CatalogProvider {
         }
     }
 
-    fn on_failed(&mut self, id: TrackId) {
-        self.ctx
-            .writer
-            .send("failure", move |c| c.record_failure(id).map(drop));
+    fn on_failed(&mut self, id: TrackId, failure: &Failure) {
+        let failure = failure.clone();
+        self.ctx.writer.send("failure", move |c| {
+            c.record_failure(id, &failure, None).map(drop)
+        });
         self.forget(id);
     }
 
@@ -162,6 +164,10 @@ mod tests {
     use super::*;
     use smp_core::catalog::TrackMeta;
     use std::time::{Duration, Instant};
+
+    fn decode_failure() -> Failure {
+        Failure::new(smp_core::failure::FailCode::Decode, "bad frame")
+    }
 
     fn track(cat: &Catalog, path: &str, genre: &str, album: Option<(&str, u32)>) -> TrackId {
         let meta = TrackMeta {
@@ -243,12 +249,12 @@ mod tests {
         assert_eq!(fx.query.last_first(&key).unwrap(), Some(first.id));
 
         // A failed track is counted in the catalog and leaves this run's shuffle.
-        p.on_failed(second.id);
+        p.on_failed(second.id, &decode_failure());
         for _ in 0..20 {
             assert_ne!(p.next_track().unwrap().id, second.id);
         }
-        p.on_failed(second.id);
-        p.on_failed(second.id);
+        p.on_failed(second.id, &decode_failure());
+        p.on_failed(second.id, &decode_failure());
         fx.flush();
         let playable = fx.query.playable_tracks(&keys).unwrap();
         assert!(
@@ -272,13 +278,15 @@ mod tests {
         let mut p = fx.shuffle(&["jazz".to_string()]);
         let item = p.next_track().unwrap();
         assert_eq!(item.gain_db, 0.0, "no ReplayGain, not measured yet");
-        p.on_failed(item.id);
-        p.on_failed(item.id);
+        p.on_failed(item.id, &decode_failure());
+        p.on_failed(item.id, &decode_failure());
         p.on_played(item.id, Some(-8.0));
         fx.flush();
         assert_eq!(fx.query.track(item.id).unwrap().measured_lufs, Some(-8.0));
         assert_eq!(
-            fx.query.record_failure(item.id).unwrap(),
+            fx.query
+                .record_failure(item.id, &decode_failure(), None)
+                .unwrap(),
             1,
             "failures were reset"
         );
@@ -354,7 +362,7 @@ mod tests {
         let item = p.next_track().unwrap();
         p.on_played(item.id, Some(-20.0));
         let other = *ids.iter().find(|&&i| i != item.id).unwrap();
-        p.on_failed(other);
+        p.on_failed(other, &decode_failure());
         let took = t.elapsed();
         release_tx.send(()).unwrap();
         holder.join().unwrap();
@@ -365,6 +373,11 @@ mod tests {
         let key = selection_key(&["trance".into()]);
         assert_eq!(fx.query.last_first(&key).unwrap(), Some(item.id));
         assert_eq!(fx.query.track(item.id).unwrap().measured_lufs, Some(-20.0));
-        assert_eq!(fx.query.record_failure(other).unwrap(), 2);
+        assert_eq!(
+            fx.query
+                .record_failure(other, &decode_failure(), None)
+                .unwrap(),
+            2
+        );
     }
 }

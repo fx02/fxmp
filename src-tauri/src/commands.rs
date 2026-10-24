@@ -428,7 +428,8 @@ pub async fn list_artists(app: AppHandle) -> CmdResult<Vec<String>> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_albums(app: AppHandle, artist: String) -> CmdResult<Vec<String>> {
     run(app, move |_, st| {
-        lock(&st.query).albums(&artist).map_err(db_err)
+        let albums = lock(&st.query).albums(&artist).map_err(db_err)?;
+        Ok(albums.into_iter().map(|a| a.name).collect())
     })
     .await
 }

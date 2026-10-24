@@ -10,6 +10,7 @@ use super::decoder::Decoder;
 use super::dsp::LoudnessMeter;
 use super::player::PlayItem;
 use super::prefetch::{PrefetchConfig, PrefetchReader};
+use crate::failure::{FailCode, Failure};
 use crate::source::MusicSource;
 
 /// Samples decoded per read on a deck thread.
@@ -23,7 +24,7 @@ enum Phase {
     Loading,
     Decoding,
     Ended,
-    Failed(String),
+    Failed(Failure),
 }
 
 struct DeckBuf {
@@ -80,7 +81,7 @@ fn spawn_deck_thread(
                 std::panic::AssertUnwindSafe(|| deck_thread(&s, &ctx, &path, rate, skip_frames));
             if std::panic::catch_unwind(run).is_err() {
                 // A decoder panic must not leave the engine waiting on this deck forever.
-                s.lock().phase = Phase::Failed("decoder panicked".into());
+                s.lock().phase = Phase::Failed(Failure::new(FailCode::Decode, "decoder panicked"));
                 (ctx.wake)();
             }
         })
@@ -88,7 +89,58 @@ fn spawn_deck_thread(
     shared
 }
 
-fn open_decoder(ctx: &LoadCtx, rel_path: &str, rate: u32) -> crate::Result<Decoder> {
+/// The last I/O error a reader returned, shared with whoever classifies a failure.
+type LastIoError = Arc<Mutex<Option<(std::io::ErrorKind, String)>>>;
+
+/// Remembers the reader's I/O errors: the decoder may hide them (symphonia's probe
+/// reports a read timeout as "no suitable format reader").
+struct TapErrors<R> {
+    inner: R,
+    last: LastIoError,
+}
+
+impl<R> TapErrors<R> {
+    fn tap<T>(&self, r: std::io::Result<T>) -> std::io::Result<T> {
+        if let Err(e) = &r {
+            *self.last.lock().unwrap_or_else(|p| p.into_inner()) = Some((e.kind(), e.to_string()));
+        }
+        r
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for TapErrors<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let r = self.inner.read(buf);
+        self.tap(r)
+    }
+}
+
+impl<R: Seek> Seek for TapErrors<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let r = self.inner.seek(pos);
+        self.tap(r)
+    }
+}
+
+/// A decode error caused by the source failing underneath is reported as that I/O
+/// error, so it is classified as a source problem.
+fn source_cause(e: crate::Error, last: &LastIoError) -> crate::Error {
+    match (e, last.lock().unwrap_or_else(|p| p.into_inner()).take()) {
+        (crate::Error::Decode(_), Some((kind, msg)))
+            if kind != std::io::ErrorKind::UnexpectedEof =>
+        {
+            crate::Error::Io(std::io::Error::new(kind, msg))
+        }
+        (e, _) => e,
+    }
+}
+
+fn open_decoder(
+    ctx: &LoadCtx,
+    rel_path: &str,
+    rate: u32,
+    last: &LastIoError,
+) -> crate::Result<Decoder> {
     let mut reader = ctx.source.open(rel_path)?;
     let len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
@@ -97,7 +149,11 @@ fn open_decoder(ctx: &LoadCtx, rel_path: &str, rate: u32) -> crate::Result<Decod
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    Decoder::open(Box::new(prefetch), Some(len), ext, rate)
+    let tapped = TapErrors {
+        inner: prefetch,
+        last: last.clone(),
+    };
+    Decoder::open(Box::new(tapped), Some(len), ext, rate).map_err(|e| source_cause(e, last))
 }
 
 fn deck_thread(shared: &DeckShared, ctx: &LoadCtx, rel_path: &str, rate: u32, skip_frames: u64) {
@@ -105,10 +161,13 @@ fn deck_thread(shared: &DeckShared, ctx: &LoadCtx, rel_path: &str, rate: u32, sk
         shared.lock().phase = phase;
         (ctx.wake)();
     };
-    let mut dec = match open_decoder(ctx, rel_path, rate) {
+    let last_io = LastIoError::default();
+    let mut dec = match open_decoder(ctx, rel_path, rate, &last_io) {
         Ok(d) => d,
-        Err(e) => return set_phase(Phase::Failed(e.to_string())),
+        Err(e) => return set_phase(Phase::Failed(Failure::from_error(&e))),
     };
+    // Errors the probe got past are not the cause of a later failure.
+    last_io.lock().unwrap_or_else(|p| p.into_inner()).take();
     {
         let mut b = shared.lock();
         b.duration_ms = dec.duration_ms();
@@ -138,7 +197,10 @@ fn deck_thread(shared: &DeckShared, ctx: &LoadCtx, rel_path: &str, rate: u32, sk
                 drop(b);
                 (ctx.wake)();
             }
-            Err(e) => return set_phase(Phase::Failed(e.to_string())),
+            Err(e) => {
+                let e = source_cause(e, &last_io);
+                return set_phase(Phase::Failed(Failure::from_error(&e)));
+            }
         }
     }
 }
@@ -168,7 +230,7 @@ pub(super) struct Status {
     pub(super) buffered: usize,
     /// No more data will arrive.
     pub(super) done: bool,
-    pub(super) error: Option<String>,
+    pub(super) error: Option<Failure>,
     pub(super) decoded_any: bool,
     pub(super) duration_ms: Option<u64>,
 }
@@ -229,7 +291,7 @@ impl Deck {
     }
 
     /// Opening or decoding failed before any audio came out.
-    pub(super) fn failed_early(&self) -> Option<String> {
+    pub(super) fn failed_early(&self) -> Option<Failure> {
         let s = self.status();
         if s.decoded_any {
             None
