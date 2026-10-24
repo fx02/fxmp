@@ -38,6 +38,14 @@ pub fn init(app: &AppHandle) {
     });
 }
 
+/// Windows needs an HWND for media controls, which is not wired up yet (the
+/// Windows pass comes later), so media keys are macOS-only for now.
+#[cfg(not(target_os = "macos"))]
+fn create_controls(_app: &AppHandle) -> Result<MediaControls, String> {
+    Err("not supported on this platform yet".into())
+}
+
+#[cfg(target_os = "macos")]
 fn create_controls(app: &AppHandle) -> Result<MediaControls, String> {
     let mut controls = MediaControls::new(PlatformConfig {
         display_name: "SMB Music Player",

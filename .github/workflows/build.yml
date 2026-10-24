@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Keep in sync with rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Core tests (live tests stay ignored)
+        run: cargo test -p smp-core
+      - name: App tests
+        run: cargo test -p smb-music-player
+      - name: UI tests
+        run: node --test ui/*.test.mjs
+      - uses: tauri-apps/tauri-action@v0
+        with:
+          args: --target universal-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Core tests (live tests stay ignored)
+        run: cargo test -p smp-core
+      - uses: tauri-apps/tauri-action@v0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: error
