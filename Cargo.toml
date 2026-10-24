@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/core"]
+
+# smb-transport 0.12.1 with TCP_NODELAY enabled (see vendor/smb-transport/SMP-PATCH.md).
+[patch.crates-io]
+smb-transport = { path = "vendor/smb-transport" }
