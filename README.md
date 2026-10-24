@@ -65,8 +65,22 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
   Right-click (or ⋯) on a genre: "Merge into…" lists the genres that have
   tracks; typing in its search field also finds the other known genres.
   Merging a genre also moves the subgenres filed under it.
-- **Artists** tab: search for an artist, click it to list the albums, click an
-  album to play it in order.
+- **Artists** tab: search for an artist, click it to list the albums (with the
+  year of their earliest track), click an album to play it in order.
+- The year is shown with the track wherever it appears: "Artist – Title (1991)"
+  in the window, the menu bar menu and its tooltip. A track without a year in
+  its tags shows none. The year comes from the date/year tag (the first
+  4-digit year, 1900–2100).
+- **Unreadable** tab (with the count): files that could not be played, or
+  whose tags could not be read during a scan, with the full path on the server
+  (`smb://host/share/path/file.mp3`, from the server it failed on, never with
+  the username or password), the reason (file not found, timed out, server
+  unreachable, cannot decode, unsupported format, tags unreadable, read error),
+  how often it failed and when. "Copy path" / "Copy all" (one line per file:
+  path, tab, reason) put it on the clipboard; "Retry" / "Retry all" let the
+  files play again. A track that failed 3 times in a row is skipped until the
+  next refresh; the list keeps it until it plays, is retried or its file
+  changes. Banned tracks are not listed there (see Settings).
 - Window controls: ⏯ pause, ⏭ next, 🚫 "never play this track again" (asks for
   confirmation: click again within 3 s), and a volume slider. Banned tracks come
   back with the **Restore** button in Settings.
@@ -74,6 +88,18 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
   the menu bar menu included.
 - **Settings → Playback**: output device, crossfade on/off and its length
   (1–10 s), and "Normalize volume".
+- **Settings → Danger zone** (each asks for confirmation first):
+  - **Reset settings to defaults**: volume, crossfade, output device,
+    normalization, notifications, start at login (the login item is removed)
+    and the last genre selection go back to their defaults; the language stays.
+    The servers and passwords stay unless "Also forget servers and passwords"
+    is ticked, which also deletes the passwords from the keychain.
+  - **Clear library**: stops a running scan and the music and empties the
+    library (tracks, genres, genre merges, bans, unreadable list, shuffle
+    history). Settings stay. "Refresh library" then reads the music again.
+- **Notifications** (if turned on) show "Artist – Title" and the year, with no
+  picture. macOS always draws the app's icon on a notification; an app cannot
+  remove it.
 - Menu bar: **left click on the icon = next track**; right click opens the menu
   (current track, pause, genre, ban, show window, quit).
 - **F8** is pause/resume, **F9** next (Control Center works too).
@@ -109,6 +135,10 @@ The language then appears in Settings → Language.
 - Listing the folder on the server takes 15–40 s and shows no progress.
 - The first full scan (~59,000 files) takes roughly 25–75 min, but genres
   appear while it runs.
+- After updating to the version that shows years, the next "Refresh library"
+  reads the tags of every file again (once), which takes about as long as a
+  first scan. Bans, failure counts, genre merges and the shuffle history are
+  kept, and the library stays playable meanwhile.
 - If a track is played before you answer the keychain prompt, tracks are
   skipped until the password is available.
 - Windows: CI builds the `.msi`/`.exe`, but media keys (souvlaki needs an HWND)
@@ -156,6 +186,12 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] The keychain prompt ("Always Allow"), and tracks play normally afterwards.
 - [ ] Switching to the backup server when the main one is unreachable.
 - [ ] Genre chip, ban and "Restore" behave correctly during real listening.
+- [ ] After the first "Refresh library" on this version, years appear (window,
+      menu bar label and tooltip, albums) and bans are still there.
+- [ ] Unreadable tab: "Copy path" and "Copy all" put the text on the clipboard;
+      "Retry" removes a row; the count updates after a failed track.
+- [ ] Reset settings (with and without "Also forget servers and passwords") and
+      Clear library behave as described, and the empty library offers "Refresh library".
 
 ## SMB client
 
