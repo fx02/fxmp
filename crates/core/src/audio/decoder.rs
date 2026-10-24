@@ -16,6 +16,7 @@ use symphonia::core::probe::Hint;
 use crate::source::ReadSeek;
 use crate::{Error, Result};
 
+const MAX_BAD_READS: u32 = 100;
 const RESAMPLE_CHUNK: usize = 1024;
 const CENTER_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
@@ -107,27 +108,49 @@ impl Downmix {
     }
 }
 
+/// Rate conversion state for one run of constant source rate.
+struct Resample {
+    rs: FftFixedIn<f32>,
+    /// Source-rate stereo frames waiting for a full resampler chunk (planar).
+    pending: [Vec<f32>; 2],
+    /// Start of the unconsumed part of `pending`.
+    offset: usize,
+    /// Allocated once; sized for the resampler's maximum output.
+    out: Vec<Vec<f32>>,
+}
+
+impl Resample {
+    fn new(src_rate: u32, out_rate: u32) -> Result<Self> {
+        let rs = FftFixedIn::<f32>::new(src_rate as usize, out_rate as usize, RESAMPLE_CHUNK, 2, 2)
+            .map_err(decode_err)?;
+        let out = rs.output_buffer_allocate(true);
+        Ok(Self { rs, pending: [Vec::new(), Vec::new()], offset: 0, out })
+    }
+}
+
 pub struct Decoder {
     format: Box<dyn FormatReader>,
     codec: Box<dyn CodecDecoder>,
     track_id: u32,
     downmix: Downmix,
     sample_buf: Option<SampleBuffer<f32>>,
-    resampler: Option<FftFixedIn<f32>>,
+    /// Reused interleaved-stereo scratch for one decoded packet.
+    stereo: Vec<f32>,
+    resample: Option<Resample>,
     /// Frames still to drop from the resampler output (its start-up delay).
     skip_frames: usize,
-    /// Source-rate stereo frames waiting for a full resampler chunk.
-    pending: [Vec<f32>; 2],
     /// Output-rate interleaved stereo ready to hand out.
     ready: VecDeque<f32>,
     duration_ms: Option<u64>,
     got_samples: bool,
-    /// Source frames fed in so far; bounds the flushed resampler output.
-    src_frames: u64,
-    /// Samples already handed out by `read`.
-    emitted_samples: u64,
+    /// Current source layout, to detect mid-stream changes.
+    cur_rate: u32,
+    cur_channels: Channels,
+    /// Source frames fed in / output frames queued since the last (re)build of `resample`;
+    /// they bound the flushed resampler output.
+    seg_src_frames: u64,
+    seg_out_frames: u64,
     out_rate: u32,
-    src_rate: u32,
     ended: bool,
 }
 
@@ -163,64 +186,82 @@ impl Decoder {
             (Some(n), Some(r)) if r > 0 => Some(n * 1000 / r as u64),
             _ => None,
         };
-        let (resampler, skip_frames) = if src_rate != out_rate {
-            let r = FftFixedIn::<f32>::new(src_rate as usize, out_rate as usize, RESAMPLE_CHUNK, 2, 2)
-                .map_err(decode_err)?;
-            let delay = r.output_delay();
-            (Some(r), delay)
-        } else {
-            (None, 0)
-        };
+        let (resample, skip_frames) = Self::make_resample(src_rate, out_rate)?;
         Ok(Self {
             format,
             codec,
             track_id,
             downmix: Downmix::new(channels),
             sample_buf: None,
-            resampler,
+            stereo: Vec::new(),
+            resample,
             skip_frames,
-            pending: [Vec::new(), Vec::new()],
             ready: VecDeque::new(),
             duration_ms,
             got_samples: false,
-            src_frames: 0,
-            emitted_samples: 0,
+            cur_rate: src_rate,
+            cur_channels: channels,
+            seg_src_frames: 0,
+            seg_out_frames: 0,
             out_rate,
-            src_rate,
             ended: false,
         })
+    }
+
+    fn make_resample(src_rate: u32, out_rate: u32) -> Result<(Option<Resample>, usize)> {
+        if src_rate == out_rate {
+            return Ok((None, 0));
+        }
+        let r = Resample::new(src_rate, out_rate)?;
+        let delay = r.rs.output_delay();
+        Ok((Some(r), delay))
     }
 
     pub fn duration_ms(&self) -> Option<u64> {
         self.duration_ms
     }
 
-    /// Fills `out` with interleaved stereo samples. `Ok(0)` means end of stream;
-    /// otherwise at least one frame is written (`out` is filled unless the stream ends).
+    /// Fills `out` with interleaved stereo samples and returns how many it wrote.
+    /// `out` must hold at least one frame (2 samples); an odd trailing sample is left
+    /// untouched. `Ok(0)` means end of stream; otherwise `out` is filled unless the
+    /// stream ends first.
     pub fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+        debug_assert!(out.len() >= 2, "read needs room for at least one stereo frame");
         let want = out.len() & !1; // whole frames only
         let mut n = 0;
         while n < want {
-            if let Some(s) = self.ready.pop_front() {
-                out[n] = s;
-                n += 1;
-                self.emitted_samples += 1;
+            if self.ready.is_empty() {
+                if self.ended {
+                    break;
+                }
+                self.fill()?;
                 continue;
             }
-            if self.ended {
-                break;
-            }
-            self.fill()?;
+            let take = (want - n).min(self.ready.len());
+            let (a, b) = self.ready.as_slices();
+            let from_a = take.min(a.len());
+            out[n..n + from_a].copy_from_slice(&a[..from_a]);
+            out[n + from_a..n + take].copy_from_slice(&b[..take - from_a]);
+            self.ready.drain(..take);
+            n += take;
         }
         Ok(n)
     }
 
     /// Decodes one more packet (or finishes the stream), appending to `ready`.
     fn fill(&mut self) -> Result<()> {
+        let mut bad_reads = 0;
         let packet = loop {
             match self.format.next_packet() {
                 Ok(p) if p.track_id() == self.track_id => break p,
                 Ok(_) => continue,
+                // Container-level damage (e.g. an Ogg page CRC mismatch): resync on the next
+                // packet, but give up if the reader makes no progress.
+                Err(SymError::DecodeError(msg)) if bad_reads < MAX_BAD_READS => {
+                    bad_reads += 1;
+                    log::debug!("skipping damaged container data: {msg}");
+                    continue;
+                }
                 Err(SymError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return self.finish(),
                 Err(SymError::ResetRequired) => return self.finish(),
                 Err(SymError::IoError(e)) => return Err(Error::Io(e)),
@@ -229,11 +270,16 @@ impl Decoder {
         };
         let decoded = match self.codec.decode(&packet) {
             Ok(d) => d,
+            // A codec-level failure means this packet is corrupt, not that the source failed
+            // (reader errors surface from `next_packet`).
             Err(SymError::DecodeError(msg)) => {
                 log::debug!("skipping undecodable packet: {msg}");
                 return Ok(());
             }
-            Err(SymError::IoError(e)) => return Err(Error::Io(e)),
+            Err(SymError::IoError(e)) => {
+                log::debug!("skipping corrupt packet: {e}");
+                return Ok(());
+            }
             Err(e) => return Err(decode_err(e)),
         };
         let frames = decoded.frames();
@@ -241,27 +287,48 @@ impl Decoder {
             return Ok(());
         }
         let spec = *decoded.spec();
+        let nch = spec.channels.count();
         let buf = self
             .sample_buf
             .get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
-        if buf.capacity() < frames * spec.channels.count() {
+        if buf.capacity() < frames * nch {
             *buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         }
         buf.copy_interleaved_ref(decoded);
-        let nch = self.downmix.gains.len();
-        let mut stereo = Vec::with_capacity(frames * 2);
+        // `decoded` borrows the codec; it is no longer needed past this point.
+        if spec.rate != self.cur_rate || spec.channels != self.cur_channels {
+            self.rebuild_for(spec.rate, spec.channels)?;
+        }
+        let buf = self.sample_buf.as_ref().expect("sample buffer was just filled");
+        self.stereo.clear();
         for frame in buf.samples().chunks_exact(nch) {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             for (s, (gl, gr)) in frame.iter().zip(&self.downmix.gains) {
                 l += s * gl;
                 r += s * gr;
             }
-            stereo.push(l);
-            stereo.push(r);
+            self.stereo.push(l);
+            self.stereo.push(r);
         }
         self.got_samples = true;
-        self.src_frames += frames as u64;
-        self.push_source_frames(&stereo)
+        self.seg_src_frames += frames as u64;
+        self.push_source_frames()
+    }
+
+    /// The stream changed sample rate or channel layout: drain the old resampler and
+    /// continue with a downmix and resampler for the new layout.
+    fn rebuild_for(&mut self, rate: u32, channels: Channels) -> Result<()> {
+        log::debug!("stream spec changed to {rate} Hz, {} ch", channels.count());
+        self.flush_resampler()?;
+        self.downmix = Downmix::new(channels);
+        let (resample, skip) = Self::make_resample(rate, self.out_rate)?;
+        self.resample = resample;
+        self.skip_frames = skip;
+        self.cur_rate = rate;
+        self.cur_channels = channels;
+        self.seg_src_frames = 0;
+        self.seg_out_frames = 0;
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -269,60 +336,80 @@ impl Decoder {
         if !self.got_samples {
             return Err(Error::Decode("stream ended before any samples were decoded".into()));
         }
-        if let Some(rs) = self.resampler.as_mut() {
-            // Flush the remaining partial chunk, plus enough silence to drain the filter delay.
-            let rest = [std::mem::take(&mut self.pending[0]), std::mem::take(&mut self.pending[1])];
-            let mut chunks = vec![rest];
-            chunks.push([vec![0.0; RESAMPLE_CHUNK], vec![0.0; RESAMPLE_CHUNK]]);
-            for chunk in chunks {
-                if chunk[0].is_empty() {
-                    continue;
-                }
-                let out = rs.process_partial(Some(&chunk), None).map_err(decode_err)?;
-                Self::queue(&mut self.ready, &mut self.skip_frames, &out);
-            }
-            // Drop the padding the flush added beyond the true resampled length.
-            let expected = (self.src_frames * self.out_rate as u64).div_ceil(self.src_rate as u64);
-            let emitted = self.emitted_samples / 2;
-            let keep = expected.saturating_sub(emitted) as usize;
-            self.ready.truncate(keep * 2);
-        }
-        Ok(())
+        self.flush_resampler()
     }
 
-    fn push_source_frames(&mut self, stereo: &[f32]) -> Result<()> {
-        let Some(rs) = self.resampler.as_mut() else {
-            self.ready.extend(stereo.iter().copied());
+    /// Emits the resampler's tail (partial chunk plus filter delay), limited to the
+    /// true resampled length of the current segment.
+    fn flush_resampler(&mut self) -> Result<()> {
+        let Some(r) = self.resample.take() else {
             return Ok(());
         };
-        for f in stereo.chunks_exact(2) {
-            self.pending[0].push(f[0]);
-            self.pending[1].push(f[1]);
+        let Resample { mut rs, pending, offset, mut out } = r;
+        let expected = (self.seg_src_frames * self.out_rate as u64).div_ceil(self.cur_rate as u64);
+        let mut budget = expected.saturating_sub(self.seg_out_frames) as usize;
+        let rest = [&pending[0][offset..], &pending[1][offset..]];
+        if !rest[0].is_empty() {
+            let (_, n) = rs.process_partial_into_buffer(Some(&rest), &mut out, None).map_err(decode_err)?;
+            Self::queue(&mut self.ready, &mut self.skip_frames, &out, n, Some(&mut budget));
         }
-        while self.pending[0].len() >= rs.input_frames_next() {
-            let need = rs.input_frames_next();
-            let input = [self.pending[0][..need].to_vec(), self.pending[1][..need].to_vec()];
-            self.pending[0].drain(..need);
-            self.pending[1].drain(..need);
-            let out = rs.process(&input, None).map_err(decode_err)?;
-            Self::queue(&mut self.ready, &mut self.skip_frames, &out);
+        let (_, n) = rs.process_partial_into_buffer(None::<&[&[f32]]>, &mut out, None).map_err(decode_err)?;
+        Self::queue(&mut self.ready, &mut self.skip_frames, &out, n, Some(&mut budget));
+        Ok(())
+    }
+
+    fn push_source_frames(&mut self) -> Result<()> {
+        let Some(r) = self.resample.as_mut() else {
+            self.ready.extend(self.stereo.iter().copied());
+            return Ok(());
+        };
+        for f in self.stereo.as_chunks::<2>().0 {
+            r.pending[0].push(f[0]);
+            r.pending[1].push(f[1]);
+        }
+        loop {
+            let need = r.rs.input_frames_next();
+            if r.pending[0].len() - r.offset < need {
+                break;
+            }
+            let input = [&r.pending[0][r.offset..r.offset + need], &r.pending[1][r.offset..r.offset + need]];
+            let (_, n) = r.rs.process_into_buffer(&input, &mut r.out, None).map_err(decode_err)?;
+            r.offset += need;
+            let before = self.ready.len();
+            Self::queue(&mut self.ready, &mut self.skip_frames, &r.out, n, None);
+            self.seg_out_frames += ((self.ready.len() - before) / 2) as u64;
+        }
+        // Compact once per packet; what remains is less than one chunk.
+        if r.offset > 0 {
+            for ch in &mut r.pending {
+                ch.drain(..r.offset);
+            }
+            r.offset = 0;
         }
         Ok(())
     }
 
-    fn queue(ready: &mut VecDeque<f32>, skip: &mut usize, out: &[Vec<f32>]) {
-        let frames = out[0].len();
+    /// Appends the first `frames` frames of planar `out` to `ready`, after dropping
+    /// `skip` start-up frames and (when given) at most `budget` frames.
+    fn queue(ready: &mut VecDeque<f32>, skip: &mut usize, out: &[Vec<f32>], frames: usize, budget: Option<&mut usize>) {
         let drop = (*skip).min(frames);
         *skip -= drop;
-        for i in drop..frames {
-            ready.push_back(out[0][i]);
-            ready.push_back(out[1][i]);
+        let mut end = frames;
+        if let Some(b) = budget {
+            end = end.min(drop + *b);
+            *b -= end - drop;
+        }
+        for (l, r) in out[0][drop..end].iter().zip(&out[1][drop..end]) {
+            ready.push_back(*l);
+            ready.push_back(*r);
         }
     }
 }
 
 fn map_open_err(e: SymError) -> Error {
     match e {
+        // A file that ends while probing is truncated or tiny: a bad file, not a source fault.
+        SymError::IoError(io) if io.kind() == io::ErrorKind::UnexpectedEof => decode_err(io),
         SymError::IoError(io) => Error::Io(io),
         other => decode_err(other),
     }
@@ -370,7 +457,11 @@ mod tests {
             let frames = s.len() / 2;
             assert!((frames as i64 - 48000).abs() <= 2400, "{name}: {frames} frames");
             assert!(rms(&s) > 0.01, "{name}: rms {}", rms(&s));
-            assert!(d.duration_ms().map_or(true, |ms| (ms as i64 - 1000).abs() < 100), "{name}");
+            match (name, d.duration_ms()) {
+                ("tone.mp3", None) => {} // no frame count without a Xing/Info header
+                (_, Some(ms)) => assert!((ms as i64 - 1000).abs() < 100, "{name}: {ms} ms"),
+                (_, None) => panic!("{name}: duration should be known"),
+            }
         }
     }
 
@@ -391,8 +482,62 @@ mod tests {
         let mut d = open("fixtures-audio", "mono.flac", 44100).unwrap();
         let s = drain(&mut d);
         assert!(rms(&s) > 0.01);
-        for f in s.chunks_exact(2) {
+        for f in s.as_chunks::<2>().0 {
             assert_eq!(f[0], f[1]);
+        }
+    }
+
+    #[test]
+    fn mono_resampled_is_duplicated() {
+        let mut d = open("fixtures-audio", "mono.flac", 48000).unwrap();
+        let s = drain(&mut d);
+        assert!((s.len() as i64 / 2 - 48000).abs() <= 2400);
+        assert!(rms(&s) > 0.01);
+        assert!(s.as_chunks::<2>().0.iter().all(|f| f[0] == f[1]));
+    }
+
+    #[test]
+    fn damaged_packet_mid_file_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["tone.mp3", "tone.flac", "tone.ogg"] {
+            let mut data = std::fs::read(path("fixtures", name)).unwrap();
+            let mid = data.len() / 2;
+            for b in &mut data[mid..mid + 64] {
+                *b ^= 0xA5;
+            }
+            let p = dir.path().join(name);
+            std::fs::write(&p, &data).unwrap();
+            let len = data.len() as u64;
+            let ext = p.extension().unwrap().to_str().unwrap();
+            let opened = Decoder::open(Box::new(File::open(&p).unwrap()), Some(len), ext, 44100);
+            let mut d = match opened {
+                Ok(d) => d,
+                // Symphonia's Ogg reader validates page CRCs while opening, so damage to a
+                // small file is reported as a bad file there; it must not be an Io error.
+                Err(Error::Decode(_)) if name == "tone.ogg" => continue,
+                Err(e) => panic!("{name}: unexpected open error {e:?}"),
+            };
+            let mut frames = 0;
+            let mut buf = vec![0.0f32; 4096];
+            loop {
+                match d.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => frames += n / 2,
+                    Err(e) => panic!("{name}: damaged packet should be skipped, got {e:?}"),
+                }
+            }
+            assert!(frames >= 35280, "{name}: only {frames} frames survived");
+        }
+    }
+
+    #[test]
+    fn truncated_file_is_decode_error_not_io() {
+        let data = std::fs::read(path("fixtures", "tone.flac")).unwrap();
+        let cut = std::io::Cursor::new(data[..10].to_vec());
+        match Decoder::open(Box::new(cut), Some(10), "flac", 44100) {
+            Err(Error::Decode(_)) => {}
+            Err(other) => panic!("expected Decode, got {other:?}"),
+            Ok(_) => panic!("tiny file must not open"),
         }
     }
 
