@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use smp_core::source::{
-    FailoverSource, FileEntry, MusicSource, ReadSeek, SmbConfig, SmbSource, SourceError,
+    FailoverSource, FileEntry, MusicSource, ReadSeek, SmbConfig, SmbSource, SourceError, WalkReport,
 };
 
 use crate::credentials::CredentialStore;
@@ -244,7 +244,7 @@ impl LazySmb {
 }
 
 impl MusicSource for LazySmb {
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
         self.get()?.walk(on_entry)
     }
 
@@ -335,7 +335,7 @@ impl AppSource {
 }
 
 impl MusicSource for AppSource {
-    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
+    fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
         self.current()?.failover.walk(on_entry)
     }
 

@@ -123,12 +123,14 @@ export function scanProgressText(p, t) {
 export function scanDoneText(d, t) {
   if (d.cancelled) return d.cancel_reason || t("scan.cancelled");
   if (d.error) return t("scan.failed", { error: d.error });
-  return t("scan.done", {
+  const done = t("scan.done", {
     files: t("scan.files", { n: d.total }),
     read: d.read,
     failed: d.failed,
     removed: d.removed,
   });
+  // Folders the share would not list: their tracks were kept, not removed.
+  return d.skipped_dirs ? `${done} ${t("scan.skipped_dirs", { n: d.skipped_dirs })}` : done;
 }
 
 const CONN_STATUSES = ["ok", "secondary", "unreachable", "auth"];

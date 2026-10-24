@@ -130,6 +130,10 @@
   "scan.cancelled": "Scan cancelled.",
   "scan.failed": "Scan failed: {error}",
   "scan.done": "Library refreshed: {files}. New or changed: {read}, unreadable: {failed}, removed: {removed}.",
+  "scan.skipped_dirs": {
+    "one": "{n} folder could not be read; its tracks were kept.",
+    "other": "{n} folders could not be read; their tracks were kept."
+  },
   "scan.cancelled_settings": "The server settings changed, so the scan was cancelled.",
   "scan.cancelled_clear": "The library was cleared, so the scan was cancelled.",
   "tray.nothing_playing": "Nothing playing",

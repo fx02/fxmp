@@ -132,6 +132,11 @@
   "scan.cancelled": "Skeniranje je prekinuto.",
   "scan.failed": "Skeniranje nije uspjelo: {error}",
   "scan.done": "Katalog osvježen: {files}. Novo ili promijenjeno: {read}, nečitljivo: {failed}, uklonjeno: {removed}.",
+  "scan.skipped_dirs": {
+    "one": "{n} mapa nije se mogla pročitati; njezine pjesme su zadržane.",
+    "few": "{n} mape nisu se mogle pročitati; njihove pjesme su zadržane.",
+    "other": "{n} mapa nije se moglo pročitati; njihove pjesme su zadržane."
+  },
   "scan.cancelled_settings": "Postavke servera su promijenjene pa je skeniranje prekinuto.",
   "scan.cancelled_clear": "Biblioteka je ispražnjena pa je skeniranje prekinuto.",
   "tray.nothing_playing": "Ništa ne svira",

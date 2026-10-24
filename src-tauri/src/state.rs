@@ -76,6 +76,8 @@ struct ScanDonePayload {
     unchanged: usize,
     failed: usize,
     removed: usize,
+    /// Folders that could not be listed (their tracks were kept).
+    skipped_dirs: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -486,13 +488,14 @@ fn run_scan(app: &AppHandle) {
     let payload = match result {
         Ok(r) => {
             log::info!(
-                "scan finished in {:.1} s: {} files, {} read, {} unchanged, {} failed, {} removed{}",
+                "scan finished in {:.1} s: {} files, {} read, {} unchanged, {} failed, {} removed, {} folders skipped{}",
                 started.elapsed().as_secs_f32(),
                 r.total,
                 r.read,
                 r.unchanged,
                 r.failed,
                 r.removed,
+                r.skipped_dirs.len(),
                 if cancelled { " (cancelled)" } else { "" }
             );
             ScanDonePayload {
@@ -505,6 +508,7 @@ fn run_scan(app: &AppHandle) {
                 unchanged: r.unchanged,
                 failed: r.failed,
                 removed: r.removed,
+                skipped_dirs: r.skipped_dirs.len(),
             }
         }
         Err(e) => {
@@ -622,7 +626,7 @@ mod tests {
     /// `start_scan`/`run_scan` do.
     #[test]
     fn taking_the_scan_slot_cancels_a_running_scan_and_keeps_new_ones_out() {
-        use smp_core::source::{FileEntry, ReadSeek};
+        use smp_core::source::{FileEntry, ReadSeek, WalkReport};
         use std::sync::atomic::AtomicUsize;
 
         struct Slow {
@@ -630,7 +634,7 @@ mod tests {
             opened: AtomicUsize,
         }
         impl MusicSource for Slow {
-            fn walk(&self, f: &mut dyn FnMut(FileEntry)) -> Result<(), SourceError> {
+            fn walk(&self, f: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
                 for i in 0..200 {
                     f(FileEntry {
                         rel_path: format!("Rock/{i}.mp3"),
@@ -638,7 +642,7 @@ mod tests {
                         mtime: 1,
                     });
                 }
-                Ok(())
+                Ok(WalkReport::default())
             }
             fn open(&self, _: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
                 self.opened.fetch_add(1, Ordering::SeqCst);

@@ -88,6 +88,10 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
   and everything else it had. After network trouble (or a read error, or the
   file not being found) the next refresh tries it again; a file whose tags or
   audio are broken waits until it changes.
+- A folder on the share that cannot be listed during a refresh is skipped and
+  reported ("N folders could not be read; their tracks were kept"): its tracks
+  stay in the library as they were (bans, loudness), instead of being removed.
+  A refresh that fails or is cancelled leaves the library as it was.
 - Window controls: ⏯ pause, ⏭ next, 🚫 "never play this track again" (asks for
   confirmation: click again within 3 s), and a volume slider. Banned tracks come
   back with the **Restore** button in Settings.
