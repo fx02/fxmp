@@ -68,6 +68,9 @@ pub struct ScanOptions {
     /// Rebuild genres after this many newly committed files, so a long first
     /// scan becomes playable before it ends (`usize::MAX` = only at the end).
     pub rebuild_every: usize,
+    /// Also rebuild once this much time has passed since the last rebuild and
+    /// something new was committed, so genres appear early even on a slow share.
+    pub rebuild_interval: Duration,
 }
 
 impl Default for ScanOptions {
@@ -75,6 +78,7 @@ impl Default for ScanOptions {
         Self {
             workers: 8,
             rebuild_every: 5000,
+            rebuild_interval: Duration::from_secs(30),
         }
     }
 }
@@ -213,7 +217,8 @@ fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult
 /// Tags `files` on `opts.workers` threads and upserts the results from the
 /// calling thread in transactions of at most [`CHUNK`] files (whatever arrived
 /// within [`BATCH_WINDOW`]), rebuilding genres after every
-/// `opts.rebuild_every` committed files. `on_written(entry, failed)` runs after
+/// `opts.rebuild_every` committed files or `opts.rebuild_interval`, whichever
+/// comes first, and on cancel. `on_written(entry, failed)` runs after
 /// each upsert. Stops early (keeping what was written) when `cancel` is set.
 fn read_parallel(
     source: &dyn MusicSource,
@@ -246,6 +251,7 @@ fn read_parallel(
 
         let mut finished = false;
         let mut since_rebuild = 0;
+        let mut last_rebuild = Instant::now();
         let mut batch: Vec<ReadResult> = Vec::with_capacity(CHUNK);
         while !finished && !cancel.load(Ordering::Relaxed) {
             // Collect results first: a write transaction is never held while
@@ -278,10 +284,18 @@ fn read_parallel(
             // Keep a long first scan playable. Not needed once all files are
             // in: the caller rebuilds after `finish_scan`. Never deletes tracks.
             since_rebuild += written;
-            if since_rebuild >= opts.rebuild_every && !finished {
+            let due = since_rebuild >= opts.rebuild_every
+                || last_rebuild.elapsed() >= opts.rebuild_interval;
+            if due && !finished {
                 catalog.rebuild_genres()?;
                 since_rebuild = 0;
+                last_rebuild = Instant::now();
             }
+        }
+        // A cancelled scan returns without the final rebuild: make what it
+        // wrote playable by genre.
+        if cancel.load(Ordering::Relaxed) && since_rebuild > 0 {
+            catalog.rebuild_genres()?;
         }
         Ok(())
     })
@@ -709,8 +723,7 @@ mod tests {
         }
     }
 
-    /// First scan of 1200 files cancelled after ~700 opens: chunks of 500 commit
-    /// before the cancel, so genres exist only if rebuilt periodically.
+    /// First scan of 1200 files cancelled after ~700 opens (no timed rebuild).
     fn cancelled_first_scan_genres(rebuild_every: usize) -> Vec<crate::catalog::GenreCount> {
         let cancel = AtomicBool::new(false);
         let src = CancellingSource {
@@ -724,6 +737,7 @@ mod tests {
         let opts = ScanOptions {
             workers: 1,
             rebuild_every,
+            rebuild_interval: Duration::from_secs(3600),
         };
         let r = scan_with(&src, &mut cat, &mut |_| {}, &cancel, &opts).unwrap();
         assert!(r.read >= 500 && r.read < 1200, "{r:?}");
@@ -735,8 +749,87 @@ mod tests {
     fn genres_rebuilt_periodically_during_first_scan() {
         assert_eq!(ScanOptions::default().rebuild_every, 5000);
         assert!(!cancelled_first_scan_genres(500).is_empty());
-        // Control: without a periodic rebuild a cancelled first scan has no genres.
-        assert!(cancelled_first_scan_genres(usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn cancelled_scan_rebuilds_genres_of_what_it_wrote() {
+        // No periodic rebuild at all: the cancel itself rebuilds.
+        assert!(!cancelled_first_scan_genres(usize::MAX).is_empty());
+    }
+
+    /// Source of `files` tone MP3s; when file number `probe_at` is opened it waits
+    /// for the writer to commit, then counts genres through its own connection
+    /// to the catalog file `db`, as the UI would see them mid-scan.
+    struct ProbeSource {
+        files: usize,
+        probe_at: usize,
+        opens: AtomicUsize,
+        db: PathBuf,
+        genres_seen: std::sync::Mutex<Option<usize>>,
+        bytes: Vec<u8>,
+    }
+
+    impl MusicSource for ProbeSource {
+        fn walk(
+            &self,
+            on_entry: &mut dyn FnMut(FileEntry),
+        ) -> std::result::Result<(), SourceError> {
+            for i in 0..self.files {
+                on_entry(FileEntry {
+                    rel_path: format!("Rock/f{i}.mp3"),
+                    size: self.bytes.len() as u64,
+                    mtime: 1_700_000_000,
+                });
+            }
+            Ok(())
+        }
+        fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+            if self.opens.fetch_add(1, Ordering::SeqCst) + 1 == self.probe_at {
+                std::thread::sleep(Duration::from_millis(500));
+                let n = Catalog::open(&self.db).unwrap().genres().unwrap().len();
+                *self.genres_seen.lock().unwrap() = Some(n);
+            }
+            Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+        }
+        fn describe(&self) -> String {
+            "probe".into()
+        }
+    }
+
+    /// Genres visible mid-scan (at file 50 of 100) with only the time trigger.
+    fn genres_mid_scan(rebuild_interval: Duration) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        let mut cat = Catalog::open(&db).unwrap();
+        let src = ProbeSource {
+            files: 100,
+            probe_at: 50,
+            opens: AtomicUsize::new(0),
+            db,
+            genres_seen: std::sync::Mutex::new(None),
+            bytes: fs::read(fixtures().join("tone.mp3")).unwrap(),
+        };
+        let opts = ScanOptions {
+            workers: 1,
+            rebuild_every: usize::MAX,
+            rebuild_interval,
+        };
+        let no = AtomicBool::new(false);
+        let r = scan_with(&src, &mut cat, &mut |_| {}, &no, &opts).unwrap();
+        assert_eq!(r.read, 100);
+        let seen = src.genres_seen.lock().unwrap().expect("probe ran");
+        seen
+    }
+
+    #[test]
+    fn genres_rebuilt_on_a_timer_during_scan() {
+        assert_eq!(
+            ScanOptions::default().rebuild_interval,
+            Duration::from_secs(30)
+        );
+        assert!(genres_mid_scan(Duration::ZERO) > 0);
+        // Control: neither trigger due, nothing rebuilt before the end.
+        assert_eq!(genres_mid_scan(Duration::from_secs(3600)), 0);
     }
 
     #[test]
@@ -798,6 +891,7 @@ mod tests {
         let opts = ScanOptions {
             workers: 1,
             rebuild_every: usize::MAX,
+            rebuild_interval: Duration::from_secs(3600),
         };
         let no = AtomicBool::new(false);
         std::thread::scope(|s| {
