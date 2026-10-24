@@ -382,6 +382,19 @@ impl Catalog {
         Ok(self.conn.query_row(&sql, [id], row_to_track)?)
     }
 
+    /// Display names of the genres a track belongs to, sorted.
+    pub fn track_genres(&self, id: TrackId) -> Result<Vec<String>> {
+        let v = self
+            .conn
+            .prepare_cached(
+                "SELECT g.display FROM track_genres tg JOIN genres g ON g.id = tg.genre_id
+                 WHERE tg.track_id=?1 ORDER BY g.display COLLATE NOCASE, g.display",
+            )?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
     pub fn record_failure(&self, id: TrackId) -> Result<u32> {
         let n: i64 = self.conn.query_row(
             "UPDATE tracks SET fail_count = fail_count + 1 WHERE id=?1 RETURNING fail_count",
@@ -710,5 +723,18 @@ mod tests {
             d2 < Duration::from_millis(200),
             "playable_tracks took {d2:?}"
         );
+    }
+
+    #[test]
+    fn track_genres_lists_display_names() {
+        let c = Catalog::open_in_memory().unwrap();
+        let a = add(&c, "a.mp3", Some("trance; Chill Out"));
+        add(&c, "b.mp3", Some("Trance"));
+        add(&c, "c.mp3", Some("Trance"));
+        let none = add(&c, "d.mp3", None);
+        c.rebuild_genres().unwrap();
+        assert_eq!(c.track_genres(a).unwrap(), vec!["Chill Out", "Trance"]);
+        assert_eq!(c.track_genres(none).unwrap(), vec!["(bez žanra)"]);
+        assert!(c.track_genres(999).unwrap().is_empty());
     }
 }
