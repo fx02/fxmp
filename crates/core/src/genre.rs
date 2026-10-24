@@ -201,8 +201,9 @@ pub const ID3V1_GENRES: [&str; 192] = [
     "Psybient",
 ];
 
-/// "Other" is a placeholder, not a genre: it goes to Unknown.
-const OTHER_CODE: usize = 12;
+/// Codes that are on the list but are not genres; their tracks go to Unknown:
+/// 12 "Other" is a placeholder, and 133 is an offensive term.
+const EXCLUDED_CODES: &[usize] = &[12, 133];
 
 /// Aliases applied to the normalized key (already lowercase alphanumeric). Each one
 /// targets the key of a name in [`ID3V1_GENRES`].
@@ -210,7 +211,6 @@ pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
     ("dnb", "drumandbass"),
     ("dandb", "drumandbass"),
     ("drumnbass", "drumandbass"),
-    ("raphiphop", "hiphop"),
     ("rnb", "rhythmandblues"),
     ("randb", "rhythmandblues"),
     ("psychedelictrance", "psytrance"),
@@ -240,26 +240,59 @@ const SUBGENRE_PARENTS: &[(&str, &str)] = &[
 /// Split a raw genre tag value into individual genre names.
 ///
 /// Separators: `;`, `/`, NUL and ` | `. Parts are trimmed and empty ones dropped.
-/// An ID3v1 reference (`(N)` or bare `N`) is mapped to its genre name.
+/// Because `/` separates genres, a name with a slash in it ("Rap/Hip-Hop") becomes
+/// two names; only the code of "Pop/funk" (62) yields that name whole.
+/// ID3 code references are mapped to their names from [`ID3V1_GENRES`]: a bare `N`,
+/// `(N)`, the ID3v2.3 forms `(N)(M)` and `(N)Refinement` (the refinement is kept
+/// when it is not just the code's name again), and `((text` for a literal `(text`.
 pub fn split_genres(raw: &str) -> Vec<String> {
     raw.replace(" | ", ";")
         .split([';', '/', '\0'])
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|p| {
-            id3v1_name(p)
-                .map(str::to_string)
-                .unwrap_or_else(|| p.to_string())
-        })
+        .flat_map(expand_codes)
         .collect()
 }
 
+/// One separated part -> its genre names, ID3 code references expanded.
+fn expand_codes(part: &str) -> Vec<String> {
+    if let Some(name) = id3v1_name(part) {
+        return vec![name.to_string()];
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = part;
+    while let Some(after) = rest.strip_prefix('(') {
+        let Some(end) = after.find(')') else { break };
+        let Some(name) = code_name(&after[..end]) else {
+            break;
+        };
+        names.push(name.to_string());
+        rest = after[end + 1..].trim_start();
+    }
+    // "((text" stands for a literal "(text".
+    let rest = if rest.starts_with("((") {
+        &rest[1..]
+    } else {
+        rest
+    };
+    let repeats_a_code = names.iter().any(|n| genre_key(n) == genre_key(rest));
+    if !rest.is_empty() && !repeats_a_code {
+        names.push(rest.to_string());
+    }
+    names
+}
+/// The name for a whole part that is a code: `N` or `(N)`.
 fn id3v1_name(part: &str) -> Option<&'static str> {
     let digits = part
         .strip_prefix('(')
         .and_then(|s| s.strip_suffix(')'))
         .unwrap_or(part);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    code_name(digits)
+}
+
+/// The name for the digits of a code, if they are one.
+fn code_name(digits: &str) -> Option<&'static str> {
+    if digits.is_empty() || digits.len() > 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     ID3V1_GENRES.get(digits.parse::<usize>().ok()?).copied()
@@ -304,7 +337,7 @@ fn known_genres() -> &'static HashMap<String, &'static str> {
         ID3V1_GENRES
             .iter()
             .enumerate()
-            .filter(|(code, _)| *code != OTHER_CODE)
+            .filter(|(code, _)| !EXCLUDED_CODES.contains(code))
             .map(|(_, name)| (genre_key(name), *name))
             .collect()
     })
@@ -318,6 +351,28 @@ pub fn known_genre(name: &str) -> Option<KnownGenre> {
     }
     let display = known_genres().get(&key)?.to_string();
     Some(KnownGenre { key, display })
+}
+
+/// The key a genre stored under `old` has now. Older versions had other aliases
+/// (`randb`, `goa`, …) and no parent genres (`deephouse`); keys that are not known
+/// genres, and [`UNKNOWN_KEY`], stay as they are.
+pub fn current_key(old: &str) -> String {
+    if old == UNKNOWN_KEY {
+        return old.to_string();
+    }
+    known_genre(old).map_or_else(|| old.to_string(), |g| g.key)
+}
+
+/// A stored genre selection with its keys brought up to date ([`current_key`]),
+/// in order, without duplicates.
+pub fn migrate_selection(keys: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(keys.len());
+    for key in keys.iter().map(|k| current_key(k)) {
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
 }
 
 /// Display names of all known genres, sorted case-insensitively.
@@ -345,6 +400,55 @@ mod tests {
         assert_eq!(split_genres("(31)"), vec!["Trance"]);
         assert_eq!(split_genres("31"), vec!["Trance"]);
         assert_eq!(split_genres("9999"), vec!["9999"]);
+        // "/" separates genres, so a slash in a name splits it too.
+        assert_eq!(split_genres("Rap/Hip-Hop"), vec!["Rap", "Hip-Hop"]);
+    }
+
+    #[test]
+    fn id3v2_code_references_are_expanded() {
+        assert_eq!(split_genres("(148)"), vec!["Christmas"]);
+        assert_eq!(split_genres("(62)"), vec!["Pop/funk"], "code, not split");
+        assert_eq!(
+            split_genres("(17)Rock"),
+            vec!["Rock"],
+            "refinement repeats the code"
+        );
+        assert_eq!(split_genres("(4)Eurodisco"), vec!["Disco", "Eurodisco"]);
+        assert_eq!(split_genres("(31)(26)"), vec!["Trance", "Ambient"]);
+        assert_eq!(
+            split_genres("(31)(26); Jazz"),
+            vec!["Trance", "Ambient", "Jazz"]
+        );
+        assert_eq!(split_genres("((Live)"), vec!["(Live)"]);
+        assert_eq!(
+            split_genres("(999)Foo"),
+            vec!["(999)Foo"],
+            "unknown code kept as text"
+        );
+    }
+
+    #[test]
+    fn old_keys_migrate_to_the_current_ones() {
+        for (old, new) in [
+            ("randb", "rhythmandblues"),
+            ("goa", "goamusic"),
+            ("jungle", "junglemusic"),
+            ("world", "worldmusic"),
+            ("electronica", "electronic"),
+            ("rocknroll", "rockandroll"),
+            ("deephouse", "house"),
+            ("trance", "trance"),
+            ("zztestpreimenovano", "zztestpreimenovano"),
+            ("_none", "_none"),
+        ] {
+            assert_eq!(current_key(old), new, "{old}");
+        }
+        let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            migrate_selection(&keys(&["randb", "rhythmandblues", "goa"])),
+            keys(&["rhythmandblues", "goamusic"])
+        );
+        assert_eq!(migrate_selection(&[]), Vec::<String>::new());
     }
 
     #[test]
@@ -403,7 +507,6 @@ mod tests {
             ("Drum'n'Bass", "Drum & bass"),
             ("hip hop", "Hip-hop"),
             ("HipHop", "Hip-hop"),
-            ("Rap/Hip-Hop", "Hip-hop"),
             ("rnb", "Rhythm and blues"),
             ("R&B", "Rhythm and blues"),
             ("R'n'B", "Rhythm and blues"),
@@ -454,11 +557,12 @@ mod tests {
         assert_eq!(known(&split_genres("(31)")[0]).as_deref(), Some("Trance"));
         assert_eq!(known(&split_genres("12")[0]), None, "12 is Other");
         let names = known_genre_names();
-        assert_eq!(names.len(), 191);
+        assert_eq!(names.len(), 190);
+        assert_eq!(known(ID3V1_GENRES[133]), None, "133 is an offensive term");
         let mut expected: Vec<&str> = ID3V1_GENRES
             .iter()
             .copied()
-            .filter(|n| *n != "Other")
+            .filter(|n| *n != "Other" && *n != ID3V1_GENRES[133])
             .collect();
         expected.sort_by_key(|s| s.to_lowercase());
         assert_eq!(names, expected, "verbatim names, sorted");

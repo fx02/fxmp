@@ -6,13 +6,15 @@ use std::path::Path;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::genre::{
-    genre_key, known_genre, split_genres, KnownGenre, UNKNOWN_DISPLAY, UNKNOWN_KEY,
+    current_key, genre_key, known_genre, migrate_selection, split_genres, KnownGenre,
+    UNKNOWN_DISPLAY, UNKNOWN_KEY,
 };
 use crate::{Result, TrackId};
 
 /// Version of the genre rules. Opening a catalog older than this re-derives its genres
 /// from the stored tags, so a change to the rules needs no rescan.
-const GENRE_VERSION: i64 = 2;
+/// Version 3 also renames genre keys stored by older versions ([`current_key`]).
+const GENRE_VERSION: i64 = 3;
 /// Consecutive failures after which a track leaves the shuffle until the next scan.
 const MAX_FAILS: i64 = 3;
 
@@ -131,12 +133,61 @@ impl Catalog {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < GENRE_VERSION {
+            let started = std::time::Instant::now();
+            catalog.migrate_genre_keys()?;
             catalog.rebuild_genres()?;
+            log::info!(
+                "catalog: genre rules v{version} -> v{GENRE_VERSION}, genres re-derived in {:.2} s",
+                started.elapsed().as_secs_f32()
+            );
             catalog
                 .conn
                 .execute_batch(&format!("PRAGMA user_version = {GENRE_VERSION}"))?;
         }
         Ok(catalog)
+    }
+
+    /// Renames genre keys that older versions stored, in `selection_state` and
+    /// `genre_rules.from_key`. A row whose new key is already taken is dropped (the
+    /// existing row wins).
+    fn migrate_genre_keys(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let selections: Vec<String> = tx
+            .prepare("SELECT selection_key FROM selection_state")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for old in selections {
+            let keys: Vec<String> = match old.as_str() {
+                "*" => continue,
+                s => s.split('|').map(str::to_string).collect(),
+            };
+            let new = selection_key(&migrate_selection(&keys));
+            if new != old {
+                tx.execute(
+                    "INSERT OR IGNORE INTO selection_state(selection_key, last_first)
+                     SELECT ?2, last_first FROM selection_state WHERE selection_key=?1",
+                    params![old, new],
+                )?;
+                tx.execute("DELETE FROM selection_state WHERE selection_key=?1", [&old])?;
+            }
+        }
+        let rules: Vec<String> = tx
+            .prepare("SELECT from_key FROM genre_rules")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for old in rules {
+            let new = current_key(&old);
+            if new != old {
+                tx.execute(
+                    "INSERT OR IGNORE INTO genre_rules(from_key, to_display)
+                     SELECT ?2, to_display FROM genre_rules WHERE from_key=?1",
+                    params![old, new],
+                )?;
+                tx.execute("DELETE FROM genre_rules WHERE from_key=?1", [&old])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Run `f` in a single transaction (bulk upserts); rolled back on error.
@@ -250,12 +301,16 @@ impl Catalog {
             .prepare("SELECT from_key, to_display FROM genre_rules")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        // A raw name -> the known genre it ends up in, merge/rename rules applied.
+        // A raw name -> the known genre it ends up in. Rules apply to the known genre
+        // (after aliases and parents, so merging House also moves "Deep House"),
+        // or else to the raw name's key.
         let resolve = |name: &str| -> Option<KnownGenre> {
-            rules
-                .get(&genre_key(name))
+            let base = known_genre(name);
+            base.as_ref()
+                .and_then(|g| rules.get(&g.key))
+                .or_else(|| rules.get(&genre_key(name)))
                 .and_then(|to| known_genre(to))
-                .or_else(|| known_genre(name))
+                .or(base)
         };
 
         let tracks: Vec<(TrackId, String, Option<String>)> = self
@@ -645,6 +700,75 @@ mod tests {
         // survives a later rebuild
         c.rebuild_genres().unwrap();
         assert_eq!(count_of(&c, "downtempo"), Some(3));
+    }
+
+    #[test]
+    fn merging_a_parent_genre_also_moves_its_subgenres() {
+        let c = Catalog::open_in_memory().unwrap();
+        let deep = add(&c, "a.mp3", Some("Deep House"));
+        let house = add(&c, "b.mp3", Some("House"));
+        let folder = add(&c, "Tech House/c.mp3", None);
+        c.add_genre_rule("house", "Electronic").unwrap();
+        for id in [deep, house, folder] {
+            assert_eq!(c.track_genres(id).unwrap(), vec!["Electronic"]);
+        }
+        assert_eq!(count_of(&c, "house"), None);
+        assert_eq!(count_of(&c, "electronic"), Some(3));
+    }
+
+    #[test]
+    fn old_genre_keys_are_remapped_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        {
+            let c = Catalog::open(&db).unwrap();
+            add(&c, "a.mp3", Some("R&B"));
+            c.conn
+                .execute_batch(
+                    "INSERT INTO selection_state VALUES ('randb', 1), ('goa|trance', 1),
+                        ('*', 1), ('rhythmandblues|worldmusic', 7), ('world|randb', 1);
+                     INSERT INTO genre_rules VALUES ('randb', 'Soul'), ('jungle', 'Dubstep');
+                     PRAGMA user_version = 2;",
+                )
+                .unwrap();
+        }
+        let c = Catalog::open(&db).unwrap();
+        let rows = |sql: &str| -> Vec<(String, String)> {
+            c.conn
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((r.get(0)?, r.get::<_, rusqlite::types::Value>(1)?))
+                })
+                .unwrap()
+                .map(|r| {
+                    let (k, v) = r.unwrap();
+                    (k, format!("{v:?}"))
+                })
+                .collect()
+        };
+        assert_eq!(
+            rows("SELECT selection_key, last_first FROM selection_state ORDER BY 1"),
+            vec![
+                ("*".to_string(), "Integer(1)".to_string()),
+                ("goamusic|trance".into(), "Integer(1)".into()),
+                ("rhythmandblues".into(), "Integer(1)".into()),
+                // Already there under the new key: that row wins.
+                ("rhythmandblues|worldmusic".into(), "Integer(7)".into()),
+            ]
+        );
+        assert_eq!(
+            rows("SELECT from_key, to_display FROM genre_rules ORDER BY 1"),
+            vec![
+                ("junglemusic".to_string(), "Text(\"Dubstep\")".to_string()),
+                ("rhythmandblues".into(), "Text(\"Soul\")".into()),
+            ]
+        );
+        assert_eq!(
+            c.track_genres(1).unwrap(),
+            vec!["Soul"],
+            "remapped rule applies"
+        );
     }
 
     #[test]
