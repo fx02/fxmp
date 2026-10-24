@@ -32,7 +32,7 @@ jobs:
         run: cargo install tauri-cli --version ${{ env.TAURI_CLI_VERSION }} --locked
       - name: UI tests
         run: node --test ui/*.test.mjs
-      - uses: tauri-apps/tauri-action@1ddc7b49b13c3038297360482fcb3e058764d7c9 # v0.6.2
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         with:
           tauriScript: cargo tauri
           args: --target universal-apple-darwin
@@ -56,7 +56,7 @@ jobs:
         run: cargo test -p smb-music-player
       - name: Install tauri CLI
         run: cargo install tauri-cli --version ${{ env.TAURI_CLI_VERSION }} --locked
-      - uses: tauri-apps/tauri-action@1ddc7b49b13c3038297360482fcb3e058764d7c9 # v0.6.2
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         with:
           tauriScript: cargo tauri
       - uses: actions/upload-artifact@v4
