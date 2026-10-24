@@ -55,42 +55,78 @@ export function debounce(fn, ms) {
   };
 }
 
-/** English plural: `forms` = [singular, plural]; only exactly 1 is singular. */
-export function plural(n, forms) {
-  return n === 1 ? forms[0] : forms[1];
+// ---------- translation ----------
+// Texts live in locales/<lang>.json (flat "area.name" keys). A plural text is an
+// object with one entry per category of the language; the count is the `n` param.
+
+/** Plural category of `n` per language (CLDR rules, integers only). */
+const PLURAL_RULES = {
+  en: (n) => (n === 1 ? "one" : "other"),
+  hr: (n) => {
+    const d = n % 10;
+    const dd = n % 100;
+    if (d === 1 && dd !== 11) return "one";
+    if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return "few";
+    return "other";
+  },
+};
+
+/** The categories each language's plural texts must have. */
+export const PLURAL_CATEGORIES = { en: ["one", "other"], hr: ["one", "few", "other"] };
+
+export function pluralCategory(lang, n) {
+  return (PLURAL_RULES[lang] || PLURAL_RULES.en)(n);
 }
 
-const FILES = ["file", "files"];
+/**
+ * A `t(key, params)` for `lang`: looks the key up in `dict`, then in `fallback`
+ * (English), else returns the key. `{name}` placeholders take `params.name`;
+ * numbers are formatted with `formatCount`.
+ */
+export function makeT(lang, dict, fallback) {
+  return (key, params = {}) => {
+    let value = dict[key];
+    let valueLang = lang;
+    if (value === undefined) {
+      value = fallback[key];
+      valueLang = "en";
+    }
+    if (value === undefined) return key;
+    if (typeof value === "object") {
+      value = value[pluralCategory(valueLang, params.n)] ?? value.other;
+    }
+    return value.replace(/\{(\w+)\}/g, (m, name) => {
+      const v = params[name];
+      if (v === undefined || v === null) return m;
+      return typeof v === "number" ? formatCount(v) : String(v);
+    });
+  };
+}
 
-export function scanProgressText(p) {
+export function scanProgressText(p, t) {
   // Nothing is counted while the share is still being listed.
-  if (!p || !p.seen) return "Scanning… listing files";
-  let text = `Scanning… ${formatCount(p.seen)} ${plural(p.seen, FILES)}`;
-  if (p.failed) text += ` (unreadable: ${formatCount(p.failed)})`;
-  return text;
+  if (!p || !p.seen) return t("scan.listing");
+  const text = t("scan.progress", { files: t("scan.files", { n: p.seen }) });
+  return p.failed ? t("scan.unreadable", { text, n: p.failed }) : text;
 }
 
 /** Text for the `scan-done` event payload. */
-export function scanDoneText(d) {
-  if (d.cancelled) return d.cancel_reason || "Scan cancelled.";
-  if (d.error) return `Scan failed: ${d.error}`;
-  return (
-    `Library refreshed: ${formatCount(d.total)} ${plural(d.total, FILES)}. ` +
-    `New or changed: ${formatCount(d.read)}, ` +
-    `unreadable: ${formatCount(d.failed)}, removed: ${formatCount(d.removed)}.`
-  );
+export function scanDoneText(d, t) {
+  if (d.cancelled) return d.cancel_reason || t("scan.cancelled");
+  if (d.error) return t("scan.failed", { error: d.error });
+  return t("scan.done", {
+    files: t("scan.files", { n: d.total }),
+    read: d.read,
+    failed: d.failed,
+    removed: d.removed,
+  });
 }
 
-// Same wording as the backend's `ConnStatus::message`.
-const CONN_MESSAGES = {
-  ok: "Connected",
-  secondary: "Connected to the backup server",
-  unreachable: "The music share is unreachable. Is WireGuard/VPN on?",
-  auth: "Wrong username or password",
-};
+const CONN_STATUSES = ["ok", "secondary", "unreachable", "auth"];
 
-export function connMessage(status) {
-  return CONN_MESSAGES[status] || "";
+/** Text for a connection status code ("ok", "secondary", "unreachable", "auth"). */
+export function connMessage(status, t) {
+  return CONN_STATUSES.includes(status) ? t(`conn.${status}`) : "";
 }
 
 const UNKNOWN_KEY = "_none";

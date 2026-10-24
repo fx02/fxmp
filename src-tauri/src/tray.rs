@@ -5,12 +5,14 @@ use std::time::Duration;
 
 use smp_core::audio::player::Command;
 use smp_core::catalog::GenreCount;
+use smp_core::genre::UNKNOWN_KEY;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Listener, Manager, Wry};
 
 use crate::commands::{ban_current_now, play_genres_now, spawn_action};
+use crate::i18n::{self, tr};
 use crate::state::{self, lock, AppState, NowPlaying};
 
 /// Genres change in bursts (every few seconds during a scan): the submenu is rebuilt
@@ -49,21 +51,40 @@ struct Tray {
     icon: TrayIcon,
     now: MenuItem<Wry>,
     pause: MenuItem<Wry>,
+    next: MenuItem<Wry>,
     ban: MenuItem<Wry>,
     genres: Submenu<Wry>,
+    show: MenuItem<Wry>,
+    quit: MenuItem<Wry>,
     rebuild_genres: Sender<()>,
 }
 
 /// Creates the tray icon. Runs on the main thread, after `AppState::init`.
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
-    let now = MenuItem::with_id(app, "now", track_label(None), false, None::<&str>)?;
-    let pause = MenuItem::with_id(app, ID_TOGGLE, pause_label(None), false, None::<&str>)?;
-    let next = MenuItem::with_id(app, ID_NEXT, "Next", true, None::<&str>)?;
-    let ban = MenuItem::with_id(app, ID_BAN, "Never play this again", false, None::<&str>)?;
+    let lang = i18n::current();
+    let item = |id: &str, key: &str, enabled: bool| {
+        MenuItem::with_id(app, id, menu_text(&tr(&lang, key)), enabled, None::<&str>)
+    };
+    let now = MenuItem::with_id(
+        app,
+        "now",
+        menu_text(&track_label(&lang, None)),
+        false,
+        None::<&str>,
+    )?;
+    let pause = MenuItem::with_id(
+        app,
+        ID_TOGGLE,
+        pause_label(&lang, None),
+        false,
+        None::<&str>,
+    )?;
+    let next = item(ID_NEXT, "player.next", true)?;
+    let ban = item(ID_BAN, "player.ban", false)?;
     // Filled in the background: the catalog is not queried on the main thread.
-    let genres = Submenu::with_items(app, "Genre", true, &[])?;
-    let show = MenuItem::with_id(app, ID_SHOW, "Show window", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
+    let genres = Submenu::with_items(app, menu_text(&tr(&lang, "tray.genre")), true, &[])?;
+    let show = item(ID_SHOW, "tray.show", true)?;
+    let quit = item(ID_QUIT, "tray.quit", true)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -109,8 +130,11 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         icon,
         now,
         pause,
+        next,
         ban,
         genres,
+        show,
+        quit,
         rebuild_genres: tx,
     });
 
@@ -146,7 +170,7 @@ pub fn refresh_genres(app: &AppHandle) {
 fn rebuild_genre_menu(app: &AppHandle, shown: &mut Vec<GenreEntry>) -> Result<(), String> {
     let st = app.state::<AppState>();
     let genres = lock(&st.query).genres().map_err(|e| e.to_string())?;
-    let entries = genre_entries(&genres, &st.settings.get().last_selection);
+    let entries = genre_entries(&i18n::current(), &genres, &st.settings.get().last_selection);
     if entries == *shown {
         return Ok(());
     }
@@ -177,9 +201,10 @@ fn show_now_playing(app: &AppHandle, np: Option<NowPlaying>) {
             return;
         };
         let np = np.as_ref();
-        let label = track_label(np);
+        let lang = i18n::current();
+        let label = track_label(&lang, np);
         let _ = tray.now.set_text(menu_text(&label));
-        let _ = tray.pause.set_text(pause_label(np));
+        let _ = tray.pause.set_text(pause_label(&lang, np));
         let _ = tray.pause.set_enabled(np.is_some());
         let _ = tray.ban.set_enabled(np.is_some());
         let tooltip = if np.is_some() {
@@ -192,6 +217,30 @@ fn show_now_playing(app: &AppHandle, np: Option<NowPlaying>) {
     if let Err(e) = result {
         log::warn!("tray: {e}");
     }
+}
+
+/// Relabels the menu after a language change.
+pub fn relabel(app: &AppHandle) {
+    let handle = app.clone();
+    let result = app.run_on_main_thread(move || {
+        let Some(tray) = handle.try_state::<Tray>() else {
+            return;
+        };
+        let lang = i18n::current();
+        let text = |key: &str| menu_text(&tr(&lang, key));
+        let _ = tray.next.set_text(text("player.next"));
+        let _ = tray.ban.set_text(text("player.ban"));
+        let _ = tray.genres.set_text(text("tray.genre"));
+        let _ = tray.show.set_text(text("tray.show"));
+        let _ = tray.quit.set_text(text("tray.quit"));
+    });
+    if let Err(e) = result {
+        log::warn!("tray: {e}");
+    }
+    let np = lock(&app.state::<AppState>().now_playing).clone();
+    show_now_playing(app, np);
+    // The genre entries now differ ("All", "Unknown"), so the submenu is rebuilt.
+    refresh_genres(app);
 }
 
 /// Runs on the main thread: anything that touches the catalog goes to a thread.
@@ -229,8 +278,12 @@ pub fn show_main_window(app: &AppHandle) {
 }
 
 /// "All", then the [`TOP_GENRES`] largest genres by track count, then the genres of
-/// `last_selection` that are not among them.
-pub fn genre_entries(genres: &[GenreCount], last_selection: &[String]) -> Vec<GenreEntry> {
+/// `last_selection` that are not among them. "All" and Unknown are in `lang`.
+pub fn genre_entries(
+    lang: &str,
+    genres: &[GenreCount],
+    last_selection: &[String],
+) -> Vec<GenreEntry> {
     let mut by_count: Vec<&GenreCount> = genres.iter().collect();
     by_count.sort_by(|a, b| {
         b.count
@@ -240,11 +293,15 @@ pub fn genre_entries(genres: &[GenreCount], last_selection: &[String]) -> Vec<Ge
     });
     let entry = |g: &GenreCount| GenreEntry {
         id: format!("{GENRE_ID_PREFIX}{}", g.key),
-        label: g.display.clone(),
+        label: if g.key == UNKNOWN_KEY {
+            tr(lang, "genres.unknown")
+        } else {
+            g.display.clone()
+        },
     };
     let mut entries = vec![GenreEntry {
         id: ALL_GENRES_ID.into(),
-        label: "All".into(),
+        label: tr(lang, "genres.all"),
     }];
     entries.extend(by_count.iter().take(TOP_GENRES).map(|g| entry(g)));
     entries.extend(
@@ -268,7 +325,7 @@ pub fn genre_pick(menu_id: &str) -> Option<GenrePick> {
 }
 
 /// "Artist – Title" for the menu and the tooltip.
-pub fn track_label(np: Option<&NowPlaying>) -> String {
+pub fn track_label(lang: &str, np: Option<&NowPlaying>) -> String {
     let parts: Vec<&str> = np
         .map(|n| [n.artist.trim(), n.title.trim()])
         .into_iter()
@@ -276,7 +333,7 @@ pub fn track_label(np: Option<&NowPlaying>) -> String {
         .filter(|s| !s.is_empty())
         .collect();
     if parts.is_empty() {
-        return "Nothing playing".into();
+        return tr(lang, "tray.nothing_playing");
     }
     let label = parts.join(" – ");
     if label.chars().count() <= LABEL_MAX_CHARS {
@@ -292,12 +349,13 @@ pub fn menu_text(s: &str) -> String {
     s.replace('&', "&&")
 }
 
-pub fn pause_label(np: Option<&NowPlaying>) -> &'static str {
-    if np.is_some_and(|n| n.paused) {
-        "Resume"
+pub fn pause_label(lang: &str, np: Option<&NowPlaying>) -> String {
+    let key = if np.is_some_and(|n| n.paused) {
+        "player.resume"
     } else {
-        "Pause"
-    }
+        "player.pause"
+    };
+    tr(lang, key)
 }
 
 #[cfg(test)]
@@ -326,7 +384,7 @@ mod tests {
     #[test]
     fn genre_menu_starts_with_all_and_orders_by_count() {
         let genres = [genre("a", 5), genre("b", 50), genre("c", 7)];
-        let e = genre_entries(&genres, &[]);
+        let e = genre_entries("en", &genres, &[]);
         let labels: Vec<_> = e.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(labels, ["All", "B", "C", "A"]);
         assert_eq!(genre_pick(&e[0].id), Some(GenrePick::All));
@@ -338,7 +396,7 @@ mod tests {
         // g0 has the most tracks, g39 the fewest.
         let genres: Vec<_> = (0..40).map(|i| genre(&format!("g{i}"), 100 - i)).collect();
         let last = ["g35".to_string(), "g2".into(), "gone".into(), "g31".into()];
-        let e = genre_entries(&genres, &last);
+        let e = genre_entries("en", &genres, &last);
         assert_eq!(e.len(), 1 + TOP_GENRES + 2);
         assert_eq!(e[1].label, "G0");
         assert_eq!(e[TOP_GENRES].label, "G29");
@@ -352,12 +410,12 @@ mod tests {
     #[test]
     fn genre_menu_ties_sort_by_name_and_empty_catalog_has_only_all() {
         let genres = [genre("zz", 3), genre("aa", 3)];
-        let labels: Vec<_> = genre_entries(&genres, &[])
+        let labels: Vec<_> = genre_entries("en", &genres, &[])
             .into_iter()
             .map(|e| e.label)
             .collect();
         assert_eq!(labels, ["All", "AA", "ZZ"]);
-        assert_eq!(genre_entries(&[], &["x".into()]).len(), 1);
+        assert_eq!(genre_entries("en", &[], &["x".into()]).len(), 1);
     }
 
     #[test]
@@ -372,18 +430,18 @@ mod tests {
     #[test]
     fn track_label_joins_artist_and_title() {
         assert_eq!(
-            track_label(Some(&np("Artist", "Song", false))),
+            track_label("en", Some(&np("Artist", "Song", false))),
             "Artist – Song"
         );
-        assert_eq!(track_label(Some(&np(" ", "Song", false))), "Song");
-        assert_eq!(track_label(Some(&np("Artist", "", false))), "Artist");
-        assert_eq!(track_label(None), "Nothing playing");
+        assert_eq!(track_label("en", Some(&np(" ", "Song", false))), "Song");
+        assert_eq!(track_label("en", Some(&np("Artist", "", false))), "Artist");
+        assert_eq!(track_label("en", None), "Nothing playing");
     }
 
     #[test]
     fn track_label_is_shortened_for_the_menu() {
         let long = "ž".repeat(100);
-        let label = track_label(Some(&np("A", &long, false)));
+        let label = track_label("en", Some(&np("A", &long, false)));
         assert_eq!(label.chars().count(), LABEL_MAX_CHARS);
         assert!(label.ends_with('…'));
     }
@@ -397,8 +455,23 @@ mod tests {
 
     #[test]
     fn pause_item_says_what_it_does() {
-        assert_eq!(pause_label(Some(&np("A", "B", false))), "Pause");
-        assert_eq!(pause_label(Some(&np("A", "B", true))), "Resume");
-        assert_eq!(pause_label(None), "Pause");
+        assert_eq!(pause_label("en", Some(&np("A", "B", false))), "Pause");
+        assert_eq!(pause_label("en", Some(&np("A", "B", true))), "Resume");
+        assert_eq!(pause_label("en", None), "Pause");
+        assert_eq!(pause_label("hr", Some(&np("A", "B", true))), "Nastavi");
+        assert_eq!(track_label("hr", None), "Ništa ne svira");
+    }
+
+    #[test]
+    fn genre_menu_labels_all_and_unknown_in_the_language() {
+        let genres = [genre("_none", 5), genre("jazz", 3)];
+        let labels = |lang| -> Vec<String> {
+            genre_entries(lang, &genres, &[])
+                .into_iter()
+                .map(|e| e.label)
+                .collect()
+        };
+        assert_eq!(labels("en"), ["All", "Unknown", "JAZZ"]);
+        assert_eq!(labels("hr"), ["Sve", "Nepoznato", "JAZZ"]);
     }
 }

@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n;
+
 pub const FILE_NAME: &str = "settings.json";
 /// Quick successive changes (a volume slider) are written at most this often.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -53,6 +55,8 @@ pub struct Settings {
     pub autostart: bool,
     /// Genre keys of the last genre selection (empty = all).
     pub last_selection: Vec<String>,
+    /// UI language code (a file in `ui/locales`).
+    pub language: String,
 }
 
 impl Default for Settings {
@@ -68,6 +72,7 @@ impl Default for Settings {
             notify: false,
             autostart: false,
             last_selection: Vec::new(),
+            language: i18n::DEFAULT_LANGUAGE.into(),
         }
     }
 }
@@ -76,6 +81,9 @@ impl Settings {
     /// Brings out-of-range values (e.g. from a hand-edited file) back into range.
     pub fn clamped(mut self) -> Self {
         self.crossfade_secs = self.crossfade_secs.clamp(1, 10);
+        if !i18n::is_supported(&self.language) {
+            self.language = i18n::DEFAULT_LANGUAGE.into();
+        }
         self.volume = if self.volume.is_finite() {
             self.volume.clamp(0.0, 1.0)
         } else {
@@ -233,6 +241,20 @@ mod tests {
         assert_eq!(s.volume, 0.7);
         assert_eq!(s.device, None);
         assert!(s.last_selection.is_empty());
+        assert_eq!(s.language, "en");
+    }
+
+    #[test]
+    fn language_defaults_to_english_and_must_be_shipped() {
+        let old: Settings = serde_json::from_str(r#"{"volume": 0.5}"#).unwrap();
+        assert_eq!(
+            old.language, "en",
+            "settings from before the language option"
+        );
+        let hr: Settings = serde_json::from_str(r#"{"language": "hr"}"#).unwrap();
+        assert_eq!(hr.clamped().language, "hr");
+        let xx: Settings = serde_json::from_str(r#"{"language": "xx"}"#).unwrap();
+        assert_eq!(xx.clamped().language, "en");
     }
 
     #[test]

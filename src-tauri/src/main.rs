@@ -5,6 +5,7 @@ mod autostart;
 mod commands;
 mod connection;
 mod credentials;
+mod i18n;
 mod media;
 mod provider;
 mod settings;
@@ -80,6 +81,9 @@ fn main() {
             commands::unban,
             commands::merge_genre,
             commands::known_genres,
+            commands::get_locale,
+            commands::list_languages,
+            commands::set_language,
             commands::list_artists,
             commands::list_albums,
             commands::now_playing,

@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::autostart;
 use crate::connection::{status_of, test_server, test_target, ConnStatus, StatusPayload};
+use crate::i18n;
 use crate::provider::CatalogProvider;
 use crate::settings::{ServerConfig, Settings};
 use crate::state::{self, apply_player_settings, lock, AppState, NowPlaying, ScanStatus};
@@ -31,8 +32,7 @@ async fn run<T: Send + 'static>(
             let _ = tx.send(f(&app, &st));
         })
         .map_err(|e| e.to_string())?;
-    rx.await
-        .map_err(|_| "The command did not finish.".to_string())?
+    rx.await.map_err(|_| i18n::t("err.command"))?
 }
 
 /// Runs `f` on a new thread for callers that do not wait for the result (tray, media
@@ -58,7 +58,7 @@ pub fn spawn_action(
 
 fn db_err(e: smp_core::Error) -> String {
     log::warn!("catalog: {e}");
-    format!("Library database error: {e}")
+    i18n::tf("err.database", &[("error", &e.to_string())])
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,17 +108,14 @@ pub async fn save_settings(
                 servers_changed = old.primary != new.primary || old.secondary != new.secondary;
                 apply_player_settings(&st.player, new);
             })
-            .map_err(|e| format!("Cannot save settings: {e}"))?;
+            .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
         if servers_changed {
-            state::cancel_scan(
-                st,
-                Some("The server settings changed, so the scan was cancelled."),
-            );
+            state::cancel_scan(st, Some(&i18n::t("scan.cancelled_settings")));
         }
         st.reconnect(&saved);
         autostart::apply(app, saved.autostart, false).map_err(|e| {
             log::warn!("start at login: {e}");
-            "Settings saved, but start at login could not be changed.".to_string()
+            i18n::t("err.autostart")
         })
     })
     .await
@@ -318,7 +315,7 @@ pub fn ban_current_now(st: &AppState) -> CmdResult<()> {
     let id = lock(&st.now_playing)
         .as_ref()
         .map(|n| n.id)
-        .ok_or("Nothing is playing.")?;
+        .ok_or_else(|| i18n::t("err.nothing_playing"))?;
     lock(&st.banned).insert(id);
     st.writer
         .call(move |c| c.set_banned(id, true))
@@ -361,15 +358,41 @@ pub async fn unban(app: AppHandle, id: TrackId) -> CmdResult<()> {
     .await
 }
 
-/// The known genre a merge goes into, by its canonical name.
-fn merge_target(into: &str) -> CmdResult<String> {
+/// The known genre a merge goes into, by its canonical name; errors in `lang`.
+fn merge_target(lang: &str, into: &str) -> CmdResult<String> {
     let into = into.trim();
     if into.is_empty() {
-        return Err("Choose a genre.".into());
+        return Err(i18n::tr(lang, "err.choose_genre"));
     }
     known_genre(into)
         .map(|g| g.display)
-        .ok_or_else(|| format!("\u{201c}{into}\u{201d} is not a known genre."))
+        .ok_or_else(|| i18n::trf(lang, "err.not_a_genre", &[("name", into)]))
+}
+
+/// The UI texts of `lang` (English filling gaps), from `ui/locales`.
+#[tauri::command(rename_all = "snake_case")]
+pub fn get_locale(lang: String) -> serde_json::Map<String, serde_json::Value> {
+    i18n::locale(&lang)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn list_languages() -> Vec<i18n::Language> {
+    i18n::languages()
+}
+
+/// Switches the app's language, saves it and relabels the tray menu.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_language(app: AppHandle, lang: String) -> CmdResult<()> {
+    run(app, move |app, st| {
+        if !i18n::is_supported(&lang) {
+            return Err(i18n::tf("err.language", &[("code", &lang)]));
+        }
+        i18n::set_current(&lang);
+        st.settings.update(|s| s.language = lang, |_| {});
+        tray::relabel(app);
+        Ok(())
+    })
+    .await
 }
 
 /// Display names of all known genres: the choices for "Merge into…".
@@ -382,7 +405,7 @@ pub fn known_genres() -> Vec<String> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn merge_genre(app: AppHandle, from_key: String, into_display: String) -> CmdResult<()> {
     run(app, move |app, st| {
-        let into = merge_target(&into_display)?;
+        let into = merge_target(&i18n::current(), &into_display)?;
         // Rebuilds genres over the whole library: on the writer's connection, so
         // playback and other queries are not held up.
         st.writer
@@ -418,11 +441,15 @@ mod tests {
 
     #[test]
     fn merge_target_must_be_a_known_genre() {
-        assert_eq!(merge_target(" dnb ").unwrap(), "Drum & bass");
-        assert_eq!(merge_target("chillout").unwrap(), "Chillout");
-        assert_eq!(merge_target("  ").unwrap_err(), "Choose a genre.");
+        assert_eq!(merge_target("en", " dnb ").unwrap(), "Drum & bass");
+        assert_eq!(merge_target("en", "chillout").unwrap(), "Chillout");
+        assert_eq!(merge_target("en", "  ").unwrap_err(), "Choose a genre.");
         assert_eq!(
-            merge_target("ZZ Test Preimenovano").unwrap_err(),
+            merge_target("hr", "Foo").unwrap_err(),
+            "\u{201e}Foo\u{201c} nije poznat \u{17e}anr."
+        );
+        assert_eq!(
+            merge_target("en", "ZZ Test Preimenovano").unwrap_err(),
             "\u{201c}ZZ Test Preimenovano\u{201d} is not a known genre."
         );
     }

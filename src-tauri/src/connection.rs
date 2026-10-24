@@ -14,6 +14,7 @@ use smp_core::source::{
 };
 
 use crate::credentials::CredentialStore;
+use crate::i18n;
 use crate::settings::{ServerConfig, Settings};
 
 /// How often an unreachable server is retried.
@@ -33,29 +34,26 @@ pub enum ConnStatus {
 }
 
 impl ConnStatus {
-    pub fn message(self) -> &'static str {
+    /// Translation key of the status text (`ui/locales`).
+    pub fn text_key(self) -> &'static str {
         match self {
-            ConnStatus::Ok => "Connected",
-            ConnStatus::Secondary => "Connected to the backup server",
-            ConnStatus::Unreachable => "The music share is unreachable. Is WireGuard/VPN on?",
-            ConnStatus::Auth => "Wrong username or password",
+            ConnStatus::Ok => "conn.ok",
+            ConnStatus::Secondary => "conn.secondary",
+            ConnStatus::Unreachable => "conn.unreachable",
+            ConnStatus::Auth => "conn.auth",
         }
     }
 }
 
-/// Payload of the `connection-status` event.
+/// Payload of the `connection-status` event. The UI words the status in its language.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusPayload {
     pub status: ConnStatus,
-    pub message: &'static str,
 }
 
 impl From<ConnStatus> for StatusPayload {
     fn from(status: ConnStatus) -> Self {
-        Self {
-            status,
-            message: status.message(),
-        }
+        Self { status }
     }
 }
 
@@ -120,8 +118,8 @@ pub fn test_target(
         ("secondary", None) => settings
             .secondary
             .clone()
-            .ok_or("No backup server is set up.")?,
-        (other, _) => return Err(format!("Unknown server: {other}")),
+            .ok_or_else(|| i18n::t("err.no_backup"))?,
+        (other, _) => return Err(i18n::tf("err.unknown_server", &[("name", other)])),
     };
     let password = password
         .filter(|p| !p.is_empty())
@@ -542,18 +540,20 @@ mod tests {
     }
 
     #[test]
-    fn status_payload_carries_english_text() {
+    fn status_payload_carries_the_status_code_and_texts_are_translated() {
         let json = serde_json::to_string(&StatusPayload::from(ConnStatus::Unreachable)).unwrap();
+        assert_eq!(json, r#"{"status":"unreachable"}"#);
+        let text = |s: ConnStatus, lang| crate::i18n::tr(lang, s.text_key());
+        assert_eq!(text(ConnStatus::Ok, "en"), "Connected");
         assert_eq!(
-            json,
-            r#"{"status":"unreachable","message":"The music share is unreachable. Is WireGuard/VPN on?"}"#
-        );
-        assert_eq!(ConnStatus::Ok.message(), "Connected");
-        assert_eq!(
-            ConnStatus::Secondary.message(),
+            text(ConnStatus::Secondary, "en"),
             "Connected to the backup server"
         );
-        assert_eq!(ConnStatus::Auth.message(), "Wrong username or password");
+        assert_eq!(text(ConnStatus::Auth, "en"), "Wrong username or password");
+        assert_eq!(
+            text(ConnStatus::Unreachable, "hr"),
+            "Disk nije dostupan. Je li uključen WireGuard/VPN?"
+        );
     }
 
     #[test]

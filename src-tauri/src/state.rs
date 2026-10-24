@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use smp_core::audio::output::CpalSinkFactory;
 use smp_core::audio::player::{Command, Event, Player, PlayerConfig};
 use smp_core::catalog::Catalog;
+use smp_core::genre::UNKNOWN_DISPLAY;
 use smp_core::scan::{scan_with, ScanOptions, ScanProgress};
 use smp_core::source::{MusicSource, SourceError, Which};
 use smp_core::TrackId;
@@ -18,6 +19,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager};
 
 use crate::connection::{monitor, AppSource, ConnStatus, Servers, StatusPayload};
 use crate::credentials::{CredentialStore, Keychain};
+use crate::i18n;
 use crate::provider::{BannedSet, Playback};
 use crate::settings::{self, Settings, SettingsStore};
 use crate::writer::CatalogWriter;
@@ -122,6 +124,7 @@ impl AppState {
             .as_ref()
             .is_some_and(|s| !s.primary.username.trim().is_empty());
         let settings = loaded.unwrap_or_default();
+        i18n::set_current(&settings.language);
         let query = Catalog::open(&catalog_path)?;
         let catalog_empty = query.is_empty()?;
         let playback_db = Catalog::open(&catalog_path)?;
@@ -269,7 +272,18 @@ fn now_playing_of(catalog: &Catalog, id: TrackId, paused: bool) -> smp_core::Res
         artist: row.meta.artist.unwrap_or_default(),
         title,
         album: row.meta.album.unwrap_or_default(),
-        genre_display: catalog.track_genres(id)?.join(", "),
+        genre_display: catalog
+            .track_genres(id)?
+            .into_iter()
+            .map(|g| {
+                if g == UNKNOWN_DISPLAY {
+                    i18n::t("genres.unknown")
+                } else {
+                    g
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
         paused,
     })
 }
@@ -342,10 +356,10 @@ fn on_player_event(app: &AppHandle, ev: Event) {
 pub fn start_scan(app: &AppHandle) -> Result<(), String> {
     let st = app.state::<AppState>();
     if st.source.servers().is_none() {
-        return Err("Save the server settings first.".into());
+        return Err(i18n::t("err.save_first"));
     }
     if st.scanning.swap(true, Ordering::SeqCst) {
-        return Err("A scan is already running.".into());
+        return Err(i18n::t("err.scan_running"));
     }
     st.cancel_scan.store(false, Ordering::SeqCst);
     *lock(&st.cancel_reason) = None;
@@ -356,7 +370,7 @@ pub fn start_scan(app: &AppHandle) -> Result<(), String> {
         .spawn(move || run_scan(&handle));
     if let Err(e) = spawned {
         st.scanning.store(false, Ordering::SeqCst);
-        return Err(format!("Cannot start the scan: {e}"));
+        return Err(i18n::tf("err.scan_start", &[("error", &e.to_string())]));
     }
     Ok(())
 }
@@ -372,11 +386,11 @@ pub fn cancel_scan(st: &AppState, reason: Option<&str>) -> bool {
     true
 }
 
-/// Text for a failed scan: connection problems in the words the status uses.
-fn scan_error_message(e: &smp_core::Error) -> String {
+/// Text for a failed scan, in `lang`: connection problems in the words the status uses.
+fn scan_error_message(lang: &str, e: &smp_core::Error) -> String {
     match e {
-        smp_core::Error::Source(SourceError::Auth) => ConnStatus::Auth.message().to_string(),
-        smp_core::Error::Source(_) => ConnStatus::Unreachable.message().to_string(),
+        smp_core::Error::Source(SourceError::Auth) => i18n::tr(lang, ConnStatus::Auth.text_key()),
+        smp_core::Error::Source(_) => i18n::tr(lang, ConnStatus::Unreachable.text_key()),
         other => other.to_string(),
     }
 }
@@ -439,7 +453,7 @@ fn run_scan(app: &AppHandle) {
             ScanDonePayload {
                 cancelled,
                 cancel_reason,
-                error: Some(scan_error_message(&e)),
+                error: Some(scan_error_message(&i18n::current(), &e)),
                 ..Default::default()
             }
         }
@@ -476,12 +490,22 @@ mod tests {
     #[test]
     fn scan_errors_use_the_matching_status_text() {
         let auth = smp_core::Error::Source(SourceError::Auth);
-        assert_eq!(scan_error_message(&auth), ConnStatus::Auth.message());
+        assert_eq!(
+            scan_error_message("en", &auth),
+            "Wrong username or password"
+        );
+        assert_eq!(
+            scan_error_message("hr", &auth),
+            "Pogrešno korisničko ime ili lozinka"
+        );
         for e in [SourceError::Unreachable, SourceError::Timeout] {
             let e = smp_core::Error::Source(e);
-            assert_eq!(scan_error_message(&e), ConnStatus::Unreachable.message());
+            assert_eq!(
+                scan_error_message("en", &e),
+                i18n::tr("en", "conn.unreachable")
+            );
         }
         let other = smp_core::Error::Other("disk full".into());
-        assert_eq!(scan_error_message(&other), "disk full");
+        assert_eq!(scan_error_message("en", &other), "disk full");
     }
 }
