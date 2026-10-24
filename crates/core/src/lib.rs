@@ -1,9 +1,9 @@
-pub mod shuffle;
-pub mod genre;
 pub mod catalog;
+pub mod genre;
+pub mod scan;
+pub mod shuffle;
 pub mod source;
 pub mod tags;
-pub mod scan;
 
 /// Identifier of a track in the catalog.
 pub type TrackId = i64;

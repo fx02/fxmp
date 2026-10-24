@@ -1,8 +1,10 @@
 //! Abstraction over where music files live (local folder, SMB share).
 
+pub mod failover;
 pub mod local;
 pub mod smb;
 
+pub use failover::{FailoverSource, Which};
 pub use local::LocalSource;
 pub use smb::{SmbConfig, SmbSource};
 

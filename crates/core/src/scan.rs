@@ -77,8 +77,15 @@ pub fn scan(
         }
     })?;
 
-    let mut report = ScanReport { total: entries.len(), ..Default::default() };
-    let mut rep = Reporter { cb: progress, state: ScanProgress::default(), last: None };
+    let mut report = ScanReport {
+        total: entries.len(),
+        ..Default::default()
+    };
+    let mut rep = Reporter {
+        cb: progress,
+        state: ScanProgress::default(),
+        last: None,
+    };
 
     'chunks: for chunk in entries.chunks(CHUNK) {
         if cancel.load(Ordering::Relaxed) {
@@ -194,8 +201,12 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         let no = AtomicBool::new(false);
         run(dir.path(), &mut cat, &no);
-        let f = fs::OpenOptions::new().write(true).open(dir.path().join("tone.mp3")).unwrap();
-        f.set_modified(SystemTime::now() + Duration::from_secs(3600)).unwrap();
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("tone.mp3"))
+            .unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
         drop(f);
         let r = run(dir.path(), &mut cat, &no);
         assert_eq!(r.read, 1);
@@ -254,7 +265,10 @@ mod tests {
     struct FlakySource(Vec<(FileEntry, Behaviour)>);
 
     impl MusicSource for FlakySource {
-        fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> std::result::Result<(), SourceError> {
+        fn walk(
+            &self,
+            on_entry: &mut dyn FnMut(FileEntry),
+        ) -> std::result::Result<(), SourceError> {
             self.0.iter().for_each(|(e, _)| on_entry(e.clone()));
             Ok(())
         }
@@ -274,31 +288,60 @@ mod tests {
     #[test]
     fn network_failures_are_retried_next_scan() {
         use std::io::ErrorKind;
-        let entry = |name: &str| FileEntry { rel_path: name.into(), size: 1000, mtime: 1_700_000_000 };
+        let entry = |name: &str| FileEntry {
+            rel_path: name.into(),
+            size: 1000,
+            mtime: 1_700_000_000,
+        };
         let retried = [
             ("timeout.mp3", Behaviour::OpenFails(SourceError::Timeout)),
-            ("unreachable.mp3", Behaviour::OpenFails(SourceError::Unreachable)),
-            ("io.mp3", Behaviour::OpenFails(SourceError::Io("reset".into()))),
-            ("read-timeout.mp3", Behaviour::ReadFails(ErrorKind::TimedOut)),
-            ("read-dropped.flac", Behaviour::ReadFails(ErrorKind::NotConnected)),
-            ("read-reset.ogg", Behaviour::ReadFails(ErrorKind::ConnectionReset)),
+            (
+                "unreachable.mp3",
+                Behaviour::OpenFails(SourceError::Unreachable),
+            ),
+            (
+                "io.mp3",
+                Behaviour::OpenFails(SourceError::Io("reset".into())),
+            ),
+            (
+                "read-timeout.mp3",
+                Behaviour::ReadFails(ErrorKind::TimedOut),
+            ),
+            (
+                "read-dropped.flac",
+                Behaviour::ReadFails(ErrorKind::NotConnected),
+            ),
+            (
+                "read-reset.ogg",
+                Behaviour::ReadFails(ErrorKind::ConnectionReset),
+            ),
         ];
         let kept = [
             ("missing.mp3", Behaviour::OpenFails(SourceError::NotFound)),
             ("garbage.mp3", Behaviour::Garbage),
         ];
         let src = FlakySource(
-            retried.iter().chain(&kept).map(|(n, b)| (entry(n), b.clone())).collect(),
+            retried
+                .iter()
+                .chain(&kept)
+                .map(|(n, b)| (entry(n), b.clone()))
+                .collect(),
         );
         let mut cat = Catalog::open_in_memory().unwrap();
         let no = AtomicBool::new(false);
         let first = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((first.read, first.failed), (8, 8));
         for (name, _) in &retried {
-            assert!(!cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(), "{name}");
+            assert!(
+                !cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(),
+                "{name}"
+            );
         }
         for (name, _) in &kept {
-            assert!(cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(), "{name}");
+            assert!(
+                cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(),
+                "{name}"
+            );
         }
         let second = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((second.read, second.unchanged), (6, 2));

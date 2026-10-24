@@ -28,7 +28,11 @@ impl LocalSource {
             if name.starts_with('.') {
                 continue;
             }
-            let rel_path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+            let rel_path = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
             // fs::metadata follows symlinks, so linked files and folders work.
             let md = match fs::metadata(item.path()) {
                 Ok(md) => md,
@@ -43,7 +47,11 @@ impl LocalSource {
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_secs() as i64);
-                on_entry(FileEntry { rel_path, size: md.len(), mtime });
+                on_entry(FileEntry {
+                    rel_path,
+                    size: md.len(),
+                    mtime,
+                });
             }
         }
         Ok(())
@@ -94,7 +102,11 @@ mod tests {
         fs::create_dir(tmp.path().join(".secret")).unwrap();
         fs::write(tmp.path().join(".secret/in.mp3"), "x").unwrap();
         fs::create_dir(tmp.path().join("sub")).unwrap();
-        fs::copy(fixtures().join("tone.mp3"), tmp.path().join("sub/UPPER.MP3")).unwrap();
+        fs::copy(
+            fixtures().join("tone.mp3"),
+            tmp.path().join("sub/UPPER.MP3"),
+        )
+        .unwrap();
 
         let src = LocalSource::new(tmp.path());
         let mut got = Vec::new();
@@ -103,10 +115,19 @@ mod tests {
         paths.sort();
         assert_eq!(
             paths,
-            ["broken.mp3", "sub/UPPER.MP3", "tone.flac", "tone.mp3", "tone.ogg"]
+            [
+                "broken.mp3",
+                "sub/UPPER.MP3",
+                "tone.flac",
+                "tone.mp3",
+                "tone.ogg"
+            ]
         );
         let tone = got.iter().find(|e| e.rel_path == "tone.mp3").unwrap();
-        assert_eq!(tone.size, fs::metadata(fixtures().join("tone.mp3")).unwrap().len());
+        assert_eq!(
+            tone.size,
+            fs::metadata(fixtures().join("tone.mp3")).unwrap().len()
+        );
         assert!(tone.mtime > 0);
     }
 
@@ -126,7 +147,9 @@ mod tests {
         assert!(!buf.is_empty());
         assert_eq!(src.open("nope.mp3").err(), Some(SourceError::NotFound));
         assert_eq!(
-            LocalSource::new(fixtures().join("missing")).walk(&mut |_| {}).err(),
+            LocalSource::new(fixtures().join("missing"))
+                .walk(&mut |_| {})
+                .err(),
             Some(SourceError::NotFound)
         );
         assert!(src.describe().contains("fixtures"));

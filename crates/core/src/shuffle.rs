@@ -17,7 +17,13 @@ pub struct Shuffler<R: Rng> {
 
 impl<R: Rng> Shuffler<R> {
     pub fn new(pool: Vec<TrackId>, avoid_first: Option<TrackId>, rng: R) -> Self {
-        let mut s = Shuffler { pool, order: Vec::new(), last: avoid_first, first: None, rng };
+        let mut s = Shuffler {
+            pool,
+            order: Vec::new(),
+            last: avoid_first,
+            first: None,
+            rng,
+        };
         s.refill();
         s.first = s.order.last().copied();
         s

@@ -19,7 +19,11 @@ pub fn split_genres(raw: &str) -> Vec<String> {
         .split([';', '/', '\0'])
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .map(|p| id3v1_name(p).map(str::to_string).unwrap_or_else(|| p.to_string()))
+        .map(|p| {
+            id3v1_name(p)
+                .map(str::to_string)
+                .unwrap_or_else(|| p.to_string())
+        })
         .collect()
 }
 
@@ -40,7 +44,11 @@ pub fn genre_key(name: &str) -> String {
     let spaced = lower.replace("'n'", " and ").replace(['&', '+'], " and ");
     let mut key = String::new();
     for tok in spaced.split_whitespace() {
-        let tok = if matches!(tok, "n" | "n'" | "'n") { "and" } else { tok };
+        let tok = if matches!(tok, "n" | "n'" | "'n") {
+            "and"
+        } else {
+            tok
+        };
         key.extend(tok.chars().filter(|c| c.is_alphanumeric()));
     }
     BUILTIN_ALIASES
@@ -68,7 +76,10 @@ mod tests {
         assert_eq!(split_genres(""), Vec::<String>::new());
         assert_eq!(split_genres("   "), Vec::<String>::new());
         assert_eq!(split_genres("Trance; Chillout"), vec!["Trance", "Chillout"]);
-        assert_eq!(split_genres("Trance/Progressive"), vec!["Trance", "Progressive"]);
+        assert_eq!(
+            split_genres("Trance/Progressive"),
+            vec!["Trance", "Progressive"]
+        );
         assert_eq!(split_genres("Jazz\0Blues"), vec!["Jazz", "Blues"]);
         assert_eq!(split_genres("Rock | Pop"), vec!["Rock", "Pop"]);
         assert_eq!(split_genres("(31)"), vec!["Trance"]);
@@ -78,7 +89,13 @@ mod tests {
 
     #[test]
     fn keys_merge_common_variants() {
-        for v in ["Drum & Bass", "DnB", "drum n bass", "Drum'n'Bass", "DRUM AND BASS"] {
+        for v in [
+            "Drum & Bass",
+            "DnB",
+            "drum n bass",
+            "Drum'n'Bass",
+            "DRUM AND BASS",
+        ] {
             assert_eq!(genre_key(v), "drumandbass");
         }
         assert_eq!(genre_key("Chill Out"), genre_key("Chillout"));

@@ -65,12 +65,21 @@ mod tests {
     use std::path::PathBuf;
 
     fn open(name: &str) -> File {
-        File::open(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap()
+        File::open(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+        )
+        .unwrap()
     }
 
     #[test]
     fn read_meta_reads_tags() {
-        for (file, ext) in [("tone.mp3", "mp3"), ("tone.flac", "flac"), ("tone.ogg", "ogg")] {
+        for (file, ext) in [
+            ("tone.mp3", "mp3"),
+            ("tone.flac", "flac"),
+            ("tone.ogg", "ogg"),
+        ] {
             let m = read_meta(&mut open(file), ext).unwrap();
             assert_eq!(m.artist.as_deref(), Some("Test Artist"), "{file}");
             assert_eq!(m.title.as_deref(), Some("Test Title"), "{file}");

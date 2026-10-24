@@ -142,7 +142,9 @@ impl Catalog {
     }
 
     pub fn is_empty(&self) -> Result<bool> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
         Ok(n == 0)
     }
 
@@ -198,7 +200,8 @@ impl Catalog {
     }
 
     pub fn begin_scan(&self) -> Result<()> {
-        self.conn.execute("UPDATE tracks SET present=0, fail_count=0", [])?;
+        self.conn
+            .execute("UPDATE tracks SET present=0, fail_count=0", [])?;
         Ok(())
     }
 
@@ -217,7 +220,9 @@ impl Catalog {
         )?;
         self.conn
             .execute("DELETE FROM selection_state WHERE last_first IN (SELECT id FROM tracks WHERE present=0)", [])?;
-        Ok(self.conn.execute("DELETE FROM tracks WHERE present=0", [])?)
+        Ok(self
+            .conn
+            .execute("DELETE FROM tracks WHERE present=0", [])?)
     }
 
     /// Recompute `genres` and `track_genres` from `raw_genre`, folder names and rules.
@@ -256,7 +261,11 @@ impl Catalog {
                 if let Some(d) = disp {
                     forced.insert(key.clone(), d);
                 } else {
-                    *spellings.entry(key.clone()).or_default().entry(name).or_default() += 1;
+                    *spellings
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(name)
+                        .or_default() += 1;
                 }
                 if !keys.contains(&key) {
                     keys.push(key);
@@ -270,7 +279,10 @@ impl Catalog {
         }
 
         // Folder fallback: first path component matching an existing tag-derived key.
-        let known: HashSet<String> = assigned.iter().flat_map(|(_, k)| k.iter().cloned()).collect();
+        let known: HashSet<String> = assigned
+            .iter()
+            .flat_map(|(_, k)| k.iter().cloned())
+            .collect();
         for (id, rel_path) in untagged {
             let folder = rel_path.split_once('/').map(|(f, _)| resolve(f).0);
             let key = match folder {
@@ -297,15 +309,17 @@ impl Catalog {
                 } else if let Some(d) = forced.get(key) {
                     d.clone()
                 } else {
-                    let sp: Vec<(String, usize)> =
-                        spellings[key].iter().map(|(s, n)| (s.clone(), *n)).collect();
+                    let sp: Vec<(String, usize)> = spellings[key]
+                        .iter()
+                        .map(|(s, n)| (s.clone(), *n))
+                        .collect();
                     pick_display(&sp)
                 };
                 ins_genre.execute(params![key, display])?;
                 genre_ids.insert(key.clone(), tx.last_insert_rowid());
             }
-            let mut ins_link =
-                tx.prepare("INSERT OR IGNORE INTO track_genres(track_id, genre_id) VALUES(?1, ?2)")?;
+            let mut ins_link = tx
+                .prepare("INSERT OR IGNORE INTO track_genres(track_id, genre_id) VALUES(?1, ?2)")?;
             for (id, keys) in &assigned {
                 for key in keys {
                     ins_link.execute(params![id, genre_ids[key]])?;
@@ -328,7 +342,11 @@ impl Catalog {
         )?;
         let rows = st
             .query_map([MAX_FAILS], |r| {
-                Ok(GenreCount { key: r.get(0)?, display: r.get(1)?, count: r.get::<_, i64>(2)? as usize })
+                Ok(GenreCount {
+                    key: r.get(0)?,
+                    display: r.get(1)?,
+                    count: r.get::<_, i64>(2)? as usize,
+                })
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
@@ -374,24 +392,34 @@ impl Catalog {
     }
 
     pub fn record_success(&self, id: TrackId) -> Result<()> {
-        self.conn.execute("UPDATE tracks SET fail_count=0 WHERE id=?1", [id])?;
+        self.conn
+            .execute("UPDATE tracks SET fail_count=0 WHERE id=?1", [id])?;
         Ok(())
     }
 
     pub fn set_banned(&self, id: TrackId, banned: bool) -> Result<()> {
-        self.conn.execute("UPDATE tracks SET banned=?2 WHERE id=?1", params![id, banned])?;
+        self.conn.execute(
+            "UPDATE tracks SET banned=?2 WHERE id=?1",
+            params![id, banned],
+        )?;
         Ok(())
     }
 
     pub fn banned(&self) -> Result<Vec<TrackRow>> {
         let sql = format!("SELECT {TRACK_COLS} FROM tracks WHERE banned=1 ORDER BY rel_path");
-        let rows = self.conn.prepare(&sql)?.query_map([], row_to_track)?.collect::<rusqlite::Result<_>>()?;
+        let rows = self
+            .conn
+            .prepare(&sql)?
+            .query_map([], row_to_track)?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
     pub fn set_measured_lufs(&self, id: TrackId, lufs: f32) -> Result<()> {
-        self.conn
-            .execute("UPDATE tracks SET measured_lufs=?2 WHERE id=?1", params![id, f64::from(lufs)])?;
+        self.conn.execute(
+            "UPDATE tracks SET measured_lufs=?2 WHERE id=?1",
+            params![id, f64::from(lufs)],
+        )?;
         Ok(())
     }
 
@@ -407,7 +435,11 @@ impl Catalog {
     pub fn last_first(&self, selection_key: &str) -> Result<Option<TrackId>> {
         Ok(self
             .conn
-            .query_row("SELECT last_first FROM selection_state WHERE selection_key=?1", [selection_key], |r| r.get(0))
+            .query_row(
+                "SELECT last_first FROM selection_state WHERE selection_key=?1",
+                [selection_key],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
@@ -461,7 +493,10 @@ mod tests {
     use super::*;
 
     fn meta(genre: Option<&str>) -> TrackMeta {
-        TrackMeta { raw_genre: genre.map(str::to_string), ..Default::default() }
+        TrackMeta {
+            raw_genre: genre.map(str::to_string),
+            ..Default::default()
+        }
     }
 
     fn add(c: &Catalog, path: &str, genre: Option<&str>) -> TrackId {
@@ -469,7 +504,11 @@ mod tests {
     }
 
     fn count_of(c: &Catalog, key: &str) -> Option<usize> {
-        c.genres().unwrap().into_iter().find(|g| g.key == key).map(|g| g.count)
+        c.genres()
+            .unwrap()
+            .into_iter()
+            .find(|g| g.key == key)
+            .map(|g| g.count)
     }
 
     #[test]
@@ -482,7 +521,9 @@ mod tests {
         assert!(!c.file_unchanged("a/x.mp3", 10, 101).unwrap());
         assert!(!c.file_unchanged("a/x.mp3", 11, 100).unwrap());
         assert!(!c.file_unchanged("nope.mp3", 10, 100).unwrap());
-        let id2 = c.upsert_track("a/x.mp3", 10, 101, &meta(Some("Rock"))).unwrap();
+        let id2 = c
+            .upsert_track("a/x.mp3", 10, 101, &meta(Some("Rock")))
+            .unwrap();
         assert_eq!(id, id2);
         assert_eq!(c.track(id).unwrap().meta.raw_genre.as_deref(), Some("Rock"));
     }
@@ -530,7 +571,12 @@ mod tests {
         assert!(jazz.contains(&j) && jazz.len() == 2);
         let none = c.playable_tracks(&["_none".to_string()]).unwrap();
         assert_eq!(none, vec![m]);
-        let g = c.genres().unwrap().into_iter().find(|g| g.key == "_none").unwrap();
+        let g = c
+            .genres()
+            .unwrap()
+            .into_iter()
+            .find(|g| g.key == "_none")
+            .unwrap();
         assert_eq!(g.display, "(bez žanra)");
     }
 
@@ -660,6 +706,9 @@ mod tests {
         assert_eq!(c.playable_tracks(&[]).unwrap().len(), 50_000);
         let d2 = t.elapsed();
         assert!(d1 < Duration::from_millis(200), "genres() took {d1:?}");
-        assert!(d2 < Duration::from_millis(200), "playable_tracks took {d2:?}");
+        assert!(
+            d2 < Duration::from_millis(200),
+            "playable_tracks took {d2:?}"
+        );
     }
 }

@@ -178,3 +178,43 @@ fn live_scan_reads_tags_sample() {
         assert!(report.failed < report.read, "{}: {report:?}", cfg.host);
     }
 }
+
+/// Failover only works if both servers use the same relative paths: take 20
+/// files spread across the primary (every 25th audio file) and open each one,
+/// read-only, on the secondary. Skipped when no secondary is configured.
+#[test]
+#[ignore]
+fn live_sample_paths_exist_on_both_servers() {
+    let servers = servers();
+    let [primary, secondary] = &servers[..] else {
+        println!("no SMB_TEST2_HOST configured, skipping");
+        return;
+    };
+    let (p, s) = (connect(primary), connect(secondary));
+    let mut n = 0usize;
+    let sample = p
+        .walk_limited(20, &mut |_| {
+            n += 1;
+            n % 25 == 1
+        })
+        .unwrap();
+    assert!(!sample.is_empty(), "{}: no audio files", primary.host);
+    let missing: Vec<_> = sample
+        .iter()
+        .filter(|e| match s.open(&e.rel_path) {
+            Ok(_) => false,
+            Err(err) => {
+                println!("{}: {} -> {err}", secondary.host, e.rel_path);
+                true
+            }
+        })
+        .map(|e| e.rel_path.as_str())
+        .collect();
+    println!(
+        "{} of {} sampled paths exist on {}",
+        sample.len() - missing.len(),
+        sample.len(),
+        secondary.host
+    );
+    assert!(missing.is_empty(), "missing on secondary: {missing:?}");
+}
