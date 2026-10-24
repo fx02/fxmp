@@ -32,6 +32,7 @@
 <nav class="tabs" role="tablist">
   <button class="tab" data-tab="genres" role="tab" data-i18n="tabs.genres"></button>
   <button class="tab" data-tab="artists" role="tab" data-i18n="tabs.artists"></button>
+  <button class="tab" data-tab="unreadable" role="tab" id="tab-btn-unreadable"></button>
   <button class="tab" data-tab="settings" role="tab" data-i18n="tabs.settings"></button>
 </nav>
 
@@ -45,6 +46,7 @@
     <div id="genre-scan" class="note" hidden></div>
     <ul id="genre-list" class="list"></ul>
     <p id="genre-empty" class="note" hidden></p>
+    <button id="btn-empty-scan" hidden data-i18n="settings.refresh"></button>
   </section>
 
   <section id="tab-artists" class="panel" hidden>
@@ -53,6 +55,16 @@
     </div>
     <ul id="artist-list" class="list"></ul>
     <p id="artist-note" class="note" hidden></p>
+  </section>
+
+  <section id="tab-unreadable" class="panel" hidden>
+    <div class="toolbar">
+      <button id="btn-copy-all" data-i18n="unreadable.copy_all"></button>
+      <button id="btn-retry-all" data-i18n="unreadable.retry_all"></button>
+    </div>
+    <p class="note" data-i18n="unreadable.hint"></p>
+    <ul id="unreadable-list" class="list unreadable"></ul>
+    <p id="unreadable-empty" class="note" hidden data-i18n="unreadable.empty"></p>
   </section>
 
   <section id="tab-settings" class="panel settings" hidden>
@@ -120,6 +132,12 @@
     <h3 data-i18n="settings.banned"></h3>
     <ul id="banned-list" class="list compact"></ul>
     <p id="banned-empty" class="note" hidden data-i18n="settings.no_banned"></p>
+
+    <h3 class="danger-title" data-i18n="settings.danger"></h3>
+    <div class="danger-zone">
+      <button id="btn-reset" class="danger" data-i18n="settings.reset"></button>
+      <button id="btn-clear" class="danger" data-i18n="settings.clear"></button>
+    </div>
   </section>
 </main>
 
@@ -135,6 +153,19 @@
     <div class="row end">
       <button type="button" id="dialog-cancel" data-i18n="common.cancel"></button>
       <button type="submit" class="primary" data-i18n="merge.button"></button>
+    </div>
+  </form>
+</div>
+
+<div id="confirm" class="overlay" hidden>
+  <form id="confirm-form" class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+    <p id="confirm-title" class="dialog-title"></p>
+    <p id="confirm-text"></p>
+    <label id="confirm-check-row" class="check" hidden><input id="confirm-check" type="checkbox"> <span id="confirm-check-label"></span></label>
+    <p id="confirm-note" class="note" hidden></p>
+    <div class="row end">
+      <button type="button" id="confirm-cancel" data-i18n="common.cancel"></button>
+      <button type="submit" id="confirm-ok" class="danger-solid"></button>
     </div>
   </form>
 </div>

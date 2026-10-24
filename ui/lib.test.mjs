@@ -18,6 +18,12 @@ import {
   pluralCategory,
   PLURAL_CATEGORIES,
   makeT,
+  albumLabel,
+  reasonText,
+  FAIL_CODES,
+  unreadableTabLabel,
+  copyAllText,
+  formatWhen,
 } from "./lib.mjs";
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
@@ -45,6 +51,48 @@ test("trackLabel shows artist – title, falls back gracefully, dash when idle",
   assert.equal(trackLabel({ artist: "", title: "Porcelain" }), "Porcelain");
   assert.equal(trackLabel({ artist: "Moby", title: "" }), "Moby");
   assert.equal(trackLabel({ artist: "", title: "" }), "—");
+});
+
+test("trackLabel ends with the year when there is one", () => {
+  assert.equal(trackLabel({ artist: "Moby", title: "Porcelain", year: 1999 }), "Moby – Porcelain (1999)");
+  assert.equal(trackLabel({ artist: "", title: "Porcelain", year: 1999 }), "Porcelain (1999)");
+  assert.equal(trackLabel({ artist: "Moby", title: "Porcelain", year: null }), "Moby – Porcelain");
+  assert.equal(trackLabel({ artist: "", title: "", year: 1999 }), "—");
+});
+
+test("albumLabel shows the year next to the album, without digit grouping", () => {
+  assert.equal(albumLabel({ name: "Play", year: 1999 }, en), "Play (1999)");
+  assert.equal(albumLabel({ name: "Play", year: null }, en), "Play");
+  assert.equal(albumLabel({ name: "", year: 2001 }, en), "(no album) (2001)");
+  assert.equal(albumLabel({ name: "", year: null }, hr), "(bez albuma)");
+});
+
+test("unreadable: reasons, tab label and the copy-all text", () => {
+  assert.deepEqual(FAIL_CODES, ["not_found", "timeout", "unreachable", "decode", "unsupported", "tag", "io"]);
+  for (const code of [...FAIL_CODES, "unknown"]) {
+    for (const lang of Object.keys(LOCALES)) assert.ok(`unreadable.reason_${code}` in LOCALES[lang], `${lang} ${code}`);
+  }
+  assert.equal(reasonText("timeout", en), "The server did not answer in time");
+  assert.equal(reasonText(null, en), "Unknown reason");
+  assert.equal(reasonText("weird", hr), "Nepoznat razlog");
+  assert.equal(unreadableTabLabel(0, en), "Unreadable");
+  assert.equal(unreadableTabLabel(1234, en), `Unreadable (1${NB}234)`);
+  assert.equal(unreadableTabLabel(3, hr), "Nečitljivo (3)");
+  const rows = [
+    { path: "smb://h/F/MP3/a b.mp3", code: "not_found", message: "source error: not found" },
+    { path: "smb://h/F/MP3/c.flac", code: null, message: null },
+  ];
+  assert.equal(
+    copyAllText(rows, en),
+    "smb://h/F/MP3/a b.mp3\tFile not found (source error: not found)\nsmb://h/F/MP3/c.flac\tUnknown reason",
+  );
+  assert.equal(copyAllText([], en), "");
+});
+
+test("formatWhen shows a date for Unix seconds and nothing without one", () => {
+  assert.equal(formatWhen(null, "en"), "");
+  const text = formatWhen(1_700_000_000, "en");
+  assert.match(text, /2023/);
 });
 
 test("foldForSearch ignores case and diacritics", () => {
@@ -119,7 +167,7 @@ test("locales: plural forms match the language's categories, placeholders match 
 });
 
 test("every translation key used by the UI and the Rust code exists", () => {
-  const KEY = /["'`]((?:language|player|conn|tabs|genres|merge|common|artists|albums|settings|scan|tray|err)\.[a-z_]+)["'`]/g;
+  const KEY = /["'`]((?:language|player|conn|tabs|genres|merge|common|artists|albums|settings|scan|tray|err|unreadable)\.[a-z_]+)["'`]/g;
   const sources = [read("./app.js"), read("./lib.mjs"), read("./index.html")];
   const rustDir = new URL("../src-tauri/src/", import.meta.url);
   for (const f of readdirSync(rustDir).filter((f) => f.endsWith(".rs"))) sources.push(read(`../src-tauri/src/${f}`));

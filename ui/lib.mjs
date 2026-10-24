@@ -8,11 +8,20 @@ export function formatCount(n) {
   return String(Math.trunc(n)).replace(/\B(?=(\d{3})+(?!\d))/g, NBSP);
 }
 
-/** "Artist – Title" for the now-playing bar; "—" when nothing plays. */
+/** "Artist – Title (1991)" for the now-playing bar (no year if unknown); "—" when nothing plays. */
 export function trackLabel(np) {
   if (!np) return "—";
   const parts = [np.artist, np.title].map((s) => (s || "").trim()).filter(Boolean);
-  return parts.length ? parts.join(" – ") : "—";
+  if (!parts.length) return "—";
+  const label = parts.join(" – ");
+  return np.year ? `${label} (${np.year})` : label;
+}
+
+/** An album of the artist list: "Name (1999)"; the year is left out when unknown. */
+export function albumLabel(album, t) {
+  const name = album.name || t("albums.unknown");
+  // A string, so the year is not grouped like a count ("1 999").
+  return album.year ? t("albums.year", { name, year: String(album.year) }) : name;
 }
 
 /** Lowercase, no diacritics, trimmed: "Čvrsto" and "cvrsto" match. */
@@ -173,4 +182,35 @@ export function passwordRequired(saved, form) {
   if (!saved || missingUsername(saved)) return true;
   const t = (v) => (v || "").trim();
   return ["host", "share", "username"].some((f) => t(saved[f]) !== t(form[f]));
+}
+
+// ---------- unreadable files ----------
+
+/** Failure codes the backend stores (see `crates/core/src/failure.rs`). */
+export const FAIL_CODES = ["not_found", "timeout", "unreachable", "decode", "unsupported", "tag", "io"];
+
+/** Why a file is unreadable, in words; "Unknown reason" when not recorded. */
+export function reasonText(code, t) {
+  return t(`unreadable.reason_${FAIL_CODES.includes(code) ? code : "unknown"}`);
+}
+
+/** The tab's label, with the count when there are unreadable files. */
+export function unreadableTabLabel(n, t) {
+  return n ? t("tabs.unreadable_n", { n }) : t("tabs.unreadable");
+}
+
+/** "Copy all": one line per file, "path<TAB>reason (message)". */
+export function copyAllText(rows, t) {
+  return rows
+    .map((r) => {
+      const reason = reasonText(r.code, t);
+      return `${r.path}\t${r.message ? `${reason} (${r.message})` : reason}`;
+    })
+    .join("\n");
+}
+
+/** Unix seconds as a short local date and time in `lang`; "" when unknown. */
+export function formatWhen(secs, lang) {
+  if (!secs) return "";
+  return new Date(secs * 1000).toLocaleString(lang, { dateStyle: "medium", timeStyle: "short" });
 }

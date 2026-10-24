@@ -13,6 +13,11 @@ import {
   passwordRequired,
   mergeChoices,
   makeT,
+  albumLabel,
+  reasonText,
+  unreadableTabLabel,
+  copyAllText,
+  formatWhen,
 } from "./lib.mjs";
 
 const { invoke } = window.__TAURI__.core;
@@ -44,6 +49,9 @@ const state = {
   status: null,
   statusChecking: false,
   scanText: null,
+  // "Unreadable" tab: the count on the tab and the rows (loaded when shown).
+  unreadableCount: 0,
+  unreadable: null,
 };
 
 // ---------- helpers ----------
@@ -67,6 +75,33 @@ async function run(cmd, args) {
   }
 }
 
+/** Puts `text` on the clipboard; resolves to whether it worked. */
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Fallback for a webview without the async clipboard.
+    const area = el("textarea", { value: text });
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.append(area);
+    area.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    area.remove();
+    return ok;
+  }
+}
+
+async function copyAndTell(text) {
+  toast((await copyText(text)) ? t("unreadable.copied") : t("unreadable.copy_failed"));
+}
+
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
   Object.assign(node, props);
@@ -86,6 +121,7 @@ function showTab(name) {
   for (const p of document.querySelectorAll(".panel")) p.hidden = p.id !== `tab-${name}`;
   $("menu").hidden = true;
   if (name === "artists") loadArtists();
+  if (name === "unreadable") loadUnreadable();
   if (name === "settings") {
     loadDevices();
     loadBanned();
@@ -262,6 +298,8 @@ function renderGenres() {
     empty.textContent = t("genres.no_match");
   }
   empty.hidden = Boolean(shown.length);
+  // An empty library offers the refresh right here.
+  $("btn-empty-scan").hidden = Boolean(state.genres.length) || !state.configured || state.scanning;
   $("btn-play-all").disabled = !state.genres.length;
   renderSelection();
 }
@@ -401,8 +439,8 @@ async function toggleAlbums(li) {
   if (!albums || !li.isConnected) return;
   const ul = el("ul", { className: "albums" });
   for (const album of albums) {
-    const a = el("li", {}, el("span", { className: "name", textContent: album || t("albums.unknown"), title: t("albums.play") }));
-    a.dataset.album = album;
+    const a = el("li", {}, el("span", { className: "name", textContent: albumLabel(album, t), title: t("albums.play") }));
+    a.dataset.album = album.name;
     ul.append(a);
   }
   if (!albums.length) ul.append(el("li", { className: "note", textContent: t("albums.none") }));
@@ -410,6 +448,175 @@ async function toggleAlbums(li) {
   wrap.dataset.artist = artist;
   li.after(wrap);
   li.classList.add("open");
+}
+
+// ---------- unreadable files ----------
+
+function renderUnreadableTab() {
+  $("tab-btn-unreadable").textContent = unreadableTabLabel(state.unreadableCount, t);
+}
+
+async function loadUnreadableCount() {
+  const n = await run("unreadable_count");
+  if (n === undefined) return;
+  state.unreadableCount = n;
+  renderUnreadableTab();
+}
+
+async function loadUnreadable() {
+  const rows = await run("list_unreadable");
+  if (!rows) return;
+  state.unreadable = rows;
+  state.unreadableCount = rows.length;
+  renderUnreadableTab();
+  renderUnreadable();
+}
+
+function renderUnreadable() {
+  const rows = state.unreadable || [];
+  const lang = document.documentElement.lang || "en";
+  const frag = document.createDocumentFragment();
+  for (const row of rows) {
+    const reason = reasonText(row.code, t);
+    const meta = el("div", { className: "meta" });
+    const parts = [reason, t("unreadable.fails", { n: row.fail_count }), formatWhen(row.at, lang)].filter(Boolean);
+    meta.append(parts.join(" · "));
+    if (row.excluded) meta.append(" · ", el("span", { className: "excluded", textContent: t("unreadable.excluded") }));
+    if (row.message) meta.title = row.message;
+    const li = el(
+      "li",
+      {},
+      el("div", { className: "info" }, el("span", { className: "path", textContent: row.path, title: row.path }), meta),
+      el(
+        "div",
+        { className: "actions" },
+        el("button", { className: "copy", textContent: t("unreadable.copy") }),
+        el("button", { className: "retry", textContent: t("unreadable.retry") }),
+      ),
+    );
+    li.dataset.id = row.id;
+    frag.append(li);
+  }
+  $("unreadable-list").replaceChildren(frag);
+  $("unreadable-empty").hidden = rows.length > 0;
+  $("btn-copy-all").disabled = !rows.length;
+  $("btn-retry-all").disabled = !rows.length;
+}
+
+/** After `unreadable-changed`: the count always, the list when it is on screen. */
+const refreshUnreadable = debounce(() => {
+  if (state.tab === "unreadable") loadUnreadable();
+  else loadUnreadableCount();
+}, 300);
+
+async function retryUnreadable(id) {
+  try {
+    await invoke("retry_unreadable", { id });
+  } catch (e) {
+    toast(String(e));
+  }
+  loadUnreadable();
+}
+
+// ---------- danger zone ----------
+
+/**
+ * Asks for confirmation. `check` (optional) adds a checkbox: `{ label, note(checked) }`.
+ * Resolves to `{ checked }` when confirmed, null when cancelled.
+ */
+function confirmDialog({ title, text, okLabel, check }) {
+  return new Promise((resolve) => {
+    const overlay = $("confirm");
+    const box = $("confirm-check");
+    const note = $("confirm-note");
+    $("confirm-title").textContent = title;
+    $("confirm-text").textContent = text;
+    $("confirm-ok").textContent = okLabel;
+    $("confirm-check-row").hidden = !check;
+    box.checked = false;
+    const renderNote = () => {
+      note.hidden = !check;
+      if (check) note.textContent = check.note(box.checked);
+    };
+    if (check) $("confirm-check-label").textContent = check.label;
+    renderNote();
+    overlay.hidden = false;
+    $("confirm-cancel").focus();
+    const finish = (value) => {
+      overlay.hidden = true;
+      $("confirm-form").onsubmit = null;
+      $("confirm-cancel").onclick = null;
+      box.onchange = null;
+      overlay.onkeydown = null;
+      resolve(value);
+    };
+    box.onchange = renderNote;
+    $("confirm-form").onsubmit = (e) => {
+      e.preventDefault();
+      finish({ checked: box.checked });
+    };
+    $("confirm-cancel").onclick = () => finish(null);
+    overlay.onkeydown = (e) => {
+      if (e.key === "Escape") finish(null);
+    };
+  });
+}
+
+async function onReset() {
+  const answer = await confirmDialog({
+    title: t("settings.reset_title"),
+    text: t("settings.reset_text"),
+    okLabel: t("settings.reset_button"),
+    check: {
+      label: t("settings.reset_forget"),
+      note: (forget) => t(forget ? "settings.reset_forget_text" : "settings.reset_keep_servers"),
+    },
+  });
+  if (!answer) return;
+  let settings;
+  try {
+    settings = await invoke("reset_settings", { forget_servers: answer.checked });
+  } catch (e) {
+    toast(String(e));
+    // Part of it may have happened (passwords deleted): show what is saved now.
+    settings = await run("get_settings");
+    if (!settings) return;
+  }
+  state.settings = settings;
+  state.configured = !missingUsername(settings.primary);
+  renderSettings(settings);
+  loadDevices();
+  if (!state.configured) renderStatus(null);
+  renderGenres();
+  toast(t("settings.reset_done"));
+}
+
+async function onClear() {
+  const answer = await confirmDialog({
+    title: t("settings.clear_title"),
+    text: t("settings.clear_text"),
+    okLabel: t("settings.clear_button"),
+  });
+  if (!answer) return;
+  try {
+    await invoke("clear_library");
+  } catch (e) {
+    toast(String(e));
+    return;
+  }
+  state.genres = [];
+  state.selected.clear();
+  state.artists = null;
+  state.artistsStale = true;
+  state.unreadable = null;
+  state.unreadableCount = 0;
+  if (state.settings) state.settings.last_selection = [];
+  renderUnreadableTab();
+  renderArtists();
+  loadBanned();
+  showTab("genres");
+  renderGenres();
+  toast(t("settings.clear_done"));
 }
 
 // ---------- settings ----------
@@ -625,6 +832,8 @@ function rerender() {
   renderStatus(state.status, state.statusChecking);
   renderGenres();
   if (state.artists) renderArtists();
+  renderUnreadableTab();
+  if (state.unreadable) renderUnreadable();
   const scan = state.scanText;
   if (scan) {
     const text = scan.done ? scanDoneText(scan.done, t) : scanProgressText(scan.progress, t);
@@ -738,6 +947,23 @@ function wire() {
     run("set_normalize", { b: e.target.checked });
   });
   $("btn-scan").addEventListener("click", startScan);
+  $("btn-empty-scan").addEventListener("click", startScan);
+
+  // Unreadable files
+  $("unreadable-list").addEventListener("click", (e) => {
+    const li = e.target.closest("li");
+    if (!li || e.target.tagName !== "BUTTON") return;
+    const row = (state.unreadable || []).find((r) => r.id === Number(li.dataset.id));
+    if (!row) return;
+    if (e.target.classList.contains("copy")) copyAndTell(row.path);
+    else if (e.target.classList.contains("retry")) retryUnreadable(row.id);
+  });
+  $("btn-copy-all").addEventListener("click", () => copyAndTell(copyAllText(state.unreadable || [], t)));
+  $("btn-retry-all").addEventListener("click", () => retryUnreadable(null));
+
+  // Danger zone
+  $("btn-reset").addEventListener("click", onReset);
+  $("btn-clear").addEventListener("click", onClear);
   $("btn-scan-cancel").addEventListener("click", () => run("cancel_scan"));
   $("banned-list").addEventListener("click", async (e) => {
     if (e.target.tagName !== "BUTTON") return;
@@ -769,6 +995,7 @@ async function init() {
       if (state.tab === "artists") reloadArtists();
     }),
     listen("track-skipped", (e) => console.info("skipped:", e.payload)),
+    listen("unreadable-changed", () => refreshUnreadable()),
   ]);
 
   if (settings) {
@@ -786,6 +1013,8 @@ async function init() {
   renderStatus(status || null);
   renderNowPlaying(np || null);
   if (scan && scan.scanning) renderScanProgress(scan.progress);
+  renderUnreadableTab();
+  loadUnreadableCount();
   await loadGenres();
 }
 
