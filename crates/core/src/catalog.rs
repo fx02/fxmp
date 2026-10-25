@@ -669,6 +669,16 @@ impl Catalog {
         }
     }
 
+    /// Rolls back a transaction left open (by a write that panicked), so the
+    /// connection can start new ones.
+    pub fn roll_back_open_transaction(&self) {
+        if !self.conn.is_autocommit() {
+            if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+                log::warn!("catalog: cannot roll back an open transaction: {e}");
+            }
+        }
+    }
+
     /// No track of a library that is on.
     pub fn is_empty(&self) -> Result<bool> {
         let n: i64 = self.conn.query_row(

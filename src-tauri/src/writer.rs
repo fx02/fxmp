@@ -25,7 +25,12 @@ impl CatalogWriter {
             .name("catalog-writer".into())
             .spawn(move || {
                 for job in rx {
-                    job(&mut catalog);
+                    // A bug in one write must not stop every later one.
+                    let run = std::panic::AssertUnwindSafe(|| job(&mut catalog));
+                    if std::panic::catch_unwind(run).is_err() {
+                        log::error!("a catalog write panicked; the writer goes on");
+                        catalog.roll_back_open_transaction();
+                    }
                 }
             })?;
         Ok(Self { tx })
@@ -153,5 +158,33 @@ mod tests {
         w.send("first", |c| c.set_last_first("k", 1));
         w.send("second", |c| c.set_last_first("k", 2));
         assert_eq!(w.call(|c| c.last_first("k")).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn a_panicking_job_does_not_stop_later_writes() {
+        let w = CatalogWriter::spawn(Catalog::open_in_memory().unwrap()).unwrap();
+        w.call(|c| {
+            for p in ["1.mp3", "2.mp3"] {
+                c.upsert_track(1, p, 1, 1, &smp_core::catalog::TrackMeta::default())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        w.send("bug", |_| panic!("a bug in a write"));
+        // One that panics inside a transaction leaves none open behind it.
+        let r: smp_core::Result<()> = w.call(|c| {
+            c.transaction(|c| {
+                c.set_last_first("k", 1)?;
+                panic!("a bug mid-transaction")
+            })
+        });
+        assert!(r.is_err(), "the caller hears of it");
+        w.send("after", |c| c.set_last_first("k", 2));
+        assert_eq!(w.call(|c| c.last_first("k")).unwrap(), Some(2));
+        assert_eq!(
+            w.call(|c| c.transaction(|c| c.last_first("k"))).unwrap(),
+            Some(2),
+            "rolled back, and a new transaction starts"
+        );
     }
 }
