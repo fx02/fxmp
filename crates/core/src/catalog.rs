@@ -622,7 +622,10 @@ impl Catalog {
 
     /// Run `f` in a single transaction (bulk upserts); rolled back on error.
     pub fn transaction<T>(&mut self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
-        self.conn.execute_batch("BEGIN")?;
+        // IMMEDIATE: a transaction that reads first would otherwise fail at its
+        // first write (SQLITE_BUSY_SNAPSHOT, no busy wait) when another
+        // connection wrote in between; this way it waits its turn up front.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match f(self) {
             Ok(v) => {
                 self.conn.execute_batch("COMMIT")?;
@@ -1501,6 +1504,37 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::failure::{FailCode, Failure};
+
+    #[test]
+    fn a_transaction_that_reads_first_does_not_fail_on_another_connections_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.db");
+        let mut scan = Catalog::open(&path).unwrap();
+        let id = scan
+            .upsert_track(DEFAULT_LIBRARY, "a.mp3", 1, 1, &TrackMeta::default())
+            .unwrap();
+        let other = std::thread::scope(|s| {
+            let r = scan.transaction(|c| {
+                assert!(c.file_unchanged(DEFAULT_LIBRARY, "a.mp3", 1, 1)?);
+                // The player's writer saves loudness meanwhile.
+                let writer = s.spawn(|| {
+                    Catalog::open(&path)
+                        .and_then(|w| w.set_measured_lufs(id, -10.0))
+                        .map_err(|e| e.to_string())
+                });
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                c.mark_seen(DEFAULT_LIBRARY, "a.mp3")?;
+                Ok(writer)
+            });
+            r.map(|w| w.join().unwrap())
+        });
+        assert_eq!(
+            other.unwrap(),
+            Ok(()),
+            "both writes go through, one after the other"
+        );
+        assert_eq!(scan.track(id).unwrap().measured_lufs, Some(-10.0));
+    }
     use crate::queue::Entry;
     use crate::source::Which;
     use crate::DEFAULT_LIBRARY;
