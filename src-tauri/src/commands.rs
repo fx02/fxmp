@@ -945,8 +945,9 @@ pub fn set_volume_now(app: &AppHandle, st: &AppState, v: f32) {
 }
 
 /// Picks the output device (`None` = system default) from Settings or the tray.
-/// Picking the current one again leaves the player alone (a device switch drops
-/// the sound for a moment); the tray's marks are still put right.
+/// Picking the current one again is sent too: the player leaves an output open on
+/// it alone (no dropout) and reopens it after an unplug fallback; the tray's marks
+/// are put right either way.
 pub fn set_device_now(app: &AppHandle, st: &AppState, name: Option<String>) {
     let s = switch_device(&st.settings, name, |d| {
         st.player.send(Command::SetDevice(d))
