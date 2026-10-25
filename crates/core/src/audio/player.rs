@@ -76,6 +76,8 @@ pub enum Command {
     Next,
     /// Linear volume, 0..1.
     SetVolume(f32),
+    /// Output device (`None` = system default). Ignored when the output is open on
+    /// that device already; after a fallback to the default it reopens the device.
     SetDevice(Option<String>),
     SetCrossfade {
         enabled: bool,
@@ -379,6 +381,10 @@ impl Engine {
                     self.volume_target = v.clamp(0.0, 1.0);
                 }
             }
+            // Already open on that very device: nothing to do (a reopen would be
+            // a dropout). After a fallback to the default output it reopens.
+            Command::SetDevice(d)
+                if d == self.device && !self.use_default && self.sink.is_some() => {}
             Command::SetDevice(d) => {
                 self.device = d;
                 self.use_default = false;

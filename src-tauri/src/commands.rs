@@ -954,25 +954,15 @@ pub fn set_device_now(app: &AppHandle, st: &AppState, name: Option<String>) {
     audio_changed(app, &s);
 }
 
-/// Saves `name` as the output device and calls `send` with it, under the
-/// settings lock, only when it differs from the saved one.
+/// Saves `name` as the output device and calls `send` with it, under the settings
+/// lock. Always sent: picking the saved device again brings it back after the
+/// player fell back to the default output (the player ignores a device it has open).
 pub fn switch_device(
     store: &SettingsStore,
     name: Option<String>,
     send: impl FnOnce(Option<String>),
 ) -> Settings {
-    let changed = std::cell::Cell::new(false);
-    store.update(
-        |s| {
-            changed.set(s.device != name);
-            s.device = name;
-        },
-        |s| {
-            if changed.get() {
-                send(s.device.clone());
-            }
-        },
-    )
+    store.update(|s| s.device = name, |s| send(s.device.clone()))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1584,15 +1574,18 @@ mod tests {
     }
 
     #[test]
-    fn picking_the_current_device_again_does_not_switch() {
+    fn picking_the_saved_device_again_is_sent_to_the_player() {
         let dir = tempfile::tempdir().unwrap();
         let store = SettingsStore::new(dir.path().join("s.json"), Settings::default()).unwrap();
         let mut sent = Vec::new();
         switch_device(&store, Some("DAC".into()), |d| sent.push(d));
+        // After an unplug fallback this is the way back: the player decides.
         switch_device(&store, Some("DAC".into()), |d| sent.push(d));
         let s = switch_device(&store, None, |d| sent.push(d));
-        switch_device(&store, None, |d| sent.push(d));
-        assert_eq!(sent, [Some("DAC".to_string()), None]);
+        assert_eq!(
+            sent,
+            [Some("DAC".to_string()), Some("DAC".to_string()), None]
+        );
         assert_eq!(s.device, None);
     }
 }

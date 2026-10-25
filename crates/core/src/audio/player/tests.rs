@@ -591,6 +591,35 @@ fn device_error_falls_back_to_default() {
 }
 
 #[test]
+fn picking_the_open_device_again_keeps_it_but_recovers_after_a_fallback() {
+    let mut h = Harness::new(Opts {
+        speed: Some(4.0),
+        lose_first_after: Some(RATE as usize * 2),
+        ..Default::default()
+    });
+    let usb = || Some("Fake USB".to_string());
+    h.player.send(Command::SetDevice(usb()));
+    h.play(vec![tone(1, 500)]);
+    h.wait("first device", 5, |e| {
+        *e == Event::DeviceChanged("Fake USB".into())
+    });
+    h.wait("fallback", 5, |e| {
+        *e == Event::DeviceChanged("Fake default".into())
+    });
+    // Re-plugged and picked again (it is still the saved device): back on it.
+    h.player.send(Command::SetDevice(usb()));
+    h.wait("back on the device", 5, |e| {
+        *e == Event::DeviceChanged("Fake USB".into())
+    });
+    assert_eq!(*h.opened.lock().unwrap(), [usb(), None, usb()]);
+    // Picked again while open on it: no reopen, so no dropout.
+    h.player.send(Command::SetDevice(usb()));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(h.opened.lock().unwrap().len(), 3, "not reopened");
+    h.player.send(Command::Stop);
+}
+
+#[test]
 fn rate_change_resumes_track_at_new_rate() {
     let lose_after = RATE as usize * 2 * 5; // 5 s at 48 kHz
     let mut h = Harness::new(Opts {
