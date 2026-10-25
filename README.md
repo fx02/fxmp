@@ -155,8 +155,8 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
     click never also skips). To tell the two apart, "next" waits for the
     double-click time to pass: the system double-click interval, max 0.4 s
     (0.4 s on a default Mac; shorter if System Settings → Mouse/Trackpad →
-    Double-click speed is faster). So a single click reacts that much later
-    than before.
+    Double-click speed is faster; on Windows the system double-click time,
+    0.25–0.9 s). So a single click reacts that much later than before.
   - Right click opens the menu: the current track; Pause, Previous, Next, Ban;
     **Look up current song** (on the default lookup site) and **Copy current
     song** ("Artist – Title (Year)"); Genre; **Volume** (0–100 % in steps of

@@ -7,10 +7,13 @@
 
 use std::time::{Duration, Instant};
 
-/// The shortest and the longest double-click window used on macOS, whatever the
-/// system says.
+/// The shortest double-click window, and the longest one used on macOS, whatever
+/// the system says.
 pub const MIN_WINDOW: Duration = Duration::from_millis(250);
 pub const MAX_WINDOW: Duration = Duration::from_millis(400);
+/// The longest double-click window used on Windows: a slower system setting
+/// (up to 5 s) would hold up every Next that long.
+pub const WINDOWS_MAX_WINDOW: Duration = Duration::from_millis(900);
 /// Windows' default `GetDoubleClickTime`, if it cannot be read.
 pub const WINDOWS_DEFAULT: Duration = Duration::from_millis(500);
 
@@ -99,12 +102,16 @@ impl ClickClassifier {
     }
 }
 
-/// The double-click window: on Windows exactly the system interval (the system
-/// reports a double click up to that long after the first click, so "Next" must
-/// not fire earlier); elsewhere the system interval clamped by [`clamp_window`].
+/// The double-click window: on Windows the system interval (the system reports a
+/// double click up to that long after the first click, so "Next" should not fire
+/// earlier), clamped to [`MIN_WINDOW`]..=[`WINDOWS_MAX_WINDOW`]; a double click
+/// slower than the cap gives one Next and no pause (see `double_click`).
+/// Elsewhere the system interval clamped by [`clamp_window`].
 pub fn window_for(system: Option<Duration>, windows: bool) -> Duration {
     if windows {
-        system.unwrap_or(WINDOWS_DEFAULT)
+        system
+            .unwrap_or(WINDOWS_DEFAULT)
+            .clamp(MIN_WINDOW, WINDOWS_MAX_WINDOW)
     } else {
         clamp_window(system)
     }
@@ -241,11 +248,14 @@ mod tests {
     }
 
     #[test]
-    fn on_windows_the_window_is_the_system_interval_unclamped() {
+    fn on_windows_the_window_is_the_system_interval_capped_at_900_ms() {
         // Windows reports the double click up to GetDoubleClickTime after the
-        // first click: the window must be at least that long.
+        // first click: the window is that long, but Next never waits more than
+        // 0.9 s (a slower double click still only toggles, see below).
         assert_eq!(window_for(Some(ms(500)), true), ms(500));
         assert_eq!(window_for(Some(ms(900)), true), ms(900));
+        assert_eq!(window_for(Some(ms(5000)), true), WINDOWS_MAX_WINDOW);
+        assert_eq!(window_for(Some(ms(100)), true), MIN_WINDOW);
         assert_eq!(window_for(None, true), WINDOWS_DEFAULT);
         assert_eq!(window_for(Some(ms(500)), false), MAX_WINDOW);
         assert_eq!(window_for(Some(ms(100)), false), MIN_WINDOW);
