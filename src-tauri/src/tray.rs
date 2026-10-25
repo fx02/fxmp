@@ -1,29 +1,42 @@
 //! Menu bar (tray) icon and its menu.
 
-use std::sync::mpsc::{self, Sender};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
+use smp_core::audio::output::list_output_devices;
 use smp_core::audio::player::Command;
 use smp_core::catalog::GenreCount;
 use smp_core::genre::UNKNOWN_KEY;
 use tauri::image::Image;
-use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Listener, Manager, Wry};
 
-use crate::commands::{ban_current_now, play_genres_now, play_pause_now, spawn_action};
-use crate::i18n::{self, tr};
+use crate::commands::{
+    ban_current_now, play_genres_now, play_pause_now, previous_now, set_device_now, set_volume_now,
+    spawn_action,
+};
+use crate::i18n::{self, tr, trf};
+use crate::lookup;
 use crate::state::{self, lock, AppState, NowPlaying};
+use crate::tray_click::{self, ClickAction, ClickClassifier};
 
 /// Genres change in bursts (every few seconds during a scan): the submenu is rebuilt
 /// once they settle for this long.
 const GENRE_MENU_DEBOUNCE: Duration = Duration::from_secs(1);
 const TOOLTIP_IDLE: &str = "SMB Music Player";
 const ID_TOGGLE: &str = "toggle";
+const ID_PREVIOUS: &str = "previous";
 const ID_NEXT: &str = "next";
 const ID_BAN: &str = "ban";
+const ID_LOOKUP: &str = "lookup";
+const ID_COPY: &str = "copy";
 const ID_SHOW: &str = "show";
 const ID_QUIT: &str = "quit";
+const VOLUME_ID_PREFIX: &str = "vol:";
+const OUTPUT_DEFAULT_ID: &str = "out-default";
+const OUTPUT_ID_PREFIX: &str = "out:";
 
 /// Genres in the "Genre" submenu besides "All" and the last selection.
 pub const TOP_GENRES: usize = 30;
@@ -39,6 +52,14 @@ pub struct GenreEntry {
     pub label: String,
 }
 
+/// A check item of the "Volume" or "Output" submenu.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckEntry {
+    pub id: String,
+    pub label: String,
+    pub checked: bool,
+}
+
 /// What a "Genre" submenu item plays.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GenrePick {
@@ -51,12 +72,19 @@ struct Tray {
     icon: TrayIcon,
     now: MenuItem<Wry>,
     pause: MenuItem<Wry>,
+    previous: MenuItem<Wry>,
     next: MenuItem<Wry>,
     ban: MenuItem<Wry>,
+    lookup: MenuItem<Wry>,
+    copy: MenuItem<Wry>,
+    volume: Submenu<Wry>,
+    output: Submenu<Wry>,
     genres: Submenu<Wry>,
     show: MenuItem<Wry>,
     quit: MenuItem<Wry>,
     rebuild_genres: Sender<()>,
+    rebuild_audio: Sender<()>,
+    clicks: Mutex<ClickClassifier>,
 }
 
 /// Creates the tray icon. Runs on the main thread, after `AppState::init`.
@@ -79,27 +107,50 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         false,
         None::<&str>,
     )?;
+    let previous = item(ID_PREVIOUS, "player.previous", false)?;
     let next = item(ID_NEXT, "player.next", true)?;
     let ban = item(ID_BAN, "player.ban", false)?;
-    // Filled in the background: the catalog is not queried on the main thread.
+    let lookup = item(ID_LOOKUP, "tray.lookup_current", false)?;
+    let copy = item(ID_COPY, "tray.copy_current", false)?;
+    // Filled in the background: neither the catalog nor the audio devices are
+    // queried on the main thread.
+    let volume = Submenu::with_items(app, menu_text(&tr(&lang, "tray.volume")), true, &[])?;
+    let output = Submenu::with_items(app, menu_text(&tr(&lang, "tray.output")), true, &[])?;
     let genres = Submenu::with_items(app, menu_text(&tr(&lang, "tray.genre")), true, &[])?;
     let show = item(ID_SHOW, "tray.show", true)?;
     let quit = item(ID_QUIT, "tray.quit", true)?;
+    let version = MenuItem::with_id(
+        app,
+        "version",
+        menu_text(&crate::about::about(app).text),
+        false,
+        None::<&str>,
+    )?;
     let menu = Menu::with_items(
         app,
         &[
             &now,
             &PredefinedMenuItem::separator(app)?,
             &pause,
+            &previous,
             &next,
             &ban,
             &PredefinedMenuItem::separator(app)?,
+            &lookup,
+            &copy,
+            &PredefinedMenuItem::separator(app)?,
             &genres,
+            &volume,
+            &output,
             &PredefinedMenuItem::separator(app)?,
             &show,
             &quit,
+            &PredefinedMenuItem::separator(app)?,
+            &version,
         ],
     )?;
+    let window = tray_click::clamp_window(tray_click::system_interval());
+    log::info!("tray: double-click window {} ms", window.as_millis());
     let icon = TrayIconBuilder::with_id("main")
         .icon(Image::from_bytes(include_bytes!(
             "../icons/tray-next@2x.png"
@@ -109,34 +160,31 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(on_menu_event)
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                log::debug!("tray: left click, next track");
-                tray.app_handle()
-                    .state::<AppState>()
-                    .player
-                    .send(Command::Next);
-            }
-        })
+        .on_tray_icon_event(|tray, event| on_icon_event(tray.app_handle(), event))
         .build(app)?;
 
     let (tx, rx) = mpsc::channel();
+    let (audio_tx, audio_rx) = mpsc::channel();
     app.manage(Tray {
         icon,
         now,
         pause,
+        previous,
         next,
         ban,
+        lookup,
+        copy,
+        volume,
+        output,
         genres,
         show,
         quit,
         rebuild_genres: tx,
+        rebuild_audio: audio_tx,
+        clicks: Mutex::new(ClickClassifier::new(window)),
     });
+    spawn_audio_menu_thread(app, audio_rx)?;
+    refresh_audio(app);
 
     let handle = app.clone();
     std::thread::Builder::new()
@@ -156,6 +204,146 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     app.listen_any("genres-changed", move |_| refresh_genres(&handle));
     let handle = app.clone();
     state::on_now_playing(app, move |np| show_now_playing(&handle, np));
+    Ok(())
+}
+
+/// Left clicks: one is "Next" (after the double-click window), two are
+/// "Play/Pause". A right click opens the menu; the device list is read again for
+/// the next time.
+fn on_icon_event(app: &AppHandle, event: TrayIconEvent) {
+    let now = Instant::now();
+    let action = match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } => clicks(app, |c| c.click(now)),
+        TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => clicks(app, |c| c.double_click(now)),
+        TrayIconEvent::Click {
+            button: MouseButton::Right,
+            button_state: MouseButtonState::Down,
+            ..
+        } => {
+            refresh_audio(app);
+            None
+        }
+        _ => None,
+    };
+    match action {
+        Some(ClickAction::Toggle) => {
+            log::debug!("tray: double click, play/pause");
+            spawn_action(app, "play/pause", |_, st| {
+                play_pause_now(st, Command::TogglePause);
+                Ok(())
+            });
+        }
+        Some(ClickAction::Wait(seq)) => {
+            let handle = app.clone();
+            let window = clicks(app, |c| c.window()).unwrap_or(tray_click::MAX_WINDOW);
+            let spawned = std::thread::Builder::new()
+                .name("tray-click".into())
+                .spawn(move || {
+                    std::thread::sleep(window);
+                    if clicks(&handle, |c| c.due(seq, Instant::now())) == Some(true) {
+                        log::debug!("tray: single click, next track");
+                        handle.state::<AppState>().player.send(Command::Next);
+                    }
+                });
+            if let Err(e) = spawned {
+                log::warn!("tray click: {e}");
+            }
+        }
+        Some(ClickAction::Ignore) | None => {}
+    }
+}
+
+fn clicks<T>(app: &AppHandle, f: impl FnOnce(&mut ClickClassifier) -> T) -> Option<T> {
+    app.try_state::<Tray>().map(|t| f(&mut lock(&t.clicks)))
+}
+
+/// Schedules a refresh of the "Volume" and "Output" submenus: after a volume or
+/// device change (from anywhere), a settings change, a language change, and when
+/// the menu is opened. No-op before the tray exists.
+pub fn refresh_audio(app: &AppHandle) {
+    if let Some(tray) = app.try_state::<Tray>() {
+        let _ = tray.rebuild_audio.send(());
+    }
+}
+
+/// The devices are listed on this thread, never on the main or the audio thread.
+fn spawn_audio_menu_thread(app: &AppHandle, rx: Receiver<()>) -> tauri::Result<()> {
+    let handle = app.clone();
+    std::thread::Builder::new()
+        .name("tray-audio".into())
+        .spawn(move || {
+            let mut shown_volume = Vec::new();
+            let mut shown_output = Vec::new();
+            while rx.recv().is_ok() {
+                while rx.try_recv().is_ok() {}
+                let lang = i18n::current();
+                let settings = handle.state::<AppState>().settings.get();
+                let devices = list_output_devices();
+                let volume = volume_entries(&lang, settings.volume);
+                let output = output_entries(&lang, &devices, settings.device.as_deref());
+                let tray = handle.state::<Tray>();
+                for (menu, entries, shown) in [
+                    (&tray.volume, volume, &mut shown_volume),
+                    (&tray.output, output, &mut shown_output),
+                ] {
+                    if let Err(e) = show_check_entries(&handle, menu, entries, shown) {
+                        log::warn!("tray audio menu: {e}");
+                    }
+                }
+            }
+        })?;
+    Ok(())
+}
+
+/// Shows `entries` in `menu`: only the checks change when the items are the same
+/// as `shown`, otherwise the items are replaced.
+fn show_check_entries(
+    app: &AppHandle,
+    menu: &Submenu<Wry>,
+    entries: Vec<CheckEntry>,
+    shown: &mut Vec<CheckEntry>,
+) -> Result<(), String> {
+    let err = |e: tauri::Error| e.to_string();
+    let same_items = shown.len() == entries.len()
+        && shown
+            .iter()
+            .zip(&entries)
+            .all(|(a, b)| a.id == b.id && a.label == b.label);
+    if same_items {
+        // A click on a check item toggles its mark by itself: every mark is set.
+        for (item, e) in menu.items().map_err(err)?.iter().zip(&entries) {
+            if let Some(check) = item.as_check_menuitem() {
+                check.set_checked(e.checked).map_err(err)?;
+            }
+        }
+    } else {
+        // Until the rebuild completes the submenu matches nothing, so a failure is
+        // retried on the next refresh.
+        shown.clear();
+        for item in menu.items().map_err(err)? {
+            menu.remove(&item).map_err(err)?;
+        }
+        for e in &entries {
+            let item = CheckMenuItem::with_id(
+                app,
+                &e.id,
+                menu_text(&e.label),
+                true,
+                e.checked,
+                None::<&str>,
+            )
+            .map_err(err)?;
+            menu.append(&item).map_err(err)?;
+        }
+    }
+    *shown = entries;
     Ok(())
 }
 
@@ -205,8 +393,15 @@ fn show_now_playing(app: &AppHandle, np: Option<NowPlaying>) {
         let label = track_label(&lang, np);
         let _ = tray.now.set_text(menu_text(&label));
         let _ = tray.pause.set_text(pause_label(&lang, np));
-        let _ = tray.pause.set_enabled(np.is_some());
-        let _ = tray.ban.set_enabled(np.is_some());
+        for item in [
+            &tray.pause,
+            &tray.previous,
+            &tray.ban,
+            &tray.lookup,
+            &tray.copy,
+        ] {
+            let _ = item.set_enabled(np.is_some());
+        }
         let tooltip = if np.is_some() {
             label.as_str()
         } else {
@@ -228,8 +423,13 @@ pub fn relabel(app: &AppHandle) {
         };
         let lang = i18n::current();
         let text = |key: &str| menu_text(&tr(&lang, key));
+        let _ = tray.previous.set_text(text("player.previous"));
         let _ = tray.next.set_text(text("player.next"));
         let _ = tray.ban.set_text(text("player.ban"));
+        let _ = tray.lookup.set_text(text("tray.lookup_current"));
+        let _ = tray.copy.set_text(text("tray.copy_current"));
+        let _ = tray.volume.set_text(text("tray.volume"));
+        let _ = tray.output.set_text(text("tray.output"));
         let _ = tray.genres.set_text(text("tray.genre"));
         let _ = tray.show.set_text(text("tray.show"));
         let _ = tray.quit.set_text(text("tray.quit"));
@@ -239,8 +439,10 @@ pub fn relabel(app: &AppHandle) {
     }
     let np = lock(&app.state::<AppState>().now_playing).clone();
     show_now_playing(app, np);
-    // The genre entries now differ ("All", "Unknown"), so the submenu is rebuilt.
+    // The genre entries now differ ("All", "Unknown"), so the submenu is rebuilt;
+    // so do the volume steps and "System default".
     refresh_genres(app);
+    refresh_audio(app);
 }
 
 /// Runs on the main thread: anything that touches the catalog goes to a thread.
@@ -252,12 +454,25 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
             play_pause_now(st, Command::TogglePause);
             Ok(())
         }),
+        ID_PREVIOUS => spawn_action(app, "previous", |_, st| previous_now(st)),
         ID_NEXT => st.player.send(Command::Next),
         ID_BAN => spawn_action(app, "ban", ban_current_now),
+        ID_LOOKUP => spawn_action(app, "look up", lookup::open_current),
+        ID_COPY => spawn_action(app, "copy", copy_current),
         ID_SHOW => show_main_window(app),
         ID_QUIT => app.exit(0),
         _ => {
-            if let Some(pick) = genre_pick(id) {
+            if let Some(v) = volume_pick(id) {
+                spawn_action(app, "volume", move |app, st| {
+                    set_volume_now(app, st, v);
+                    Ok(())
+                });
+            } else if let Some(device) = output_pick(id) {
+                spawn_action(app, "output", move |app, st| {
+                    set_device_now(app, st, device);
+                    Ok(())
+                });
+            } else if let Some(pick) = genre_pick(id) {
                 let keys = match pick {
                     GenrePick::All => Vec::new(),
                     GenrePick::One(key) => vec![key],
@@ -268,6 +483,19 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
             }
         }
     }
+}
+
+/// "Copy current song": "Artist – Title (Year)" on the clipboard.
+fn copy_current(app: &AppHandle, st: &AppState) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let text = lookup::current_text(st).ok_or_else(|| i18n::t("err.nothing_playing"))?;
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        if let Err(e) = handle.clipboard().write_text(text) {
+            log::warn!("clipboard: {e}");
+        }
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Shows, restores and focuses the main window.
@@ -315,6 +543,65 @@ pub fn genre_entries(
             .map(|g| entry(g)),
     );
     entries
+}
+
+/// The volume rounded to the nearest 10 %, 0..=100.
+pub fn volume_step(volume: f32) -> u8 {
+    if !volume.is_finite() {
+        return 0;
+    }
+    ((volume.clamp(0.0, 1.0) * 10.0).round() * 10.0) as u8
+}
+
+/// "0%" … "100%"; the step nearest to `volume` is checked.
+pub fn volume_entries(lang: &str, volume: f32) -> Vec<CheckEntry> {
+    let current = volume_step(volume);
+    (0..=100u8)
+        .step_by(10)
+        .map(|p| CheckEntry {
+            id: format!("{VOLUME_ID_PREFIX}{p}"),
+            label: trf(lang, "tray.volume_step", &[("n", &p.to_string())]),
+            checked: p == current,
+        })
+        .collect()
+}
+
+/// The volume (0..1) a "Volume" item sets; `None` for other items.
+pub fn volume_pick(menu_id: &str) -> Option<f32> {
+    let p: u8 = menu_id.strip_prefix(VOLUME_ID_PREFIX)?.parse().ok()?;
+    (p <= 100).then(|| f32::from(p) / 100.0)
+}
+
+/// "System default", then every output device; a saved device that is not
+/// connected stays at the end, marked so. The current one is checked.
+pub fn output_entries(lang: &str, devices: &[String], current: Option<&str>) -> Vec<CheckEntry> {
+    let mut entries = vec![CheckEntry {
+        id: OUTPUT_DEFAULT_ID.into(),
+        label: tr(lang, "settings.device_default"),
+        checked: current.is_none(),
+    }];
+    let device = |name: &str, label: String| CheckEntry {
+        id: format!("{OUTPUT_ID_PREFIX}{name}"),
+        label,
+        checked: current == Some(name),
+    };
+    entries.extend(devices.iter().map(|d| device(d, d.clone())));
+    if let Some(saved) = current.filter(|c| !devices.iter().any(|d| d == c)) {
+        let label = trf(lang, "settings.device_missing", &[("name", saved)]);
+        entries.push(device(saved, label));
+    }
+    entries
+}
+
+/// The device an "Output" item selects (`Some(None)`: system default); `None` for
+/// other items.
+pub fn output_pick(menu_id: &str) -> Option<Option<String>> {
+    if menu_id == OUTPUT_DEFAULT_ID {
+        return Some(None);
+    }
+    menu_id
+        .strip_prefix(OUTPUT_ID_PREFIX)
+        .map(|name| Some(name.to_string()))
 }
 
 /// The genre a menu item id stands for; `None` for other items.
@@ -506,5 +793,70 @@ mod tests {
         };
         assert_eq!(labels("en"), ["All", "Unknown", "JAZZ"]);
         assert_eq!(labels("hr"), ["Sve", "Nepoznato", "JAZZ"]);
+    }
+
+    #[test]
+    fn volume_menu_checks_the_nearest_ten() {
+        let e = volume_entries("en", 0.64);
+        assert_eq!(e.len(), 11);
+        assert_eq!(e[0].label, "0%");
+        assert_eq!(e[10].label, "100%");
+        let checked: Vec<_> = e
+            .iter()
+            .filter(|e| e.checked)
+            .map(|e| e.label.as_str())
+            .collect();
+        assert_eq!(checked, ["60%"]);
+        assert_eq!(volume_step(0.65), 70);
+        assert_eq!(volume_step(0.04), 0);
+        assert_eq!(volume_step(1.0), 100);
+        assert_eq!(volume_step(f32::NAN), 0);
+        assert_eq!(volume_entries("hr", 0.5)[5].label, "50 %");
+    }
+
+    #[test]
+    fn volume_items_set_the_volume_they_show() {
+        for e in volume_entries("en", 0.3) {
+            let v = volume_pick(&e.id).expect(&e.id);
+            assert_eq!(volume_step(v).to_string() + "%", e.label);
+        }
+        assert_eq!(volume_pick("vol:110"), None);
+        assert_eq!(volume_pick("next"), None);
+    }
+
+    #[test]
+    fn output_menu_lists_the_default_and_every_device() {
+        let devices = ["MacBook Speakers".to_string(), "Rock & Roll DAC".into()];
+        let e = output_entries("en", &devices, None);
+        let labels: Vec<_> = e.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["System default", "MacBook Speakers", "Rock & Roll DAC"]
+        );
+        assert_eq!(e.iter().filter(|e| e.checked).count(), 1);
+        assert!(e[0].checked);
+        for (entry, want) in e
+            .iter()
+            .zip([None, Some("MacBook Speakers"), Some("Rock & Roll DAC")])
+        {
+            assert_eq!(output_pick(&entry.id), Some(want.map(String::from)));
+        }
+        let e = output_entries("hr", &devices, Some("Rock & Roll DAC"));
+        assert_eq!(e[0].label, "Zadani uređaj sustava");
+        assert!(e[2].checked && !e[0].checked && !e[1].checked);
+        assert_eq!(output_pick("vol:10"), None);
+    }
+
+    #[test]
+    fn output_menu_keeps_a_saved_device_that_is_not_connected() {
+        let devices = ["Speakers".to_string()];
+        let e = output_entries("en", &devices, Some("USB DAC"));
+        let labels: Vec<_> = e.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["System default", "Speakers", "USB DAC (not connected)"]
+        );
+        assert!(e[2].checked);
+        assert_eq!(output_pick(&e[2].id), Some(Some("USB DAC".into())));
     }
 }

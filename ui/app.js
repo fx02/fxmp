@@ -30,6 +30,7 @@ import {
   genresSummary,
   patchPlan,
   retryDelay,
+  sliderFollows,
 } from "./lib.mjs";
 
 const { invoke } = window.__TAURI__.core;
@@ -68,6 +69,10 @@ const state = {
   position: null,
   // Lookup sites: [{ id, name }].
   lookupServices: [],
+  // "About": name, version, commit, build date, project URL, version line.
+  about: null,
+  // When the volume slider was last moved here (ms), so the tray does not fight it.
+  volumeTouched: null,
   // Artists tab: open artists (their albums shown) and open albums (their tracks
   // shown, keyed artist + NUL + album), kept across re-renders.
   expanded: new Set(),
@@ -229,6 +234,29 @@ async function onBan() {
 }
 
 const sendVolume = debounce((v) => run("set_volume", { v }), 60);
+
+/** The volume or the output device changed (the tray, or this window). */
+function onAudioChanged({ volume, device }) {
+  if (state.settings) Object.assign(state.settings, { volume, device });
+  if (sliderFollows(state.volumeTouched, Date.now())) $("volume").value = Math.round(volume * 100);
+  if (state.tab === "settings") {
+    const sel = $("device");
+    const want = device || "";
+    if ([...sel.options].some((o) => o.value === want)) sel.value = want;
+    else loadDevices();
+  }
+}
+
+// ---------- about ----------
+
+function renderAbout() {
+  const a = state.about;
+  if (!a) return;
+  $("about-name").textContent = a.name;
+  $("about-version").textContent = t("about.version", { version: a.version });
+  $("about-build").textContent = t("about.build", { commit: a.commit, date: a.build_date });
+  $("btn-github").title = a.url;
+}
 
 // ---------- track context menu ----------
 // The app's own menu (not WebKit's) on every track row and the now-playing bar.
@@ -1617,6 +1645,7 @@ function rerender() {
   $("crossfade-label").textContent = t("settings.seconds", { n: Number($("crossfade-secs").value) });
   for (const which of ["primary", "secondary"]) updatePasswordHint(which);
   for (const out of document.querySelectorAll(".test-result, #save-result")) out.textContent = "";
+  renderAbout();
   if (pl.facets) renderFacets();
   if (pl.meta) {
     renderPlaylistHead();
@@ -1659,7 +1688,10 @@ function wire() {
   });
   $("btn-next").addEventListener("click", () => run("next"));
   $("btn-ban").addEventListener("click", onBan);
-  $("volume").addEventListener("input", (e) => sendVolume(Number(e.target.value) / 100));
+  $("volume").addEventListener("input", (e) => {
+    state.volumeTouched = Date.now();
+    sendVolume(Number(e.target.value) / 100);
+  });
 
   // Genres
   $("genre-filter").addEventListener("input", debounce(renderGenres, 80));
@@ -1765,6 +1797,10 @@ function wire() {
     run("set_lookup_service", { service: e.target.value });
     renderNowPlaying(state.nowPlaying);
   });
+  $("btn-github").addEventListener("click", () => run("open_project_page"));
+  $("btn-copy-version").addEventListener("click", () => {
+    if (state.about) copyAndTell(state.about.text);
+  });
   $("btn-scan").addEventListener("click", startScan);
   $("btn-empty-scan").addEventListener("click", startScan);
 
@@ -1809,8 +1845,15 @@ async function init() {
   // Texts first, so nothing is shown untranslated.
   const settings = await run("get_settings");
   const lang = (settings && settings.language) || "en";
-  const [, , services] = await Promise.all([loadLanguage(lang), loadLanguages(lang), run("lookup_services")]);
+  const [, , services, about] = await Promise.all([
+    loadLanguage(lang),
+    loadLanguages(lang),
+    run("lookup_services"),
+    run("app_about"),
+  ]);
   state.lookupServices = services || [];
+  state.about = about || null;
+  renderAbout();
   await Promise.all([
     listen("now-playing", (e) => renderNowPlaying(e.payload)),
     listen("connection-status", (e) => renderStatus(e.payload)),
@@ -1827,6 +1870,7 @@ async function init() {
     listen("unreadable-changed", () => refreshUnreadable()),
     listen("position", (e) => onPosition(e.payload)),
     listen("playlist-changed", () => onPlaylistChanged()),
+    listen("audio-changed", (e) => onAudioChanged(e.payload)),
   ]);
 
   if (settings) {

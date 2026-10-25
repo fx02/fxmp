@@ -234,5 +234,16 @@
   "menu.copy_path": "Kopiraj putanju",
   "albums.tracks": "Prikaži pjesme",
   "albums.more": "Dodaj na popis…",
-  "settings.lookup_service": "Zadana usluga za traženje"
+  "settings.lookup_service": "Zadana usluga za traženje",
+  "tray.volume": "Glasnoća",
+  "tray.volume_step": "{n} %",
+  "tray.output": "Izlaz",
+  "tray.lookup_current": "Potraži trenutnu pjesmu",
+  "tray.copy_current": "Kopiraj trenutnu pjesmu",
+  "settings.about": "O aplikaciji",
+  "about.version": "Verzija {version}",
+  "about.build": "Izgradnja {commit}, {date}",
+  "about.github": "Izvorni kod na GitHubu",
+  "about.copy_version": "Kopiraj verziju",
+  "about.version_hint": "Verzija je i na dnu izbornika ikone u traci izbornika."
 }

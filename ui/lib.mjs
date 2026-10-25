@@ -349,3 +349,14 @@ export function patchPlan(oldKeys, newKeys) {
 export function retryDelay(n) {
   return n >= 1 && n <= 5 ? 500 * 2 ** (n - 1) : null;
 }
+
+/** How long after the user moved the volume slider a volume from elsewhere waits. */
+export const SLIDER_QUIET_MS = 500;
+
+/**
+ * Whether a volume set elsewhere (the tray) may move the slider: not while the
+ * user is still using it (`touchedAt`: last input, ms; `null` if never).
+ */
+export function sliderFollows(touchedAt, now, quietMs = SLIDER_QUIET_MS) {
+  return touchedAt == null || now - touchedAt >= quietMs;
+}

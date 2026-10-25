@@ -36,6 +36,7 @@ import {
   genresSummary,
   patchPlan,
   retryDelay,
+  sliderFollows,
 } from "./lib.mjs";
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
@@ -180,7 +181,7 @@ test("locales: plural forms match the language's categories, placeholders match 
 });
 
 test("every translation key used by the UI and the Rust code exists", () => {
-  const KEY = /["'`]((?:language|player|conn|tabs|genres|merge|common|artists|albums|settings|scan|tray|err|unreadable|playlist|menu)\.[a-z_]+)["'`]/g;
+  const KEY = /["'`]((?:language|player|conn|tabs|genres|merge|common|artists|albums|settings|scan|tray|err|unreadable|playlist|menu|about)\.[a-z_]+)["'`]/g;
   const sources = [read("./app.js"), read("./lib.mjs"), read("./index.html")];
   const rustDir = new URL("../src-tauri/src/", import.meta.url);
   for (const f of readdirSync(rustDir).filter((f) => f.endsWith(".rs"))) sources.push(read(`../src-tauri/src/${f}`));
@@ -418,4 +419,10 @@ test("patchPlan: only rows that changed are replaced", () => {
 test("retryDelay: backs off, then gives up", () => {
   assert.deepEqual([1, 2, 3, 4, 5].map(retryDelay), [500, 1000, 2000, 4000, 8000]);
   assert.equal(retryDelay(6), null);
+});
+
+test("sliderFollows: a volume from elsewhere moves the slider unless it was just used", () => {
+  assert.equal(sliderFollows(null, 1000), true, "never touched");
+  assert.equal(sliderFollows(1000, 1200), false, "still being dragged");
+  assert.equal(sliderFollows(1000, 1600), true, "left alone long enough");
 });

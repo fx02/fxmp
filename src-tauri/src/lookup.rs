@@ -1,7 +1,7 @@
 //! "Look up online" and "Copy 'Artist – Title'": search URLs on a few music sites,
 //! opened in the default browser. Only artist and title are ever sent, and only
-//! URLs on the hosts in [`ALLOWED_HOSTS`] are opened. Shared by the window's
-//! context menu and the tray.
+//! URLs on the hosts in [`ALLOWED_HOSTS`] (and the project page) are opened.
+//! Shared by the window's context menu and the tray.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use tauri::AppHandle;
@@ -117,11 +117,15 @@ pub fn artist_url(service: Service, artist: &str) -> String {
 }
 
 /// Whether `url`, parsed as a browser would, is `https` on one of
-/// [`ALLOWED_HOSTS`] exactly, with no user info and no explicit port.
+/// [`ALLOWED_HOSTS`] exactly, with no user info and no explicit port, or is the
+/// project page ([`crate::about::PROJECT_URL`]) exactly.
 pub fn is_allowed(url: &str) -> bool {
     let Ok(u) = tauri::Url::parse(url) else {
         return false;
     };
+    if u.as_str() == crate::about::PROJECT_URL {
+        return true;
+    }
     u.scheme() == "https"
         && u.username().is_empty()
         && u.password().is_none()

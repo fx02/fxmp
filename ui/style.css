@@ -389,3 +389,11 @@ button.danger-solid:hover:not(:disabled) { filter: brightness(1.08); background:
 .album-tracks { list-style: none; margin: 0 0 4px; padding: 0 0 0 16px; }
 .album-tracks li { padding: 2px 6px; min-height: 24px; font-size: 12px; }
 .albums li.album.open > .name { font-weight: 600; }
+
+/* About */
+.about { padding-bottom: 12px; }
+.about .about-name { margin: 0 2px 2px; font-weight: 600; }
+.about .note { margin: 2px; }
+.about .row { flex-wrap: wrap; }
+button.link { background: none; border-color: transparent; color: var(--accent); padding-left: 2px; padding-right: 2px; text-decoration: underline; }
+button.link:hover:not(:disabled) { background: none; filter: brightness(1.15); }

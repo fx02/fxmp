@@ -1,6 +1,7 @@
 // Prevents an additional console window on Windows in release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod about;
 mod autostart;
 mod commands;
 mod connection;
@@ -14,6 +15,7 @@ mod provider;
 mod settings;
 mod state;
 mod tray;
+mod tray_click;
 mod writer;
 
 use tauri::{Manager, WindowEvent};
@@ -39,11 +41,13 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(autostart::plugin())
         .setup(|app| {
-            // Menu bar app: no Dock icon.
+            // In the Dock and the menu bar: the Dock icon opens the window, Cmd+Q
+            // quits (the default app menu), the tray icon stays.
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            app.set_activation_policy(tauri::ActivationPolicy::Regular);
             let handle = app.handle();
             state::AppState::init(handle)?;
             tray::init(handle)?;
@@ -62,7 +66,8 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing only hides the window; the music and the tray icon stay.
+            // Closing only hides the window; the music, the Dock and the tray icon
+            // stay. Minimizing is left to the system (the window goes to the Dock).
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
@@ -123,11 +128,13 @@ fn main() {
             commands::lookup_current,
             commands::current_song_text,
             commands::set_lookup_service,
+            commands::app_about,
+            commands::open_project_page,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(|app, event| match event {
+            tauri::RunEvent::Exit => {
                 if let Some(st) = app.try_state::<state::AppState>() {
                     st.save_playlist_now();
                     if let Err(e) = st.settings.flush() {
@@ -135,6 +142,10 @@ fn main() {
                     }
                 }
             }
+            // A click on the Dock icon (also with the window hidden or minimized).
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => tray::show_main_window(app),
+            _ => {}
         });
 }
 

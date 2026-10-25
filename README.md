@@ -11,7 +11,7 @@ A macOS-first Tauri 2 player that plays music straight from an SMB share
   start of a selection begins with a different track.
 - Crossfade (on, 5 s, adjustable 1–10 s); a manual "next" does a short 0.7 s
   fade; volume normalization (ReplayGain or measured loudness, target -18 LUFS).
-- Lives in the menu bar (no Dock icon), with media keys and Now Playing,
+- Lives in the Dock and in the menu bar, with media keys and Now Playing,
   optional notifications and start at login.
 - Optional backup server: if the main server does not answer, the backup is used.
 
@@ -26,7 +26,8 @@ A macOS-first Tauri 2 player that plays music straight from an SMB share
    xattr -dr com.apple.quarantine "/Applications/SMB Music Player.app"
    ```
 
-3. Start the app. Its icon appears in the menu bar.
+3. Start the app. Its icon (a white play triangle over "SMB") appears in the
+   Dock, and the ⏭ glyph in the menu bar.
 
 Building from source: `cargo tauri build --target universal-apple-darwin`
 (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`); the `.dmg` ends
@@ -149,10 +150,29 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
 - **Notifications** (if turned on) show "Artist – Title" and the year, with no
   picture. macOS always draws the app's icon on a notification; an app cannot
   remove it.
-- Menu bar: **left click on the icon = next track**; right click opens the menu
-  (current track, pause, genre, ban, show window, quit).
+- Menu bar icon:
+  - **one left click = next track**, **double click = pause/resume** (a double
+    click never also skips). To tell the two apart, "next" waits for the
+    double-click time to pass (the system setting, kept between 0.25 and 0.4 s),
+    so a single click reacts about 0.3 s later than before.
+  - Right click opens the menu: the current track; Pause, Previous, Next, Ban;
+    **Look up current song** (on the default lookup site) and **Copy current
+    song** ("Artist – Title (Year)"); Genre; **Volume** (0–100 % in steps of
+    10, the current value checked, kept in step with the window's slider);
+    **Output** ("System default" and every output device, the current one
+    checked; the list is read again each time the menu opens); Show window;
+    Quit; and, greyed out at the bottom, the version.
 - **F8** is pause/resume, **F9** next (Control Center works too).
-- Closing the window does not quit the app; quit from the menu bar menu.
+- **Dock**: the app has a Dock icon. Closing the window (red button) only hides
+  it: the music plays on and the Dock and menu bar icons stay. A click on the
+  Dock icon brings the window back. Minimizing (yellow button) puts the window
+  in the Dock as usual. **Cmd+Q** (or Quit in the menu bar menu) quits.
+- **Version**: Settings → **About** (at the bottom) shows the version, the
+  commit it was built from and the build date, with a link to the source code
+  on GitHub (https://github.com/fx02/smb-music-player) and **Copy version**,
+  which copies e.g. "SMB Music Player 0.1.0 (abc1234, 2026-10-25)" for bug
+  reports. The same line is the last (greyed-out) item of the menu bar menu. A
+  build without git (a source tarball) shows "unknown" as the commit.
 
 ## Translations
 
@@ -233,7 +253,23 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] Five starts of the same genre give five different first tracks.
 - [ ] Look in light and dark mode (420×640, long titles, genre chip, ⋯).
 - [ ] Left click on the menu bar icon reliably skips the track (if the click does
-      not arrive reliably: move "Next" to the first menu item).
+      not arrive reliably: move "Next" to the first menu item), about 0.3 s
+      after the click.
+- [ ] Double click on the menu bar icon pauses / resumes and does not skip;
+      three quick clicks pause once (and then skip once).
+- [ ] Menu bar menu → Volume: the checked step follows the window's slider, and
+      picking a step changes the volume and moves the slider.
+- [ ] Menu bar menu → Output: lists the devices (a newly plugged-in device shows
+      up the next time the menu opens); picking one moves the sound and the
+      Settings device list follows.
+- [ ] Menu bar menu → Previous, Look up current song (opens the browser) and
+      Copy current song (paste it somewhere); the greyed-out version line at the
+      bottom matches Settings → About.
+- [ ] Settings → About: the GitHub link opens the browser on the project page;
+      Copy version puts the version line on the clipboard.
+- [ ] The new app icon (play triangle over "SMB", no sound arcs) in the Dock,
+      Finder, the app switcher (Cmd+Tab) and the notification picture; "SMB" is
+      readable in small sizes (Finder list view).
 - [ ] Right click: the menu opens, the track name updates, picking a genre plays that genre.
 - [ ] Right-click on a genre in the window opens the app's own menu (not WebKit's),
       and "Merge into…" really merges.
@@ -242,7 +278,9 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] F8/F9 work and the track shows in Control Center.
 - [ ] Notifications appear only when turned on (try with the installed .app).
 - [ ] Start at login: after logging out and in, the app is in the menu bar with the window hidden.
-- [ ] No Dock icon; "Show window" and a second launch bring the window to the front.
+- [ ] The Dock icon stays, and clicking it opens the window (also after the red
+      close button and after minimizing); "Show window" and a second launch
+      bring the window to the front; Cmd+Q quits.
 - [ ] A full first scan to the end, with genres appearing along the way.
 - [ ] The keychain prompt ("Always Allow"), and tracks play normally afterwards.
 - [ ] Switching to the backup server when the main one is unreachable.

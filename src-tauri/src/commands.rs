@@ -14,6 +14,7 @@ use smp_core::source::Which;
 use smp_core::TrackId;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::about;
 use crate::autostart;
 use crate::connection::{status_of, test_server, test_target, ConnStatus, StatusPayload};
 use crate::credentials::CredentialStore;
@@ -218,6 +219,7 @@ pub async fn save_settings(
             state::cancel_scan(st, Some(&i18n::t("scan.cancelled_settings")));
         }
         st.reconnect(&saved);
+        tray::refresh_audio(app);
         autostart::apply(app, saved.autostart, false).map_err(|e| {
             log::warn!("start at login: {e}");
             i18n::t("err.autostart")
@@ -914,13 +916,47 @@ pub async fn set_resume_autoplay(app: AppHandle, on: bool) -> CmdResult<()> {
     .await
 }
 
+/// The volume and the output device, sent as `audio-changed` whenever either
+/// changes, so the window's slider and device list follow the tray.
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioPayload {
+    pub volume: f32,
+    pub device: Option<String>,
+}
+
+fn audio_changed(app: &AppHandle, s: &Settings) {
+    let payload = AudioPayload {
+        volume: s.volume,
+        device: s.device.clone(),
+    };
+    if let Err(e) = app.emit("audio-changed", payload) {
+        log::warn!("audio-changed: {e}");
+    }
+    tray::refresh_audio(app);
+}
+
+/// Sets the volume (0..1) from the slider or the tray.
+pub fn set_volume_now(app: &AppHandle, st: &AppState, v: f32) {
+    let s = st.settings.update(
+        |s| s.volume = v,
+        |s| st.player.send(Command::SetVolume(s.volume)),
+    );
+    audio_changed(app, &s);
+}
+
+/// Picks the output device (`None` = system default) from Settings or the tray.
+pub fn set_device_now(app: &AppHandle, st: &AppState, name: Option<String>) {
+    let s = st.settings.update(
+        |s| s.device = name,
+        |s| st.player.send(Command::SetDevice(s.device.clone())),
+    );
+    audio_changed(app, &s);
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn set_volume(app: AppHandle, v: f32) -> CmdResult<()> {
-    run(app, move |_, st| {
-        st.settings.update(
-            |s| s.volume = v,
-            |s| st.player.send(Command::SetVolume(s.volume)),
-        );
+    run(app, move |app, st| {
+        set_volume_now(app, st, v);
         Ok(())
     })
     .await
@@ -934,14 +970,23 @@ pub async fn list_devices(app: AppHandle) -> CmdResult<Vec<String>> {
 /// `None` = system default.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn set_device(app: AppHandle, name: Option<String>) -> CmdResult<()> {
-    run(app, move |_, st| {
-        st.settings.update(
-            |s| s.device = name,
-            |s| st.player.send(Command::SetDevice(s.device.clone())),
-        );
+    run(app, move |app, st| {
+        set_device_now(app, st, name);
         Ok(())
     })
     .await
+}
+
+/// Name, version, commit and build date for "About".
+#[tauri::command(rename_all = "snake_case")]
+pub async fn app_about(app: AppHandle) -> about::About {
+    about::about(&app)
+}
+
+/// Opens the project page on GitHub (the only URL besides the lookup sites).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn open_project_page(app: AppHandle) -> CmdResult<()> {
+    run(app, |app, _| about::open_project_page(app)).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1203,6 +1248,7 @@ pub async fn reset_settings(app: AppHandle, forget_servers: bool) -> CmdResult<S
         }
         // The tray's genre menu lists the (now cleared) last selection.
         tray::refresh_genres(app);
+        audio_changed(app, &new);
         autostart::apply(app, new.autostart, false).map_err(|e| {
             log::warn!("start at login: {e}");
             i18n::t("err.autostart")
