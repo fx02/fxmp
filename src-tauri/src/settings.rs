@@ -235,7 +235,8 @@ impl Settings {
         }
     }
 
-    /// Reads settings from `path`; `None` if the file does not exist or cannot be parsed.
+    /// Reads settings from `path`; `None` if the file does not exist or cannot be
+    /// parsed (then it is renamed to `settings.json.bad-<unix time>`).
     pub fn load(path: &Path) -> Option<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -248,7 +249,25 @@ impl Settings {
         match serde_json::from_str::<Settings>(&text) {
             Ok(s) => Some(s.clamped()),
             Err(e) => {
-                log::warn!("ignoring invalid {}: {e}", path.display());
+                // Kept aside (the libraries in it would otherwise be lost for
+                // good at the next save).
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(format!(".bad-{secs}"));
+                let aside = PathBuf::from(aside);
+                match std::fs::rename(path, &aside) {
+                    Ok(()) => log::warn!(
+                        "invalid {} ({e}): kept as {}, starting from defaults",
+                        path.display(),
+                        aside.display()
+                    ),
+                    Err(re) => log::warn!(
+                        "invalid {} ({e}), and it cannot be kept aside: {re}",
+                        path.display()
+                    ),
+                }
                 None
             }
         }
@@ -509,6 +528,15 @@ mod tests {
         assert_eq!(Settings::load(&path), None);
         std::fs::write(&path, "{ not json").unwrap();
         assert_eq!(Settings::load(&path), None);
+        // Kept aside for the user, not overwritten by the next save.
+        assert!(!path.exists());
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains("settings.json.bad-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "{ not json");
         std::fs::write(&path, r#"{"volume": 0.25, "primary": {"username": "u"}}"#).unwrap();
         let s = Settings::load(&path).unwrap();
         assert_eq!(s.volume, 0.25);
