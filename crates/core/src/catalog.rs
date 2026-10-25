@@ -1222,6 +1222,22 @@ impl Catalog {
         Ok(())
     }
 
+    /// Saves the playlist's order (when given: selection, shuffle, entries) and
+    /// its cursor together: a crash or error in between never leaves a new
+    /// order with the old cursor.
+    pub fn save_playlist(
+        &self,
+        order: Option<(&str, bool, &[Entry])>,
+        cursor: &PlaylistCursor,
+    ) -> Result<()> {
+        self.savepoint(|| {
+            if let Some((selection, shuffle, entries)) = order {
+                self.save_playlist_order(selection, shuffle, entries)?;
+            }
+            self.save_playlist_cursor(cursor)
+        })
+    }
+
     pub fn save_playlist_cursor(&self, c: &PlaylistCursor) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO playlist_cursor(id, cursor, history, history_pos,
@@ -2521,6 +2537,39 @@ mod tests {
         c.save_playlist_order("{}", false, &[]).unwrap();
         let saved = c.load_playlist().unwrap().unwrap();
         assert_eq!(saved.cursor, PlaylistCursor::default());
+    }
+
+    #[test]
+    fn a_new_order_and_its_cursor_are_saved_together_or_not_at_all() {
+        let c = Catalog::open_in_memory().unwrap();
+        let cursor = |at| PlaylistCursor {
+            cursor: Some(at),
+            ..Default::default()
+        };
+        c.save_playlist(
+            Some(("{}", false, &[Entry::new(1), Entry::new(2)])),
+            &cursor(1),
+        )
+        .unwrap();
+        c.conn
+            .execute_batch(
+                "CREATE TRIGGER no_cursor BEFORE UPDATE ON playlist_cursor
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+                 CREATE TRIGGER no_cursor_insert BEFORE INSERT ON playlist_cursor
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+        let new_order = [Entry::new(7), Entry::new(8), Entry::new(9)];
+        assert!(c
+            .save_playlist(Some(("{}", true, &new_order)), &cursor(2))
+            .is_err());
+        let saved = c.load_playlist().unwrap().unwrap();
+        assert_eq!(
+            saved.order,
+            [Entry::new(1), Entry::new(2)],
+            "the old order stays"
+        );
+        assert_eq!(saved.cursor, cursor(1));
     }
 
     #[test]

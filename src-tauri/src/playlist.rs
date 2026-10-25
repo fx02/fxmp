@@ -546,13 +546,18 @@ pub struct SaveJob {
 }
 
 impl SaveJob {
-    /// Writes it; the order counts as saved only once this succeeded.
+    /// Writes the order (if any) and the cursor together; the order counts as
+    /// saved only once this succeeded.
     pub fn run(self, c: &Catalog) -> smp_core::Result<()> {
-        if let Some((selection, shuffle, order)) = &self.order {
-            c.save_playlist_order(selection, *shuffle, order)?;
+        let order = self
+            .order
+            .as_ref()
+            .map(|(selection, shuffle, order)| (selection.as_str(), *shuffle, order.as_slice()));
+        c.save_playlist(order, &self.cursor)?;
+        if self.order.is_some() {
             lock(&self.list).saved_order = Some(self.version);
         }
-        c.save_playlist_cursor(&self.cursor)
+        Ok(())
     }
 }
 
