@@ -1,5 +1,7 @@
 # SMB music player
 
+Vibe coded with Claude.
+
 A macOS-first Tauri 2 player that plays music straight from an SMB share
 (MP3, FLAC, OGG Vorbis). Design: `docs/superpowers/specs/2026-10-24-smb-music-player-design.md`.
 
@@ -41,9 +43,10 @@ pinned in `rust-toolchain.toml`. The icons are generated with
 
 On first launch a window opens. In **Settings** enter:
 
-- **Server**, **Share**, **Path** (defaults: `10.111.100.2`, `F`, `MP3`),
+- **Server**, **Share**, **Path** (empty at first; the fields show examples
+  such as `192.168.1.10`, `Music`, `MP3`),
 - **Username** and **Password** (the domain is optional),
-- optionally turn on **Backup server** (suggested `10.111.0.2`) and enter its details.
+- optionally turn on **Backup server** and enter its details.
 
 Click "Test connection", then "Save" and "Refresh library". Passwords are kept
 only in the macOS keychain (service `smb-music-player`, one entry per server of
@@ -119,9 +122,10 @@ server's address), an **On** switch and (except the main one) **Remove**:
   towards the 3 failures that leave a track out of the shuffle (an unplugged
   disk does not get its tracks excluded).
 - Local folders: hidden files and the macOS `._*` companion files are skipped,
-  names with spaces and any letters (č, ć, ž, emoji…) work, linked folders are
-  followed but a link loop is not, and a name that is not valid Unicode is
-  skipped (logged).
+  names with spaces and any letters (č, ć, ž, emoji…) work, linked folders
+  outside the library are followed (a link to a folder inside it is not: its
+  tracks keep their real path) and a link loop is not, and a name that is not
+  valid Unicode is skipped (logged).
 - The same file in two libraries (say, the NAS and a copy on a USB disk) is
   two tracks: duplicates are not merged in this version.
 - The catalog keeps tracks by library and path. Updating to this version moves
@@ -306,6 +310,14 @@ The language then appears in Settings → Language.
   skipped until the password is available.
 - Windows: CI builds the `.msi`/`.exe`, but media keys (souvlaki needs an HWND)
   are macOS-only for now, and the build has not been tried on real Windows.
+  The code and tests were only type-checked for Windows on a Mac; the Windows
+  CI job has not had a green run yet.
+- The first start after an update that changes the library's format updates
+  it before the window and the menu bar icon appear (about a second for
+  ~59,000 tracks, once).
+- A scan served by the backup server treats a file it already knows with the
+  same size as unchanged, whatever its date: a file changed on the backup
+  without changing size is read again only by a scan from the main server.
 - Windows: the tray icon is the macOS template glyph (black on transparent), so
   it may be hard to see, or invisible, on a dark taskbar.
 
@@ -332,8 +344,10 @@ Release builds ignore the variable.
 SMP_DATA_DIR=$(mktemp -d) cargo run -p smb-music-player
 # afterwards: rm -rf that folder; security delete-generic-password -s smb-music-player-dev
 ```
-CI (`.github/workflows/build.yml`, on push to `main` and manually) runs the tests
-and builds the macOS `.dmg` and the Windows `.msi`/`.exe` as artifacts.
+CI (`.github/workflows/build.yml`, on push to `main` and `feat/**` branches,
+and manually) runs the tests and builds the macOS `.dmg` and the Windows
+`.msi`/`.exe` as artifacts. Every action is pinned by commit SHA. The Windows
+job may fail without failing the run until its first green build.
 
 ## Owner checklist (manual checks)
 

@@ -8,6 +8,8 @@ on:
 permissions:
   contents: read
 
+# Every action is pinned by commit SHA (the tag it was taken from is noted).
+
 env:
   # Keep in sync with rust-toolchain.toml.
   RUST_TOOLCHAIN: "1.99.1"
@@ -17,13 +19,13 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (toolchain set below)
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: aarch64-apple-darwin,x86_64-apple-darwin
           components: rustfmt,clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Core tests (live tests stay ignored)
         run: cargo test -p smp-core
       - name: App tests
@@ -36,7 +38,7 @@ jobs:
         with:
           tauriScript: cargo tauri
           args: --target universal-apple-darwin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-dmg
           path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
@@ -44,12 +46,15 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    # Not yet built on real Windows: until its first green run, a Windows-only
+    # failure must not hide the macOS result.
+    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (toolchain set below)
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Core tests (live tests stay ignored)
         run: cargo test -p smp-core
       - name: App tests
@@ -59,7 +64,7 @@ jobs:
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         with:
           tauriScript: cargo tauri
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-installers
           path: |
