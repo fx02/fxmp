@@ -792,18 +792,18 @@ fn on_player_event(app: &AppHandle, ev: Event) {
             *lock(&st.now_playing) = np.clone();
             emit_now_playing(app, &np);
             st.save_playlist_soon();
-            // Playback moved between servers: let the monitor confirm and report it.
-            if let Some(libs) = st.source.libraries() {
-                let status = lock(&st.status).clone();
-                let moved = libs.iter().any(|lib| {
-                    let expected = match lib.active_server() {
-                        Some(Which::Primary) => ConnStatus::Ok,
-                        Some(Which::Secondary) => ConnStatus::Secondary,
-                        None => return false,
-                    };
-                    status.as_ref().and_then(|s| s.of(lib.id)) != Some(expected)
-                });
-                if moved {
+            // Playback of its library moved between servers (or the server is back):
+            // let the monitor confirm and report it.
+            let library = lock(&st.query).track(id).map(|r| r.library_id).ok();
+            let active = library
+                .and_then(|lib| Some((lib, st.source.libraries()?.get(lib)?.active_server()?)));
+            if let Some((lib, active)) = active {
+                let expected = match active {
+                    Which::Primary => ConnStatus::Ok,
+                    Which::Secondary => ConnStatus::Secondary,
+                };
+                let last = lock(&st.status).as_ref().and_then(|s| s.of(lib));
+                if last != Some(expected) {
                     st.wake_monitor();
                 }
             }
@@ -1484,5 +1484,63 @@ mod tests {
         }
         let other = smp_core::Error::Other("disk full".into());
         assert_eq!(scan_error_message("en", &other), "disk full");
+    }
+
+    fn statuses(list: &[(LibraryId, ConnStatus)]) -> StatusPayload {
+        StatusPayload::new(
+            list.iter()
+                .map(|&(id, status)| crate::connection::LibraryStatus {
+                    id,
+                    name: String::new(),
+                    status,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_resume_waits_for_the_library_of_its_track() {
+        let s = statuses(&[(1, ConnStatus::Unreachable), (2, ConnStatus::Ok)]);
+        assert_eq!(
+            resume_status(&s, Some(1)),
+            ConnStatus::Unreachable,
+            "VPN not up yet"
+        );
+        assert_eq!(
+            resume_status(&s, Some(2)),
+            ConnStatus::Ok,
+            "the disk is there"
+        );
+        // Its library not in use (switched off) or unknown: any library that answers.
+        assert_eq!(resume_status(&s, Some(7)), ConnStatus::Ok);
+        assert_eq!(resume_status(&s, None), ConnStatus::Ok);
+        let down = statuses(&[(1, ConnStatus::Unreachable), (2, ConnStatus::Missing)]);
+        assert_eq!(resume_status(&down, None), ConnStatus::Unreachable);
+    }
+
+    #[test]
+    fn libraries_off_are_the_switched_off_and_the_lost_ones() {
+        let c = Catalog::open_in_memory().unwrap();
+        for lib in [1, 2, 3, 9] {
+            c.upsert_track(lib, "a.mp3", 1, 1, &TrackMeta::default())
+                .unwrap();
+        }
+        let dir = std::path::PathBuf::from("/music");
+        let lib = |id, enabled| crate::settings::Library {
+            id,
+            name: String::new(),
+            enabled,
+            source: crate::settings::LibrarySource::Local {
+                path: dir.display().to_string(),
+            },
+        };
+        let settings = Settings {
+            default_library_enabled: false,
+            libraries: vec![lib(2, true), lib(3, false)],
+            ..Settings::default()
+        };
+        // 9 is in the catalog but no longer in the settings: hidden, not deleted.
+        assert_eq!(libraries_off(&settings, &c), [1, 3, 9]);
     }
 }
