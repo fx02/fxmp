@@ -42,7 +42,6 @@ const { listen } = window.__TAURI__.event;
 const ARTIST_LIMIT = 300;
 const UNKNOWN_KEY = "_none";
 const BAN_CONFIRM_MS = 3000;
-const SUGGESTED_SECONDARY = { host: "10.111.0.2", share: "F", root: "MP3", username: "", domain: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -1468,7 +1467,8 @@ function readServer(which) {
 
 function renderSettings(s) {
   fillServer("primary", s.primary);
-  fillServer("secondary", s.secondary || SUGGESTED_SECONDARY);
+  // A backup server usually has the same share and folder: only those are filled in.
+  fillServer("secondary", s.secondary || { ...s.primary, host: "", username: "", domain: null });
   $("use-secondary").checked = Boolean(s.secondary);
   fieldset("secondary").hidden = !s.secondary;
   $("notify").checked = s.notify;

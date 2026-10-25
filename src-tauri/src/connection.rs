@@ -920,6 +920,9 @@ mod tests {
         creds.put(1, "10.111.100.2", "music", "saved-pw");
         let settings = Settings {
             primary: ServerConfig {
+                host: "10.111.100.2".into(),
+                share: "F".into(),
+                root: "MP3".into(),
                 username: "music".into(),
                 ..ServerConfig::default()
             },
@@ -999,9 +1002,11 @@ mod tests {
         creds.put(1, "10.111.0.2", "backup", "pw2");
         let settings = Settings {
             primary: ServerConfig {
+                host: "10.111.100.2".into(),
+                share: "F".into(),
+                root: "MP3".into(),
                 username: " music ".into(),
                 domain: Some("  ".into()),
-                ..ServerConfig::default()
             },
             secondary: Some(ServerConfig {
                 host: "10.111.0.2".into(),

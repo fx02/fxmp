@@ -16,8 +16,9 @@ pub const FILE_NAME: &str = "settings.json";
 /// Quick successive changes (a volume slider) are written at most this often.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// One SMB server. `root` is the music folder inside the share.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One SMB server. `root` is the music folder inside the share. Blank by default
+/// (the form shows examples).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
     pub host: String,
@@ -25,18 +26,6 @@ pub struct ServerConfig {
     pub root: String,
     pub username: String,
     pub domain: Option<String>,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            host: "10.111.100.2".into(),
-            share: "F".into(),
-            root: "MP3".into(),
-            username: String::new(),
-            domain: None,
-        }
-    }
 }
 
 /// Where a library's music is.
@@ -407,9 +396,16 @@ mod tests {
     #[test]
     fn settings_defaults_match_spec() {
         let s = Settings::default();
-        assert_eq!(s.primary.host, "10.111.100.2");
-        assert_eq!(s.primary.share, "F");
-        assert_eq!(s.primary.root, "MP3");
+        // No server of anyone's in the defaults: the form shows examples.
+        assert_eq!(s.primary, ServerConfig::default());
+        assert_eq!(
+            (
+                s.primary.host.as_str(),
+                s.primary.share.as_str(),
+                s.primary.root.as_str()
+            ),
+            ("", "", "")
+        );
         assert_eq!(s.secondary, None);
         assert!(s.crossfade_enabled);
         assert_eq!(s.crossfade_secs, 5);
@@ -557,7 +553,7 @@ mod tests {
         let s = Settings::load(&path).unwrap();
         assert_eq!(s.volume, 0.25);
         assert_eq!(s.primary.username, "u");
-        assert_eq!(s.primary.host, "10.111.100.2");
+        assert_eq!(s.primary.host, "");
         assert_eq!(s.crossfade_secs, 5);
     }
 
