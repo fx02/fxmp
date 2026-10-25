@@ -331,10 +331,52 @@ pub async fn play_album(app: AppHandle, artist: String, album: String) -> CmdRes
     .await
 }
 
+/// What pressing Play (or Play/Pause) does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlayAction {
+    /// The player pauses/resumes (or tries again after failures).
+    Player,
+    /// The restored playlist still waits for the share: it plays when it comes.
+    RememberForResume,
+    /// Nothing is loaded: the playlist plays from what is due.
+    StartPlaylist,
+}
+
+/// `loaded`: a track is playing, paused or cued; `pending`: the restored playlist
+/// waits for the share; `has_next`: the playlist has a track to play.
+pub fn play_action(loaded: bool, pending: bool, has_next: bool) -> PlayAction {
+    if loaded {
+        PlayAction::Player
+    } else if pending {
+        PlayAction::RememberForResume
+    } else if has_next {
+        PlayAction::StartPlaylist
+    } else {
+        PlayAction::Player
+    }
+}
+
+/// Play/Pause (`TogglePause`) or Play (`Resume`) from the UI, tray or media keys;
+/// pressing Play is never silent while there is something to play.
+pub fn play_pause_now(st: &AppState, command: Command) {
+    let loaded = lock(&st.now_playing).is_some();
+    let pending = st.resume_pending.load(std::sync::atomic::Ordering::SeqCst);
+    let has_next = !loaded && lock(&st.playlist).queue.successor().is_some();
+    match play_action(loaded, pending, has_next) {
+        PlayAction::Player => st.player.send(command),
+        PlayAction::RememberForResume => {
+            log::info!("play pressed while the playlist waits for the share");
+            st.play_requested
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        PlayAction::StartPlaylist => st.play_playlist(),
+    }
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn toggle_pause(app: AppHandle) -> CmdResult<()> {
     run(app, |_, st| {
-        st.player.send(Command::TogglePause);
+        play_pause_now(st, Command::TogglePause);
         Ok(())
     })
     .await
@@ -1131,6 +1173,19 @@ mod tests {
         assert_eq!(creds.get("10.111.100.2", "music"), None);
         assert_eq!(creds.get("10.111.0.2", "backup"), None);
         assert_eq!(Settings::load(&path).unwrap(), forgot);
+    }
+
+    #[test]
+    fn play_is_never_silent() {
+        use PlayAction::*;
+        // Something loaded (playing, paused or cued): the player toggles/resumes.
+        assert_eq!(play_action(true, false, true), Player);
+        // Waiting for the share to resume: remembered, the resume then plays.
+        assert_eq!(play_action(false, true, true), RememberForResume);
+        // Nothing loaded (the playlist ran out or stopped): play it from what is due.
+        assert_eq!(play_action(false, false, true), StartPlaylist);
+        // Nothing to play at all: the player is asked anyway (it may re-try).
+        assert_eq!(play_action(false, false, false), Player);
     }
 
     #[test]

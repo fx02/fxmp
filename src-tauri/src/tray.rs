@@ -11,7 +11,7 @@ use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Listener, Manager, Wry};
 
-use crate::commands::{ban_current_now, play_genres_now, spawn_action};
+use crate::commands::{ban_current_now, play_genres_now, play_pause_now, spawn_action};
 use crate::i18n::{self, tr};
 use crate::state::{self, lock, AppState, NowPlaying};
 
@@ -248,7 +248,10 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     let id = event.id().as_ref();
     let st = app.state::<AppState>();
     match id {
-        ID_TOGGLE => st.player.send(Command::TogglePause),
+        ID_TOGGLE => spawn_action(app, "play/pause", |_, st| {
+            play_pause_now(st, Command::TogglePause);
+            Ok(())
+        }),
         ID_NEXT => st.player.send(Command::Next),
         ID_BAN => spawn_action(app, "ban", ban_current_now),
         ID_SHOW => show_main_window(app),

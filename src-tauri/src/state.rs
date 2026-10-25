@@ -42,6 +42,9 @@ pub const POSITION_EVENT: &str = "position";
 const PLAYLIST_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 /// While playing, the position is saved this often.
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(10);
+/// A resume that waited longer than this for the share does not start playing on
+/// its own (it is cued, paused).
+const LATE_RESUME: Duration = Duration::from_secs(120);
 /// Longest wait on quit for the playlist to be saved.
 const QUIT_SAVE_WAIT: Duration = Duration::from_millis(1500);
 
@@ -142,7 +145,10 @@ pub struct AppState {
     playlist_saved_at: Mutex<Instant>,
     /// The restored playlist waits for the share to be reachable (cleared once it
     /// is cued, or once the user plays something else).
-    resume_pending: AtomicBool,
+    pub resume_pending: AtomicBool,
+    /// Play was pressed while the resume waited: it plays rather than cues.
+    pub play_requested: AtomicBool,
+    launched_at: Instant,
     scanning: AtomicBool,
     /// "Clear library" holds the scan slot: shown as such, not as a scan.
     clearing: AtomicBool,
@@ -228,6 +234,8 @@ impl AppState {
             save_playlist: Mutex::new(save_tx),
             playlist_saved_at: Mutex::new(Instant::now()),
             resume_pending: AtomicBool::new(true),
+            play_requested: AtomicBool::new(false),
+            launched_at: Instant::now(),
             scanning: AtomicBool::new(false),
             clearing: AtomicBool::new(false),
             cancel_scan: Arc::new(AtomicBool::new(false)),
@@ -363,7 +371,9 @@ impl AppState {
         if !due {
             return;
         }
-        let command = resume_command(&self.settings.get(), self.provider());
+        let late = resume_is_late(self.launched_at, Instant::now());
+        let pressed = self.play_requested.swap(false, Ordering::SeqCst);
+        let command = resume_command(&self.settings.get(), self.provider(), late, pressed);
         log::info!(
             "playlist restored, {}",
             if matches!(command, Command::Cue(_)) {
@@ -428,13 +438,24 @@ impl AppState {
 }
 
 /// A restored playlist waits paused (`Cue`) unless the user asked for it to play on
-/// start (start at login should not start music unasked).
-pub fn resume_command(s: &Settings, provider: Box<dyn TrackProvider>) -> Command {
-    if s.resume_autoplay {
+/// start (start at login should not start music unasked) and the share answered
+/// soon enough, or Play was pressed while it waited (`pressed`).
+pub fn resume_command(
+    s: &Settings,
+    provider: Box<dyn TrackProvider>,
+    late: bool,
+    pressed: bool,
+) -> Command {
+    if pressed || (s.resume_autoplay && !late) {
         Command::Play(provider)
     } else {
         Command::Cue(provider)
     }
+}
+
+/// The share answered too long after launch for music to start on its own.
+pub fn resume_is_late(launched: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(launched) > LATE_RESUME
 }
 
 /// Whether the held-back resume goes now: once, when the share is reachable.
@@ -817,18 +838,25 @@ mod tests {
     fn a_restored_playlist_waits_paused_unless_asked_to_play() {
         let s = Settings::default();
         assert!(!s.resume_autoplay, "off by default");
-        assert!(matches!(
-            resume_command(&s, Box::new(Nothing)),
-            Command::Cue(_)
-        ));
+        let cmd = |s: &Settings, late, pressed| resume_command(s, Box::new(Nothing), late, pressed);
+        assert!(matches!(cmd(&s, false, false), Command::Cue(_)));
         let on = Settings {
             resume_autoplay: true,
-            ..s
+            ..s.clone()
         };
-        assert!(matches!(
-            resume_command(&on, Box::new(Nothing)),
-            Command::Play(_)
-        ));
+        assert!(matches!(cmd(&on, false, false), Command::Play(_)));
+        // The share answered long after launch: no music unasked.
+        assert!(matches!(cmd(&on, true, false), Command::Cue(_)));
+        // Play was pressed while waiting for the share: it plays.
+        assert!(matches!(cmd(&s, false, true), Command::Play(_)));
+        assert!(matches!(cmd(&s, true, true), Command::Play(_)));
+    }
+
+    #[test]
+    fn a_resume_is_late_after_two_minutes() {
+        let t0 = Instant::now();
+        assert!(!resume_is_late(t0, t0 + Duration::from_secs(119)));
+        assert!(resume_is_late(t0, t0 + Duration::from_secs(121)));
     }
 
     #[test]

@@ -31,6 +31,9 @@ pub type SharedPlaylist = Arc<Mutex<Playlist>>;
 pub const MAX_PAGE: usize = 500;
 /// Past this point into a track, "Previous" starts it again instead.
 pub const RESTART_AFTER_MS: u64 = 3_000;
+/// Network failures of the track to resume before the playlist moves on (the share
+/// answers, but that track does not).
+pub const RESUME_RETRIES: u32 = 3;
 /// Ids looked up per catalog query when exporting.
 const EXPORT_BATCH: usize = 500;
 
@@ -94,8 +97,11 @@ pub struct Playlist {
     generation: u64,
     /// `(generation, order version)` last saved.
     saved_order: Option<(u64, u64)>,
-    /// A track to start part way in (resuming) and where.
+    /// The track to resume and where (0 = its start); kept through a few network
+    /// failures (see [`RESUME_RETRIES`]).
     pub resume_at: Option<(TrackId, u64)>,
+    /// Network failures of that track so far.
+    pub resume_failures: u32,
     /// The first track of a genre shuffle is recorded (to avoid it next time).
     pub first_recorded: bool,
     /// Played to its end: nothing to resume.
@@ -110,6 +116,7 @@ impl Default for Playlist {
             generation: 0,
             saved_order: None,
             resume_at: None,
+            resume_failures: 0,
             first_recorded: false,
             ended: false,
         }
@@ -626,7 +633,7 @@ pub fn restore(query: &Catalog, saved: SavedPlaylist) -> smp_core::Result<Playli
     list.ended = !resume;
     list.first_recorded = true;
     list.resume_at = current
-        .filter(|_| resume && saved.cursor.position_ms > 0)
+        .filter(|_| resume)
         .map(|id| (id, saved.cursor.position_ms));
     Ok(list)
 }
@@ -943,24 +950,49 @@ mod tests {
     }
 
     #[test]
-    fn the_resume_track_is_kept_while_the_share_is_unreachable() {
+    fn the_resume_track_survives_two_network_failures_then_the_next_one_plays() {
+        use smp_core::failure::{FailCode, Failure};
+        for saved_ms in [42_000, 0] {
+            let fx = Fx::new();
+            let mut p = fx.play_genres(&["jazz"]);
+            take(&mut p);
+            let current = take(&mut p).unwrap();
+            let order = row_ids(&fx.page(0, 100, None));
+            let list = saved_and_restored(&fx, current, saved_ms);
+            let mut p = CatalogProvider::new(fx.ctx.clone(), list.clone());
+            let unreachable = Failure::new(FailCode::Unreachable, "no route");
+            for _ in 0..RESUME_RETRIES - 1 {
+                let item = p.next_track().unwrap();
+                assert_eq!((item.id, item.start_ms), (current, saved_ms), "@{saved_ms}");
+                p.on_failed(item.id, &unreachable);
+            }
+            assert_eq!(lock(&list).resume_at, Some((current, saved_ms)), "kept");
+            let item = p.next_track().unwrap();
+            assert_eq!(item.id, current);
+            p.on_failed(item.id, &unreachable);
+            let next = p.next_track().unwrap();
+            assert_eq!(
+                (next.id, next.start_ms),
+                (order[2], 0),
+                "@{saved_ms}: moved on"
+            );
+            assert_eq!(lock(&list).resume_at, None);
+        }
+    }
+
+    #[test]
+    fn a_started_track_resets_the_resume_retries() {
         use smp_core::failure::{FailCode, Failure};
         let fx = Fx::new();
         let mut p = fx.play_genres(&["jazz"]);
-        take(&mut p);
         let current = take(&mut p).unwrap();
-        let list = saved_and_restored(&fx, current, 42_000);
+        let list = saved_and_restored(&fx, current, 1_000);
         let mut p = CatalogProvider::new(fx.ctx.clone(), list.clone());
-        // WireGuard not up yet: every try fails with network trouble.
-        for _ in 0..25 {
-            let item = p.next_track().unwrap();
-            assert_eq!((item.id, item.start_ms), (current, 42_000));
-            p.on_failed(item.id, &Failure::new(FailCode::Unreachable, "no route"));
-        }
-        assert_eq!(lock(&list).resume_at, Some((current, 42_000)));
-        // A bad file is a different matter: the next one plays.
-        p.on_failed(current, &Failure::new(FailCode::Decode, "bad"));
-        assert_ne!(p.next_track().unwrap().id, current);
+        let item = p.next_track().unwrap();
+        p.on_failed(item.id, &Failure::new(FailCode::Timeout, "slow"));
+        assert_eq!(lock(&list).resume_failures, 1);
+        p.on_started(current);
+        assert_eq!(lock(&list).resume_failures, 0);
     }
 
     #[test]

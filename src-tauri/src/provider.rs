@@ -15,7 +15,7 @@ use smp_core::failure::Failure;
 use smp_core::source::Which;
 use smp_core::TrackId;
 
-use crate::playlist::{Selection, SharedPlaylist};
+use crate::playlist::{Selection, SharedPlaylist, RESUME_RETRIES};
 use crate::state::lock;
 use crate::writer::CatalogWriter;
 
@@ -84,6 +84,7 @@ impl TrackProvider for CatalogProvider {
         let mut l = lock(&self.list);
         let expected = l.queue.started(id);
         l.ended = false;
+        l.resume_failures = 0;
         if l.resume_at.is_some_and(|r| r.0 == id) {
             l.resume_at = None;
         }
@@ -110,10 +111,17 @@ impl TrackProvider for CatalogProvider {
             c.record_failure(id, &failure, server).map(drop)
         });
         let mut l = lock(&self.list);
-        if transient && l.resume_at.is_some_and(|r| r.0 == id) {
-            // The share is not up yet (at login, before the VPN): keep the track to
-            // resume and where, rather than walking the playlist.
+        let resuming = transient && l.resume_at.is_some_and(|r| r.0 == id);
+        if resuming && l.resume_failures + 1 < RESUME_RETRIES {
+            // The share is not quite up yet: keep the track to resume and where,
+            // rather than walking the playlist.
+            l.resume_failures += 1;
         } else if transient {
+            if resuming {
+                // It keeps failing: go on with the next track, from its start.
+                l.resume_at = None;
+                l.resume_failures = 0;
+            }
             // Network trouble is not the file's fault: it stays in the playlist.
             l.queue.pass_over(id);
         } else {
