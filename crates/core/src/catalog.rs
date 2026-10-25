@@ -491,6 +491,7 @@ impl Catalog {
             }
             let started = std::time::Instant::now();
             let done = self.savepoint(|| {
+                self.remove_orphans()?;
                 step(self)?;
                 self.check_foreign_keys()?;
                 self.conn
@@ -514,6 +515,35 @@ impl Catalog {
             }
         }
         debug_assert!(MIGRATIONS.last().is_some_and(|m| m.0 == CATALOG_VERSION));
+    }
+
+    /// Deletes rows that refer to rows that do not exist (genre links an old
+    /// build left behind), so the check after a migration step sees only what
+    /// that step broke.
+    fn remove_orphans(&self) -> Result<()> {
+        let broken: Vec<(String, i64)> = self
+            .conn
+            .prepare(
+                "SELECT \"table\", rowid FROM pragma_foreign_key_check WHERE rowid IS NOT NULL",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (table, rowid) in &broken {
+            self.conn.execute(
+                &format!(
+                    "DELETE FROM \"{}\" WHERE rowid=?1",
+                    table.replace('"', "\"\"")
+                ),
+                [rowid],
+            )?;
+        }
+        if !broken.is_empty() {
+            log::warn!(
+                "catalog: removed {} rows that referred to missing rows",
+                broken.len()
+            );
+        }
+        Ok(())
     }
 
     /// Fails if a row refers to one that does not exist.
@@ -2912,6 +2942,27 @@ mod tests {
 
     fn library_of(c: &Catalog, id: TrackId) -> LibraryId {
         c.track(id).unwrap().library_id
+    }
+
+    #[test]
+    fn orphan_genre_links_from_an_old_build_do_not_block_the_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        v4_catalog(&db);
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF; INSERT INTO track_genres VALUES (99, 1), (1, 77);",
+            )
+            .unwrap();
+        let c = Catalog::open(&db).unwrap();
+        assert_eq!(user_version(&c), CATALOG_VERSION);
+        let links: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM track_genres", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(links, 4, "the orphans are gone, the rest kept");
+        assert_eq!(c.track_genres(1).unwrap(), vec!["Rock"]);
     }
 
     #[test]
