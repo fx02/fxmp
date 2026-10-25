@@ -1118,8 +1118,17 @@ fn cue_loads_paused_at_the_position_and_play_continues_there() {
         calls: h.calls.clone(),
     };
     h.player.send(Command::Cue(Box::new(provider)));
-    h.wait("paused", 5, |e| *e == Event::Paused(true));
     h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    let paused_at = h.seen.iter().position(|e| *e == Event::Paused(true));
+    let started_at = h
+        .seen
+        .iter()
+        .position(|e| *e == Event::TrackStarted { id: 1 });
+    assert!(
+        paused_at.is_some_and(|p| Some(p) < started_at),
+        "paused before the track is reported: {:?}",
+        h.seen
+    );
     let e = h.wait("position", 5, |e| {
         matches!(e, Event::Position { id: 1, .. })
     });

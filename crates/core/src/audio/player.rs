@@ -318,6 +318,11 @@ impl Engine {
             Command::Cue(p) => {
                 self.command(Command::Play(p));
                 self.set_paused(true);
+                if self.cur.is_none() {
+                    // Nothing audible to fade out: paused at once, before the track
+                    // is reported as started.
+                    self.pause_gain = 0.0;
+                }
             }
             Command::Requeue => {
                 if self.provider.is_some() {
