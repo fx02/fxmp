@@ -2036,7 +2036,8 @@ mod tests {
         assert!(!c
             .file_unchanged(DEFAULT_LIBRARY, "d1/t1.mp3", 1, 1)
             .unwrap());
-        assert!(took < Duration::from_secs(3), "migration took {took:?}");
+        // Generous bound: debug builds on slow CI runners (Windows) take several seconds.
+        assert!(took < Duration::from_secs(20), "migration took {took:?}");
     }
 
     fn failure(code: FailCode, msg: &str) -> Failure {

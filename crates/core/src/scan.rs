@@ -1461,8 +1461,9 @@ mod tests {
         let backup = library_dir(&["Jazz/a.mp3", "Rock/b.mp3", "Pop/new.mp3"]);
         let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         for p in ["Jazz/a.mp3", "Rock/b.mp3"] {
+            // write, not append: Windows needs write access to set file times.
             let f = fs::File::options()
-                .append(true)
+                .write(true)
                 .open(backup.path().join(p))
                 .unwrap();
             if p == "Rock/b.mp3" {
