@@ -823,6 +823,7 @@ fn run_scan(app: &AppHandle) {
     };
     let result = Catalog::open(&st.catalog_path).and_then(|mut catalog| {
         scan_with(
+            smp_core::DEFAULT_LIBRARY,
             st.source.as_ref(),
             &mut catalog,
             &mut progress,
@@ -965,7 +966,9 @@ mod tests {
             year: Some(1997),
             ..Default::default()
         };
-        let id = c.upsert_track("x/Some Song.mp3", 1, 1, &meta).unwrap();
+        let id = c
+            .upsert_track(smp_core::DEFAULT_LIBRARY, "x/Some Song.mp3", 1, 1, &meta)
+            .unwrap();
         c.rebuild_genres().unwrap();
         let np = now_playing_of(&c, id, true).unwrap();
         assert_eq!(np.title, "Some Song");
@@ -1176,7 +1179,14 @@ mod tests {
                     workers: 2,
                     ..ScanOptions::default()
                 };
-                let r = scan_with(&src, &mut cat, &mut |_| {}, &cancel, &opts);
+                let r = scan_with(
+                    smp_core::DEFAULT_LIBRARY,
+                    &src,
+                    &mut cat,
+                    &mut |_| {},
+                    &cancel,
+                    &opts,
+                );
                 scanning.store(false, Ordering::SeqCst);
                 r.unwrap()
             });

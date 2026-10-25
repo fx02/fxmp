@@ -65,6 +65,9 @@ pub struct WalkReport {
     /// Folders (`/`-separated, relative to the music root) whose listing failed and
     /// that were skipped: their files may still exist, they were just not seen.
     pub skipped_dirs: Vec<String>,
+    /// Listed by a backup server because the primary was down. The backup may lag
+    /// behind, so files it lacks are not taken as deleted.
+    pub from_backup: bool,
 }
 
 pub trait MusicSource: Send + Sync {
@@ -73,5 +76,15 @@ pub trait MusicSource: Send + Sync {
     /// skipped and reported; failing to list the root is an error.
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError>;
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError>;
+    /// Opens `rel_path` of library `library`. A source of one library (every
+    /// source but the app's, which holds them all) ignores `library`.
+    fn open_in(
+        &self,
+        library: crate::LibraryId,
+        rel_path: &str,
+    ) -> Result<Box<dyn ReadSeek>, SourceError> {
+        let _ = library;
+        self.open(rel_path)
+    }
     fn describe(&self) -> String;
 }

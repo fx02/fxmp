@@ -12,6 +12,7 @@ use super::player::PlayItem;
 use super::prefetch::{PrefetchConfig, PrefetchReader};
 use crate::failure::{FailCode, Failure};
 use crate::source::MusicSource;
+use crate::LibraryId;
 
 /// Samples decoded per read on a deck thread.
 const DECODE_CHUNK: usize = 4096;
@@ -59,10 +60,11 @@ pub(super) struct LoadCtx {
     pub(super) wake: Arc<dyn Fn() + Send + Sync>,
 }
 
-/// Starts decoding `rel_path` at `start_ms` (from 0 if it cannot be positioned
-/// there), dropping a further `skip_frames` output frames.
+/// Starts decoding `rel_path` of `library` at `start_ms` (from 0 if it cannot be
+/// positioned there), dropping a further `skip_frames` output frames.
 fn spawn_deck_thread(
     ctx: &LoadCtx,
+    library: LibraryId,
     rel_path: &str,
     rate: u32,
     start_ms: u64,
@@ -84,7 +86,7 @@ fn spawn_deck_thread(
         .name("player-deck".into())
         .spawn(move || {
             let run = std::panic::AssertUnwindSafe(|| {
-                deck_thread(&s, &ctx, &path, rate, start_ms, skip_frames)
+                deck_thread(&s, &ctx, library, &path, rate, start_ms, skip_frames)
             });
             if std::panic::catch_unwind(run).is_err() {
                 // A decoder panic must not leave the engine waiting on this deck forever.
@@ -147,11 +149,12 @@ fn source_cause(e: crate::Error, last: &LastIoError) -> crate::Error {
 
 fn open_decoder(
     ctx: &LoadCtx,
+    library: LibraryId,
     rel_path: &str,
     rate: u32,
     last: &LastIoError,
 ) -> crate::Result<Decoder> {
-    let mut reader = ctx.source.open(rel_path)?;
+    let mut reader = ctx.source.open_in(library, rel_path)?;
     let len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
     let prefetch = PrefetchReader::new(reader, len, ctx.prefetch.clone());
@@ -169,6 +172,7 @@ fn open_decoder(
 fn deck_thread(
     shared: &DeckShared,
     ctx: &LoadCtx,
+    library: LibraryId,
     rel_path: &str,
     rate: u32,
     start_ms: u64,
@@ -179,7 +183,7 @@ fn deck_thread(
         (ctx.wake)();
     };
     let last_io = LastIoError::default();
-    let mut dec = match open_decoder(ctx, rel_path, rate, &last_io) {
+    let mut dec = match open_decoder(ctx, library, rel_path, rate, &last_io) {
         Ok(d) => d,
         Err(e) => return set_phase(Phase::Failed(Failure::from_error(&e))),
     };
@@ -192,7 +196,7 @@ fn deck_thread(
                 log::warn!(
                     "cannot start {rel_path} at {start_ms} ms ({e}); playing from the start"
                 );
-                dec = match open_decoder(ctx, rel_path, rate, &last_io) {
+                dec = match open_decoder(ctx, library, rel_path, rate, &last_io) {
                     Ok(d) => d,
                     Err(e) => return set_phase(Phase::Failed(Failure::from_error(&e))),
                 };
@@ -288,7 +292,7 @@ pub(super) struct Deck {
 
 impl Deck {
     pub(super) fn load(ctx: &LoadCtx, item: PlayItem, rate: u32) -> Self {
-        let shared = spawn_deck_thread(ctx, &item.rel_path, rate, item.start_ms, 0);
+        let shared = spawn_deck_thread(ctx, item.library, &item.rel_path, rate, item.start_ms, 0);
         Self {
             item,
             shared,
@@ -306,7 +310,14 @@ impl Deck {
         let start_ms = self.status().start_ms;
         self.cancel();
         self.played = self.played * rate as u64 / old_rate.max(1) as u64;
-        self.shared = spawn_deck_thread(ctx, &self.item.rel_path, rate, start_ms, self.played);
+        self.shared = spawn_deck_thread(
+            ctx,
+            self.item.library,
+            &self.item.rel_path,
+            rate,
+            start_ms,
+            self.played,
+        );
         self.meter = Some(LoudnessMeter::new(rate));
         self.fade_in = None;
     }

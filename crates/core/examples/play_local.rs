@@ -55,6 +55,7 @@ fn main() {
         .enumerate()
         .map(|(i, rel_path)| PlayItem {
             id: i as TrackId + 1,
+            library: smp_core::DEFAULT_LIBRARY,
             rel_path,
             gain_db: 0.0,
             start_ms: 0,

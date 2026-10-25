@@ -73,6 +73,7 @@ impl TrackProvider for CatalogProvider {
             };
             return Some(PlayItem {
                 id,
+                library: row.library_id,
                 rel_path: row.rel_path,
                 gain_db: track_gain_db(row.meta.rg_track_gain_db, row.measured_lufs),
                 start_ms,
@@ -174,7 +175,8 @@ mod tests {
             raw_genre: Some(genre.into()),
             ..Default::default()
         };
-        cat.upsert_track(path, 1, 1, &meta).unwrap()
+        cat.upsert_track(smp_core::DEFAULT_LIBRARY, path, 1, 1, &meta)
+            .unwrap()
     }
 
     /// A catalog file with a query connection (also used for setup and checks) and
@@ -337,7 +339,10 @@ mod tests {
             rg_track_gain_db: Some(-30.0),
             ..Default::default()
         };
-        let rg = fx.query.upsert_track("a.mp3", 1, 1, &meta).unwrap();
+        let rg = fx
+            .query
+            .upsert_track(smp_core::DEFAULT_LIBRARY, "a.mp3", 1, 1, &meta)
+            .unwrap();
         let measured = track(&fx.query, "b.mp3", "Pop", None);
         fx.query.set_measured_lufs(measured, -24.0).unwrap();
         fx.query.rebuild_genres().unwrap();

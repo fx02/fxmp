@@ -98,7 +98,13 @@ mod tests {
         let reader = Catalog::open(&path).unwrap();
         let w = CatalogWriter::spawn(Catalog::open(&path).unwrap()).unwrap();
         w.call(|c| {
-            let id = c.upsert_track("a.mp3", 1, 1, &TrackMeta::default())?;
+            let id = c.upsert_track(
+                smp_core::DEFAULT_LIBRARY,
+                "a.mp3",
+                1,
+                1,
+                &TrackMeta::default(),
+            )?;
             c.rebuild_genres()?;
             c.set_banned(id, true)
         })
@@ -133,7 +139,13 @@ mod tests {
         let w = CatalogWriter::spawn(Catalog::open_in_memory().unwrap()).unwrap();
         w.call(|c| {
             for p in ["1.mp3", "2.mp3"] {
-                c.upsert_track(p, 1, 1, &smp_core::catalog::TrackMeta::default())?;
+                c.upsert_track(
+                    smp_core::DEFAULT_LIBRARY,
+                    p,
+                    1,
+                    1,
+                    &smp_core::catalog::TrackMeta::default(),
+                )?;
             }
             Ok(())
         })

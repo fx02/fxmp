@@ -169,6 +169,7 @@ fn live_scan_reads_tags_sample() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
         let report = scan(
+            smp_core::DEFAULT_LIBRARY,
             &src,
             &mut cat,
             &mut |p| {
@@ -265,6 +266,7 @@ fn live_scan_timing() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let started = Instant::now();
         let report = scan_with(
+            smp_core::DEFAULT_LIBRARY,
             &sample,
             &mut cat,
             &mut |_| {},

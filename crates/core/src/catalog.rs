@@ -14,10 +14,10 @@ use crate::genre::{
 };
 use crate::queue::Entry;
 use crate::source::Which;
-use crate::{Result, TrackId};
+use crate::{LibraryId, Result, TrackId};
 
 /// Catalog version, kept in `PRAGMA user_version`; see [`MIGRATIONS`].
-const CATALOG_VERSION: i64 = 4;
+const CATALOG_VERSION: i64 = 5;
 /// Consecutive failures after which a track leaves the shuffle until the next scan.
 const MAX_FAILS: i64 = 3;
 
@@ -36,6 +36,8 @@ pub struct TrackMeta {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackRow {
     pub id: TrackId,
+    pub library_id: LibraryId,
+    /// Relative to its library's root.
     pub rel_path: String,
     pub meta: TrackMeta,
     pub measured_lufs: Option<f32>,
@@ -45,6 +47,7 @@ pub struct TrackRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnreadableTrack {
     pub id: TrackId,
+    pub library_id: LibraryId,
     pub rel_path: String,
     /// [`crate::failure::FailCode`] as text; `None` for failures recorded before
     /// reasons were stored.
@@ -138,10 +141,13 @@ pub fn selection_key(genre_keys: &[String]) -> String {
     keys.join("|")
 }
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS tracks(
+/// The columns of `tracks` as this version creates it: a path is unique within its
+/// library (see the unique index made in `add_missing_columns`). Older catalogs get
+/// the later columns added ([`ADDED_TRACK_COLUMNS`]) and the table rebuilt
+/// (migration 5).
+const TRACKS_COLUMNS: &str = "
     id INTEGER PRIMARY KEY,
-    rel_path TEXT NOT NULL UNIQUE,
+    rel_path TEXT NOT NULL,
     size INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
     artist TEXT, album TEXT, title TEXT,
@@ -151,9 +157,24 @@ CREATE TABLE IF NOT EXISTS tracks(
     measured_lufs REAL,
     fail_count INTEGER NOT NULL DEFAULT 0,
     banned INTEGER NOT NULL DEFAULT 0,
-    present INTEGER NOT NULL DEFAULT 1
-);
+    present INTEGER NOT NULL DEFAULT 1,
+    year INTEGER,
+    needs_retag INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_error_msg TEXT,
+    last_error_at INTEGER,
+    last_error_server TEXT,
+    library_id INTEGER NOT NULL DEFAULT 1
+";
+
+/// Indexes on `tracks` (also made again after the table is rebuilt).
+const TRACKS_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS idx_tracks_artist_album ON tracks(artist, album);
+CREATE INDEX IF NOT EXISTS idx_tracks_year ON tracks(year);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_library_path ON tracks(library_id, rel_path);
+";
+
+const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS genres(
     id INTEGER PRIMARY KEY,
     key TEXT NOT NULL UNIQUE,
@@ -192,6 +213,9 @@ CREATE TABLE IF NOT EXISTS playlist_cursor(
     position_ms INTEGER NOT NULL,
     resume INTEGER NOT NULL DEFAULT 1
 );
+-- Libraries switched off in the settings: their tracks stay but are not shown or
+-- played. A library not listed is on.
+CREATE TABLE IF NOT EXISTS disabled_libraries(id INTEGER PRIMARY KEY);
 ";
 
 fn ids_to_blob(ids: impl Iterator<Item = i64>) -> Vec<u8> {
@@ -232,6 +256,8 @@ const ADDED_TRACK_COLUMNS: &[(&str, &str)] = &[
     ("last_error_msg", "TEXT"),
     ("last_error_at", "INTEGER"),
     ("last_error_server", "TEXT"),
+    // Tracks from before libraries are the first (SMB) library's.
+    ("library_id", "INTEGER NOT NULL DEFAULT 1"),
 ];
 
 /// Columns added to the playlist tables after they first shipped (as for `tracks`).
@@ -259,6 +285,9 @@ const MIGRATIONS: &[Migration] = &[
         c.conn.execute("UPDATE tracks SET needs_retag=1", [])?;
         Ok(())
     }),
+    (5, "a path is unique within its library", |c| {
+        c.rebuild_tracks_table()
+    }),
 ];
 
 /// `upsert_track` keeps a stored failure only when the file did not change and the
@@ -266,9 +295,15 @@ const MIGRATIONS: &[Migration] = &[
 const KEEP_ERROR: &str = "size=excluded.size AND mtime=excluded.mtime \
                           AND last_error IN ('decode', 'unsupported')";
 
-/// Tracks the "Unreadable" list shows: not banned, and failed (network trouble
-/// stored by an older build aside).
-const UNREADABLE: &str = "banned=0 AND (fail_count>0 OR (last_error IS NOT NULL \
+/// The track's library is switched on (a condition on `tracks`, unaliased).
+const ENABLED: &str = "library_id NOT IN (SELECT id FROM disabled_libraries)";
+/// [`ENABLED`] for `tracks t`.
+const T_ENABLED: &str = "t.library_id NOT IN (SELECT id FROM disabled_libraries)";
+
+/// Tracks the "Unreadable" list shows: not banned, in a library that is on, and
+/// failed (network trouble stored by an older build aside).
+const UNREADABLE: &str = "banned=0 AND library_id NOT IN (SELECT id FROM disabled_libraries) \
+                          AND (fail_count>0 OR (last_error IS NOT NULL \
                           AND last_error NOT IN ('timeout', 'unreachable')))";
 
 fn now_secs() -> i64 {
@@ -284,10 +319,10 @@ fn which_str(w: Which) -> &'static str {
     }
 }
 
-/// Playable (not banned, not excluded) tracks in `f`'s genres and years, as a
-/// condition on `tracks t` and its parameters.
+/// Playable (not banned, not excluded, library on) tracks in `f`'s genres and
+/// years, as a condition on `tracks t` and its parameters.
 fn filter_sql(f: &TrackFilter) -> (String, Vec<Value>) {
-    let mut sql = format!("t.banned=0 AND t.fail_count<{MAX_FAILS}");
+    let mut sql = format!("t.banned=0 AND t.fail_count<{MAX_FAILS} AND {T_ENABLED}");
     let mut args = Vec::new();
     if !f.genre_keys.is_empty() {
         let marks = vec!["?"; f.genre_keys.len()].join(",");
@@ -318,11 +353,12 @@ fn filter_sql(f: &TrackFilter) -> (String, Vec<Value>) {
 }
 
 const TRACK_COLS: &str = "id, rel_path, artist, album, title, track_no, duration_ms, \
-                          raw_genre, rg_track_gain, measured_lufs, year";
+                          raw_genre, rg_track_gain, measured_lufs, year, library_id";
 
 fn row_to_track(r: &Row) -> rusqlite::Result<TrackRow> {
     Ok(TrackRow {
         id: r.get(0)?,
+        library_id: r.get(11)?,
         rel_path: r.get(1)?,
         meta: TrackMeta {
             artist: r.get(2)?,
@@ -354,6 +390,9 @@ impl Catalog {
     fn init(conn: Connection) -> Result<Self> {
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS tracks({TRACKS_COLUMNS});"
+        ))?;
         conn.execute_batch(SCHEMA)?;
         let catalog = Self { conn };
         // The app cannot run without these: a failure here is fatal.
@@ -377,8 +416,8 @@ impl Catalog {
                     log::info!("catalog: added column tracks.{name}");
                 }
             }
-            self.conn
-                .execute_batch("CREATE INDEX IF NOT EXISTS idx_tracks_year ON tracks(year)")?;
+            // Every path was unique before libraries came, so this always works.
+            self.conn.execute_batch(TRACKS_INDEXES)?;
             for (table, name, decl) in ADDED_PLAYLIST_COLUMNS {
                 let have: bool = self.conn.query_row(
                     &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
@@ -404,10 +443,27 @@ impl Catalog {
                 return;
             }
         };
+        // A step may rebuild a table others refer to: foreign keys are checked by
+        // hand at the end of each step instead (the pragma only works outside a
+        // transaction, as here), and are on again afterwards whatever happens.
+        if let Err(e) = self.conn.execute_batch("PRAGMA foreign_keys=OFF") {
+            log::error!("catalog: cannot prepare the migrations: {e}");
+            return;
+        }
+        struct ForeignKeysOn<'a>(&'a Connection);
+        impl Drop for ForeignKeysOn<'_> {
+            fn drop(&mut self) {
+                if let Err(e) = self.0.execute_batch("PRAGMA foreign_keys=ON") {
+                    log::error!("catalog: foreign keys not switched on again: {e}");
+                }
+            }
+        }
+        let _on = ForeignKeysOn(&self.conn);
         for (to, what, step) in MIGRATIONS.iter().filter(|(to, ..)| *to > version) {
             let started = std::time::Instant::now();
             let done = self.savepoint(|| {
                 step(self)?;
+                self.check_foreign_keys()?;
                 self.conn
                     .execute_batch(&format!("PRAGMA user_version = {to}"))?;
                 Ok(())
@@ -426,6 +482,52 @@ impl Catalog {
             }
         }
         debug_assert!(MIGRATIONS.last().is_some_and(|m| m.0 == CATALOG_VERSION));
+    }
+
+    /// Fails if a row refers to one that does not exist.
+    fn check_foreign_keys(&self) -> Result<()> {
+        let broken: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })?;
+        if broken > 0 {
+            return Err(crate::Error::Other(format!(
+                "{broken} rows refer to rows that do not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rebuilds `tracks` without the old `UNIQUE` on `rel_path` alone (a path is
+    /// unique within its library, see [`TRACKS_INDEXES`]), keeping every row and
+    /// id, so genre links, selections and the saved playlist stay valid. Nothing
+    /// to do for a table made by this version. Runs in the migration's
+    /// transaction, with foreign keys off (dropping the old table must not delete
+    /// the genre links).
+    fn rebuild_tracks_table(&self) -> Result<()> {
+        let old_unique: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_index_list('tracks') WHERE origin='u'",
+            [],
+            |r| r.get(0),
+        )?;
+        if old_unique == 0 {
+            return Ok(());
+        }
+        let columns: Vec<String> = self
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('tracks')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let columns = columns.join(", ");
+        self.conn.execute_batch(&format!(
+            "CREATE TABLE tracks_v5({TRACKS_COLUMNS});
+             INSERT INTO tracks_v5({columns}) SELECT {columns} FROM tracks;
+             DROP TABLE tracks;
+             ALTER TABLE tracks_v5 RENAME TO tracks;
+             {TRACKS_INDEXES}"
+        ))?;
+        Ok(())
     }
 
     /// Runs `f` in a savepoint: a transaction of its own, or nested in the caller's.
@@ -508,23 +610,33 @@ impl Catalog {
         Ok(n == 0)
     }
 
-    /// The file is known with this size and time, and its tags need no new read.
-    pub fn file_unchanged(&self, rel_path: &str, size: u64, mtime: i64) -> Result<bool> {
+    /// The file is known in `library` with this size and time, and its tags need
+    /// no new read.
+    pub fn file_unchanged(
+        &self,
+        library: LibraryId,
+        rel_path: &str,
+        size: u64,
+        mtime: i64,
+    ) -> Result<bool> {
         let hit = self
             .conn
             .prepare_cached(
                 "SELECT 1 FROM tracks
-                 WHERE rel_path=?1 AND size=?2 AND mtime=?3 AND needs_retag=0",
+                 WHERE library_id=?4 AND rel_path=?1 AND size=?2 AND mtime=?3
+                   AND needs_retag=0",
             )?
-            .exists(params![rel_path, size as i64, mtime])?;
+            .exists(params![rel_path, size as i64, mtime, library])?;
         Ok(hit)
     }
 
-    /// Insert or update a track by path after reading its tags; marks it present. A
-    /// changed file loses its measured loudness and stored failure, a tag failure
-    /// is cleared; the failure count is left to `begin_scan`/`record_success`.
+    /// Insert or update a track by library and path after reading its tags; marks
+    /// it present. A changed file loses its measured loudness and stored failure, a
+    /// tag failure is cleared; the failure count is left to
+    /// `begin_scan`/`record_success`.
     pub fn upsert_track(
         &self,
+        library: LibraryId,
         rel_path: &str,
         size: u64,
         mtime: i64,
@@ -532,9 +644,10 @@ impl Catalog {
     ) -> Result<TrackId> {
         let sql = format!(
             "INSERT INTO tracks(rel_path, size, mtime, artist, album, title, track_no,
-                                duration_ms, raw_genre, rg_track_gain, year, present)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1)
-             ON CONFLICT(rel_path) DO UPDATE SET
+                                duration_ms, raw_genre, rg_track_gain, year, library_id,
+                                present)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1)
+             ON CONFLICT(library_id, rel_path) DO UPDATE SET
                 measured_lufs = CASE WHEN size=excluded.size AND mtime=excluded.mtime
                                      THEN measured_lufs ELSE NULL END,
                 last_error = CASE WHEN {KEEP_ERROR} THEN last_error END,
@@ -561,6 +674,7 @@ impl Catalog {
                 meta.raw_genre,
                 meta.rg_track_gain_db.map(f64::from),
                 meta.year.map(i64::from),
+                library,
             ],
             |r| r.get(0),
         )?;
@@ -576,6 +690,7 @@ impl Catalog {
     /// it was network trouble ([`crate::failure::FailCode::is_transient`]).
     pub fn record_scan_failure(
         &self,
+        library: LibraryId,
         rel_path: &str,
         size: u64,
         mtime: i64,
@@ -585,9 +700,10 @@ impl Catalog {
         let known: Option<TrackId> = if retry {
             self.conn
                 .prepare_cached(
-                    "UPDATE tracks SET present=1, needs_retag=1 WHERE rel_path=?1 RETURNING id",
+                    "UPDATE tracks SET present=1, needs_retag=1
+                     WHERE library_id=?2 AND rel_path=?1 RETURNING id",
                 )?
-                .query_row([rel_path], |r| r.get(0))
+                .query_row(params![rel_path, library], |r| r.get(0))
                 .optional()?
         } else {
             self.conn
@@ -595,15 +711,16 @@ impl Catalog {
                     "UPDATE tracks SET
                         measured_lufs = CASE WHEN size=?2 AND mtime=?3 THEN measured_lufs END,
                         size=?2, mtime=?3, present=1, needs_retag=0
-                     WHERE rel_path=?1 RETURNING id",
+                     WHERE library_id=?4 AND rel_path=?1 RETURNING id",
                 )?
-                .query_row(params![rel_path, size as i64, mtime], |r| r.get(0))
+                .query_row(params![rel_path, size as i64, mtime, library], |r| r.get(0))
                 .optional()?
         };
         let id = match known {
             Some(id) => id,
             None => {
-                let id = self.upsert_track(rel_path, size, mtime, &TrackMeta::default())?;
+                let id =
+                    self.upsert_track(library, rel_path, size, mtime, &TrackMeta::default())?;
                 self.conn
                     .prepare_cached("UPDATE tracks SET needs_retag=?2 WHERE id=?1")?
                     .execute(params![id, retry])?;
@@ -633,56 +750,124 @@ impl Catalog {
         Ok(())
     }
 
-    /// Lets every track play again; stored failures stay listed (see [`Self::unreadable`]).
-    pub fn begin_scan(&self) -> Result<()> {
-        self.conn
-            .execute("UPDATE tracks SET present=0, fail_count=0", [])?;
+    /// A scan of `library` starts: lets its tracks play again; stored failures
+    /// stay listed (see [`Self::unreadable`]). Other libraries are not touched.
+    pub fn begin_scan(&self, library: LibraryId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET present=0, fail_count=0 WHERE library_id=?1",
+            [library],
+        )?;
         Ok(())
     }
 
-    pub fn mark_seen(&self, rel_path: &str) -> Result<()> {
+    pub fn mark_seen(&self, library: LibraryId, rel_path: &str) -> Result<()> {
         self.conn
-            .prepare_cached("UPDATE tracks SET present=1 WHERE rel_path=?1")?
-            .execute([rel_path])?;
+            .prepare_cached("UPDATE tracks SET present=1 WHERE library_id=?2 AND rel_path=?1")?
+            .execute(params![rel_path, library])?;
         Ok(())
     }
 
-    /// Delete tracks not seen since `begin_scan`, except those under `keep_under`
-    /// (folders the walk could not list: their files were not seen, not deleted),
-    /// which count as present again. Returns how many were removed.
-    pub fn finish_scan(&self, keep_under: &[String]) -> Result<usize> {
+    /// Delete `library`'s tracks not seen since `begin_scan`, except those under
+    /// `keep_under` (folders the walk could not list: their files were not seen,
+    /// not deleted; `""` is the whole library), which count as present again.
+    /// Returns how many were removed.
+    pub fn finish_scan(&self, library: LibraryId, keep_under: &[String]) -> Result<usize> {
         self.savepoint(|| {
             let mut keep = self.conn.prepare_cached(
                 "UPDATE tracks SET present=1
-                 WHERE present=0 AND substr(rel_path, 1, length(?1) + 1) = ?1 || '/'",
+                 WHERE present=0 AND library_id=?2
+                   AND substr(rel_path, 1, length(?1) + 1) = ?1 || '/'",
             )?;
             for dir in keep_under.iter().map(|d| d.trim_matches('/')) {
                 if dir.is_empty() {
                     // The whole library unseen: sweep nothing.
-                    self.conn.execute("UPDATE tracks SET present=1", [])?;
+                    self.abort_scan(library)?;
                 } else {
-                    keep.execute([dir])?;
+                    keep.execute(params![dir, library])?;
                 }
             }
+            const GONE: &str = "SELECT id FROM tracks WHERE present=0 AND library_id=?1";
             self.conn.execute(
-                "DELETE FROM track_genres WHERE track_id IN (SELECT id FROM tracks WHERE present=0)",
-                [],
+                &format!("DELETE FROM track_genres WHERE track_id IN ({GONE})"),
+                [library],
             )?;
             self.conn.execute(
-                "DELETE FROM selection_state
-                 WHERE last_first IN (SELECT id FROM tracks WHERE present=0)",
-                [],
+                &format!("DELETE FROM selection_state WHERE last_first IN ({GONE})"),
+                [library],
             )?;
-            Ok(self.conn.execute("DELETE FROM tracks WHERE present=0", [])?)
+            Ok(self.conn.execute(
+                "DELETE FROM tracks WHERE present=0 AND library_id=?1",
+                [library],
+            )?)
         })
     }
 
-    /// A scan that stopped early (cancelled or failed): every track counts as
-    /// present again, as before `begin_scan`.
-    pub fn abort_scan(&self) -> Result<()> {
-        self.conn
-            .execute("UPDATE tracks SET present=1 WHERE present=0", [])?;
+    /// A scan of `library` that stopped early (cancelled or failed): its tracks
+    /// count as present again, as before `begin_scan`.
+    pub fn abort_scan(&self, library: LibraryId) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tracks SET present=1 WHERE present=0 AND library_id=?1",
+            [library],
+        )?;
         Ok(())
+    }
+
+    /// Switches libraries on and off: exactly `ids` are off (their tracks are kept
+    /// but neither listed nor played).
+    pub fn set_disabled_libraries(&self, ids: &[LibraryId]) -> Result<()> {
+        self.savepoint(|| {
+            self.conn.execute("DELETE FROM disabled_libraries", [])?;
+            let mut ins = self
+                .conn
+                .prepare_cached("INSERT OR IGNORE INTO disabled_libraries(id) VALUES(?1)")?;
+            for id in ids {
+                ins.execute([id])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn disabled_libraries(&self) -> Result<HashSet<LibraryId>> {
+        let v = self
+            .conn
+            .prepare_cached("SELECT id FROM disabled_libraries")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// How many tracks each library has (whether on or off).
+    pub fn library_track_counts(&self) -> Result<HashMap<LibraryId, usize>> {
+        let v = self
+            .conn
+            .prepare_cached("SELECT library_id, COUNT(*) FROM tracks GROUP BY library_id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// A library was removed: deletes its tracks (with their genre links and the
+    /// selections that started with one), in one transaction, and rebuilds the
+    /// genres. Returns how many tracks went.
+    pub fn remove_library(&self, library: LibraryId) -> Result<usize> {
+        let removed = self.savepoint(|| {
+            const ITS: &str = "SELECT id FROM tracks WHERE library_id=?1";
+            self.conn.execute(
+                &format!("DELETE FROM track_genres WHERE track_id IN ({ITS})"),
+                [library],
+            )?;
+            self.conn.execute(
+                &format!("DELETE FROM selection_state WHERE last_first IN ({ITS})"),
+                [library],
+            )?;
+            self.conn
+                .execute("DELETE FROM disabled_libraries WHERE id=?1", [library])?;
+            Ok(self
+                .conn
+                .execute("DELETE FROM tracks WHERE library_id=?1", [library])?)
+        })?;
+        self.rebuild_genres()?;
+        Ok(removed)
     }
 
     /// Tracks marked not present (between `begin_scan` and `finish_scan`).
@@ -780,16 +965,18 @@ impl Catalog {
         })
     }
 
-    /// Genres with the number of playable (not banned, not failed) tracks in each.
+    /// Genres with the number of playable (not banned, not failed, library on)
+    /// tracks in each.
     pub fn genres(&self) -> Result<Vec<GenreCount>> {
-        let mut st = self.conn.prepare_cached(
+        let mut st = self.conn.prepare_cached(&format!(
             "SELECT g.key, g.display, COUNT(t.id)
              FROM genres g
              JOIN track_genres tg ON tg.genre_id = g.id
              JOIN tracks t ON t.id = tg.track_id AND t.banned = 0 AND t.fail_count < ?1
+                           AND {T_ENABLED}
              GROUP BY g.id
-             ORDER BY g.display COLLATE NOCASE, g.key",
-        )?;
+             ORDER BY g.display COLLATE NOCASE, g.key"
+        ))?;
         let rows = st
             .query_map([MAX_FAILS], |r| {
                 Ok(GenreCount {
@@ -1060,7 +1247,7 @@ impl Catalog {
             .conn
             .prepare_cached(&format!(
                 "SELECT id, rel_path, last_error, last_error_msg, fail_count, last_error_at,
-                        last_error_server
+                        last_error_server, library_id
                  FROM tracks
                  WHERE {UNREADABLE}
                  ORDER BY last_error_at IS NULL, last_error_at DESC, rel_path"
@@ -1069,6 +1256,7 @@ impl Catalog {
                 let fail_count: i64 = r.get(4)?;
                 Ok(UnreadableTrack {
                     id: r.get(0)?,
+                    library_id: r.get(7)?,
                     rel_path: r.get(1)?,
                     code: r.get(2)?,
                     message: r.get(3)?,
@@ -1146,8 +1334,12 @@ impl Catalog {
         Ok(())
     }
 
+    /// Banned tracks of the libraries that are on.
     pub fn banned(&self) -> Result<Vec<TrackRow>> {
-        let sql = format!("SELECT {TRACK_COLS} FROM tracks WHERE banned=1 ORDER BY rel_path");
+        let sql = format!(
+            "SELECT {TRACK_COLS} FROM tracks WHERE banned=1 AND {ENABLED}
+             ORDER BY rel_path, library_id"
+        );
         let rows = self
             .conn
             .prepare(&sql)?
@@ -1197,10 +1389,11 @@ impl Catalog {
     pub fn artists(&self) -> Result<Vec<String>> {
         let v = self
             .conn
-            .prepare(
-                "SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL AND artist<>''
-                 ORDER BY artist COLLATE NOCASE, artist",
-            )?
+            .prepare(&format!(
+                "SELECT DISTINCT artist FROM tracks
+                 WHERE artist IS NOT NULL AND artist<>'' AND {ENABLED}
+                 ORDER BY artist COLLATE NOCASE, artist"
+            ))?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(v)
@@ -1210,11 +1403,11 @@ impl Catalog {
     pub fn albums(&self, artist: &str) -> Result<Vec<AlbumInfo>> {
         let v = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT album, MIN(year) FROM tracks
-                 WHERE artist=?1 AND album IS NOT NULL AND album<>''
-                 GROUP BY album ORDER BY album COLLATE NOCASE, album",
-            )?
+                 WHERE artist=?1 AND album IS NOT NULL AND album<>'' AND {ENABLED}
+                 GROUP BY album ORDER BY album COLLATE NOCASE, album"
+            ))?
             .query_map([artist], |r| {
                 Ok(AlbumInfo {
                     name: r.get(0)?,
@@ -1228,10 +1421,10 @@ impl Catalog {
     pub fn album_tracks(&self, artist: &str, album: &str) -> Result<Vec<TrackId>> {
         let v = self
             .conn
-            .prepare(
-                "SELECT id FROM tracks WHERE artist=?1 AND album=?2
-                 ORDER BY track_no IS NULL, track_no, rel_path",
-            )?
+            .prepare(&format!(
+                "SELECT id FROM tracks WHERE artist=?1 AND album=?2 AND {ENABLED}
+                 ORDER BY track_no IS NULL, track_no, rel_path"
+            ))?
             .query_map([artist, album], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(v)
@@ -1244,6 +1437,7 @@ mod tests {
     use crate::failure::{FailCode, Failure};
     use crate::queue::Entry;
     use crate::source::Which;
+    use crate::DEFAULT_LIBRARY;
 
     fn meta(genre: Option<&str>) -> TrackMeta {
         TrackMeta {
@@ -1253,7 +1447,8 @@ mod tests {
     }
 
     fn add(c: &Catalog, path: &str, genre: Option<&str>) -> TrackId {
-        c.upsert_track(path, 10, 100, &meta(genre)).unwrap()
+        c.upsert_track(DEFAULT_LIBRARY, path, 10, 100, &meta(genre))
+            .unwrap()
     }
 
     fn count_of(c: &Catalog, key: &str) -> Option<usize> {
@@ -1268,14 +1463,24 @@ mod tests {
     fn upsert_and_unchanged_detection() {
         let c = Catalog::open_in_memory().unwrap();
         assert!(c.is_empty().unwrap());
-        let id = c.upsert_track("a/x.mp3", 10, 100, &meta(None)).unwrap();
+        let id = c
+            .upsert_track(DEFAULT_LIBRARY, "a/x.mp3", 10, 100, &meta(None))
+            .unwrap();
         assert!(!c.is_empty().unwrap());
-        assert!(c.file_unchanged("a/x.mp3", 10, 100).unwrap());
-        assert!(!c.file_unchanged("a/x.mp3", 10, 101).unwrap());
-        assert!(!c.file_unchanged("a/x.mp3", 11, 100).unwrap());
-        assert!(!c.file_unchanged("nope.mp3", 10, 100).unwrap());
+        assert!(c
+            .file_unchanged(DEFAULT_LIBRARY, "a/x.mp3", 10, 100)
+            .unwrap());
+        assert!(!c
+            .file_unchanged(DEFAULT_LIBRARY, "a/x.mp3", 10, 101)
+            .unwrap());
+        assert!(!c
+            .file_unchanged(DEFAULT_LIBRARY, "a/x.mp3", 11, 100)
+            .unwrap());
+        assert!(!c
+            .file_unchanged(DEFAULT_LIBRARY, "nope.mp3", 10, 100)
+            .unwrap());
         let id2 = c
-            .upsert_track("a/x.mp3", 10, 101, &meta(Some("Rock")))
+            .upsert_track(DEFAULT_LIBRARY, "a/x.mp3", 10, 101, &meta(Some("Rock")))
             .unwrap();
         assert_eq!(id, id2);
         assert_eq!(c.track(id).unwrap().meta.raw_genre.as_deref(), Some("Rock"));
@@ -1355,9 +1560,9 @@ mod tests {
             3
         );
         assert!(!c.playable_tracks(&[]).unwrap().contains(&id));
-        c.begin_scan().unwrap();
-        c.mark_seen("a.mp3").unwrap();
-        assert_eq!(c.finish_scan(&[]).unwrap(), 0);
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
+        c.mark_seen(DEFAULT_LIBRARY, "a.mp3").unwrap();
+        assert_eq!(c.finish_scan(DEFAULT_LIBRARY, &[]).unwrap(), 0);
         assert!(c.playable_tracks(&[]).unwrap().contains(&id));
     }
 
@@ -1572,7 +1777,11 @@ mod tests {
         assert_eq!(c.track_genres(3).unwrap(), vec!["Jazz"]);
         // Every track is re-read on the next scan, so it gets its year.
         for (path, size, mtime) in [("Rock/a.mp3", 10, 100), ("Rock/b.mp3", 20, 200)] {
-            assert!(!c.file_unchanged(path, size, mtime).unwrap(), "{path}");
+            assert!(
+                !c.file_unchanged(DEFAULT_LIBRARY, path, size, mtime)
+                    .unwrap(),
+                "{path}"
+            );
         }
         // The failures listed so far have no stored reason.
         let u = c.unreadable().unwrap();
@@ -1588,17 +1797,22 @@ mod tests {
         {
             let c = Catalog::open(&db).unwrap();
             // A scan re-reads a.mp3.
-            c.upsert_track("Rock/a.mp3", 10, 100, &meta(Some("Rock")))
+            c.upsert_track(DEFAULT_LIBRARY, "Rock/a.mp3", 10, 100, &meta(Some("Rock")))
                 .unwrap();
-            assert!(c.file_unchanged("Rock/a.mp3", 10, 100).unwrap());
+            assert!(c
+                .file_unchanged(DEFAULT_LIBRARY, "Rock/a.mp3", 10, 100)
+                .unwrap());
         }
         let c = Catalog::open(&db).unwrap();
         assert_eq!(user_version(&c), CATALOG_VERSION);
         assert!(
-            c.file_unchanged("Rock/a.mp3", 10, 100).unwrap(),
+            c.file_unchanged(DEFAULT_LIBRARY, "Rock/a.mp3", 10, 100)
+                .unwrap(),
             "not marked again"
         );
-        assert!(!c.file_unchanged("Rock/b.mp3", 20, 200).unwrap());
+        assert!(!c
+            .file_unchanged(DEFAULT_LIBRARY, "Rock/b.mp3", 20, 200)
+            .unwrap());
         assert_eq!(c.track(1).unwrap().measured_lufs, Some(-9.5));
         // Columns are only added once: a third open is fine as well.
         drop(c);
@@ -1627,6 +1841,7 @@ mod tests {
         // The new columns are there, so the app works.
         let id = c
             .upsert_track(
+                DEFAULT_LIBRARY,
                 "new.mp3",
                 1,
                 1,
@@ -1661,7 +1876,9 @@ mod tests {
         let c = Catalog::open(&db).unwrap();
         let took = t.elapsed();
         assert_eq!(user_version(&c), CATALOG_VERSION);
-        assert!(!c.file_unchanged("d1/t1.mp3", 1, 1).unwrap());
+        assert!(!c
+            .file_unchanged(DEFAULT_LIBRARY, "d1/t1.mp3", 1, 1)
+            .unwrap());
         assert!(took < Duration::from_secs(3), "migration took {took:?}");
     }
 
@@ -1712,11 +1929,11 @@ mod tests {
         assert_eq!((ub.fail_count, ub.excluded, ub.server), (3, true, None));
 
         // A rescan lets the track play again but keeps the reason on the list.
-        c.begin_scan().unwrap();
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
         for p in ["a.mp3", "b.mp3", "c.mp3", "ok.mp3"] {
-            c.mark_seen(p).unwrap();
+            c.mark_seen(DEFAULT_LIBRARY, p).unwrap();
         }
-        c.finish_scan(&[]).unwrap();
+        c.finish_scan(DEFAULT_LIBRARY, &[]).unwrap();
         assert_eq!(c.unreadable().unwrap().len(), 2);
         assert!(c.playable_tracks(&[]).unwrap().contains(&b));
 
@@ -1749,7 +1966,9 @@ mod tests {
             year: Some(1999),
             ..Default::default()
         };
-        let id = c.upsert_track("known.mp3", 10, 100, &m).unwrap();
+        let id = c
+            .upsert_track(DEFAULT_LIBRARY, "known.mp3", 10, 100, &m)
+            .unwrap();
         c.set_measured_lufs(id, -11.0).unwrap();
         c.conn
             .execute("UPDATE tracks SET needs_retag=1", [])
@@ -1777,7 +1996,7 @@ mod tests {
             let c = Catalog::open_in_memory().unwrap();
             let id = retag_fixture(&c);
             let got = c
-                .record_scan_failure("known.mp3", 10, 100, &failure(code, "x"))
+                .record_scan_failure(DEFAULT_LIBRARY, "known.mp3", 10, 100, &failure(code, "x"))
                 .unwrap();
             assert_eq!(got, id);
             let row = c.track(id).unwrap();
@@ -1786,14 +2005,18 @@ mod tests {
             assert_eq!(row.measured_lufs, Some(-11.0), "{code:?}");
             assert_eq!(size_mtime(&c, id), (10, 100), "never zeroed: {code:?}");
             assert_eq!(
-                c.file_unchanged("known.mp3", 10, 100).unwrap(),
+                c.file_unchanged(DEFAULT_LIBRARY, "known.mp3", 10, 100)
+                    .unwrap(),
                 !code.is_retried(),
                 "retried unless the file is broken: {code:?}"
             );
             // A later successful read keeps the loudness of the unchanged file.
-            c.upsert_track("known.mp3", 10, 100, &row.meta).unwrap();
+            c.upsert_track(DEFAULT_LIBRARY, "known.mp3", 10, 100, &row.meta)
+                .unwrap();
             assert_eq!(c.track(id).unwrap().measured_lufs, Some(-11.0), "{code:?}");
-            assert!(c.file_unchanged("known.mp3", 10, 100).unwrap());
+            assert!(c
+                .file_unchanged(DEFAULT_LIBRARY, "known.mp3", 10, 100)
+                .unwrap());
         }
     }
 
@@ -1801,25 +2024,41 @@ mod tests {
     fn a_failed_read_of_a_changed_file_keeps_the_old_data_until_it_reads() {
         let c = Catalog::open_in_memory().unwrap();
         let id = retag_fixture(&c);
-        c.record_scan_failure("known.mp3", 20, 200, &failure(FailCode::Timeout, "t"))
-            .unwrap();
+        c.record_scan_failure(
+            DEFAULT_LIBRARY,
+            "known.mp3",
+            20,
+            200,
+            &failure(FailCode::Timeout, "t"),
+        )
+        .unwrap();
         assert_eq!(size_mtime(&c, id), (10, 100));
         assert_eq!(c.track(id).unwrap().meta.artist.as_deref(), Some("Artist"));
-        assert!(!c.file_unchanged("known.mp3", 20, 200).unwrap());
+        assert!(!c
+            .file_unchanged(DEFAULT_LIBRARY, "known.mp3", 20, 200)
+            .unwrap());
         // Read at last: the file changed, so its old loudness goes.
-        c.upsert_track("known.mp3", 20, 200, &meta(None)).unwrap();
+        c.upsert_track(DEFAULT_LIBRARY, "known.mp3", 20, 200, &meta(None))
+            .unwrap();
         assert_eq!(c.track(id).unwrap().measured_lufs, None);
 
         // Changed into a broken file: new size and time, old tags, no loudness.
         let id = retag_fixture(&c);
-        c.record_scan_failure("known.mp3", 30, 300, &failure(FailCode::Tag, "bad"))
-            .unwrap();
+        c.record_scan_failure(
+            DEFAULT_LIBRARY,
+            "known.mp3",
+            30,
+            300,
+            &failure(FailCode::Tag, "bad"),
+        )
+        .unwrap();
         assert_eq!(size_mtime(&c, id), (30, 300));
         let row = c.track(id).unwrap();
         assert_eq!(row.meta.artist.as_deref(), Some("Artist"));
         assert_eq!(row.measured_lufs, None);
         assert!(
-            c.file_unchanged("known.mp3", 30, 300).unwrap(),
+            c.file_unchanged(DEFAULT_LIBRARY, "known.mp3", 30, 300)
+                .unwrap(),
             "waits for a change"
         );
     }
@@ -1828,18 +2067,35 @@ mod tests {
     fn scan_failures_of_new_files_are_stored_and_retried() {
         let c = Catalog::open_in_memory().unwrap();
         let broken = c
-            .record_scan_failure("broken.mp3", 5, 50, &failure(FailCode::Tag, "bad"))
+            .record_scan_failure(
+                DEFAULT_LIBRARY,
+                "broken.mp3",
+                5,
+                50,
+                &failure(FailCode::Tag, "bad"),
+            )
             .unwrap();
         let slow = c
-            .record_scan_failure("slow.mp3", 6, 60, &failure(FailCode::Timeout, "t"))
+            .record_scan_failure(
+                DEFAULT_LIBRARY,
+                "slow.mp3",
+                6,
+                60,
+                &failure(FailCode::Timeout, "t"),
+            )
             .unwrap();
         assert_eq!(size_mtime(&c, broken), (5, 50));
         assert_eq!(size_mtime(&c, slow), (6, 60));
         assert!(
-            c.file_unchanged("broken.mp3", 5, 50).unwrap(),
+            c.file_unchanged(DEFAULT_LIBRARY, "broken.mp3", 5, 50)
+                .unwrap(),
             "until it changes"
         );
-        assert!(!c.file_unchanged("slow.mp3", 6, 60).unwrap(), "retried");
+        assert!(
+            !c.file_unchanged(DEFAULT_LIBRARY, "slow.mp3", 6, 60)
+                .unwrap(),
+            "retried"
+        );
         let listed: Vec<_> = c
             .unreadable()
             .unwrap()
@@ -1855,7 +2111,8 @@ mod tests {
             c.playable_tracks(&[]).unwrap().contains(&broken),
             "still plays"
         );
-        c.upsert_track("broken.mp3", 5, 50, &meta(None)).unwrap();
+        c.upsert_track(DEFAULT_LIBRARY, "broken.mp3", 5, 50, &meta(None))
+            .unwrap();
         assert!(
             c.unreadable().unwrap().is_empty(),
             "read: tag failure cleared"
@@ -1904,11 +2161,12 @@ mod tests {
         let c = Catalog::open_in_memory().unwrap();
         for code in [FailCode::NotFound, FailCode::Io, FailCode::Tag] {
             let a = add(&c, "a.mp3", None);
-            c.record_scan_failure("a.mp3", 10, 100, &failure(code, "x"))
+            c.record_scan_failure(DEFAULT_LIBRARY, "a.mp3", 10, 100, &failure(code, "x"))
                 .unwrap();
-            c.begin_scan().unwrap();
+            c.begin_scan(DEFAULT_LIBRARY).unwrap();
             assert_eq!(c.unreadable().unwrap().len(), 1, "{code:?}");
-            c.upsert_track("a.mp3", 10, 100, &meta(None)).unwrap();
+            c.upsert_track(DEFAULT_LIBRARY, "a.mp3", 10, 100, &meta(None))
+                .unwrap();
             assert!(c.unreadable().unwrap().is_empty(), "{code:?}");
             assert_eq!(c.track(a).unwrap().rel_path, "a.mp3");
         }
@@ -1921,11 +2179,13 @@ mod tests {
         c.record_failure(a, &failure(FailCode::Decode, "bad"), None)
             .unwrap();
         // Scans (which reset the failure count) re-read the tags.
-        c.begin_scan().unwrap();
-        c.upsert_track("a.mp3", 10, 100, &meta(None)).unwrap();
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
+        c.upsert_track(DEFAULT_LIBRARY, "a.mp3", 10, 100, &meta(None))
+            .unwrap();
         assert_eq!(c.unreadable().unwrap().len(), 1);
-        c.begin_scan().unwrap();
-        c.upsert_track("a.mp3", 11, 100, &meta(None)).unwrap();
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
+        c.upsert_track(DEFAULT_LIBRARY, "a.mp3", 11, 100, &meta(None))
+            .unwrap();
         assert!(c.unreadable().unwrap().is_empty(), "the file changed");
     }
 
@@ -1938,7 +2198,7 @@ mod tests {
                 year,
                 ..Default::default()
             };
-            c.upsert_track(path, 1, 1, &m).unwrap()
+            c.upsert_track(DEFAULT_LIBRARY, path, 1, 1, &m).unwrap()
         };
         let r91 = mk("a.mp3", "Rock", Some(1991));
         let r95 = mk("b.mp3", "Rock", Some(1995));
@@ -1991,7 +2251,7 @@ mod tests {
                 year,
                 ..Default::default()
             };
-            c.upsert_track(path, 1, 1, &m).unwrap()
+            c.upsert_track(DEFAULT_LIBRARY, path, 1, 1, &m).unwrap()
         };
         let a = mk("x/a.mp3", Some("Metallica"), Some("One"), Some(1988));
         let b = mk("x/b.mp3", Some("Ritam 100%"), Some("Two_Step"), None);
@@ -2037,7 +2297,7 @@ mod tests {
                 year,
                 ..Default::default()
             };
-            c.upsert_track(path, 1, 1, &m).unwrap()
+            c.upsert_track(DEFAULT_LIBRARY, path, 1, 1, &m).unwrap()
         };
         let a = mk("a.mp3", "Rock; Jazz", Some(1991));
         let b = mk("b.mp3", "Rock", None);
@@ -2181,9 +2441,12 @@ mod tests {
             year,
             ..Default::default()
         };
-        c.upsert_track("1.mp3", 1, 1, &m("X", Some(1994))).unwrap();
-        c.upsert_track("2.mp3", 1, 1, &m("X", Some(1993))).unwrap();
-        c.upsert_track("3.mp3", 1, 1, &m("Y", None)).unwrap();
+        c.upsert_track(DEFAULT_LIBRARY, "1.mp3", 1, 1, &m("X", Some(1994)))
+            .unwrap();
+        c.upsert_track(DEFAULT_LIBRARY, "2.mp3", 1, 1, &m("X", Some(1993)))
+            .unwrap();
+        c.upsert_track(DEFAULT_LIBRARY, "3.mp3", 1, 1, &m("Y", None))
+            .unwrap();
         assert_eq!(
             c.albums("A").unwrap(),
             vec![
@@ -2339,9 +2602,9 @@ mod tests {
         let a = add(&c, "a.mp3", Some("Rock"));
         add(&c, "b.mp3", Some("Rock"));
         c.rebuild_genres().unwrap();
-        c.begin_scan().unwrap();
-        c.mark_seen("b.mp3").unwrap();
-        assert_eq!(c.finish_scan(&[]).unwrap(), 1);
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
+        c.mark_seen(DEFAULT_LIBRARY, "b.mp3").unwrap();
+        assert_eq!(c.finish_scan(DEFAULT_LIBRARY, &[]).unwrap(), 1);
         assert!(c.track(a).is_err());
         c.rebuild_genres().unwrap();
         assert_eq!(count_of(&c, "rock"), Some(1));
@@ -2358,10 +2621,14 @@ mod tests {
         c.set_banned(jazz, true).unwrap();
         c.set_measured_lufs(deep, -9.0).unwrap();
         c.set_last_first("jazz", deep).unwrap();
-        c.begin_scan().unwrap();
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
         assert_eq!(c.absent_count(), 5);
-        c.mark_seen("Rock/e.mp3").unwrap();
-        assert_eq!(c.finish_scan(&["Jazz".to_string()]).unwrap(), 2);
+        c.mark_seen(DEFAULT_LIBRARY, "Rock/e.mp3").unwrap();
+        assert_eq!(
+            c.finish_scan(DEFAULT_LIBRARY, &["Jazz".to_string()])
+                .unwrap(),
+            2
+        );
         assert!(c.track(gone).is_err(), "not seen elsewhere: swept");
         assert!(c.track(jazzy).is_err(), "Jazzy is not under Jazz");
         assert!(c.track(seen).is_ok());
@@ -2376,12 +2643,16 @@ mod tests {
         let c = Catalog::open_in_memory().unwrap();
         add(&c, "a.mp3", None);
         add(&c, "b.mp3", None);
-        c.begin_scan().unwrap();
-        c.mark_seen("a.mp3").unwrap();
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
+        c.mark_seen(DEFAULT_LIBRARY, "a.mp3").unwrap();
         assert_eq!(c.absent_count(), 1);
-        c.abort_scan().unwrap();
+        c.abort_scan(DEFAULT_LIBRARY).unwrap();
         assert_eq!(c.absent_count(), 0);
-        assert_eq!(c.finish_scan(&[]).unwrap(), 0, "nothing to sweep");
+        assert_eq!(
+            c.finish_scan(DEFAULT_LIBRARY, &[]).unwrap(),
+            0,
+            "nothing to sweep"
+        );
     }
 
     #[test]
@@ -2402,9 +2673,14 @@ mod tests {
             track_no: Some(no),
             ..Default::default()
         };
-        let t2 = c.upsert_track("b/2.mp3", 1, 1, &m("A", "X", 2)).unwrap();
-        let t1 = c.upsert_track("b/1.mp3", 1, 1, &m("A", "X", 1)).unwrap();
-        c.upsert_track("b/3.mp3", 1, 1, &m("B", "Y", 1)).unwrap();
+        let t2 = c
+            .upsert_track(DEFAULT_LIBRARY, "b/2.mp3", 1, 1, &m("A", "X", 2))
+            .unwrap();
+        let t1 = c
+            .upsert_track(DEFAULT_LIBRARY, "b/1.mp3", 1, 1, &m("A", "X", 1))
+            .unwrap();
+        c.upsert_track(DEFAULT_LIBRARY, "b/3.mp3", 1, 1, &m("B", "Y", 1))
+            .unwrap();
         c.set_last_first("*", t2).unwrap();
         c.set_last_first("*", t1).unwrap();
         assert_eq!(c.last_first("*").unwrap(), Some(t1));
@@ -2423,7 +2699,13 @@ mod tests {
             let names = crate::genre::known_genre_names();
             for i in 0..50_000 {
                 let m = meta(Some(&names[i % 40]));
-                c.upsert_track(&format!("g{}/t{}.mp3", i % 40, i), 1, 1, &m)?;
+                c.upsert_track(
+                    DEFAULT_LIBRARY,
+                    &format!("g{}/t{}.mp3", i % 40, i),
+                    1,
+                    1,
+                    &m,
+                )?;
             }
             Ok(())
         })
@@ -2453,5 +2735,319 @@ mod tests {
         assert_eq!(c.track_genres(a).unwrap(), vec!["Chillout", "Trance"]);
         assert_eq!(c.track_genres(none).unwrap(), vec!["Unknown"]);
         assert!(c.track_genres(999).unwrap().is_empty());
+    }
+
+    /// The whole schema as catalog version 4 left it (before libraries), frozen here
+    /// so later schema changes do not change the fixture.
+    const SCHEMA_V4: &str = "
+        CREATE TABLE tracks(
+            id INTEGER PRIMARY KEY,
+            rel_path TEXT NOT NULL UNIQUE,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            artist TEXT, album TEXT, title TEXT,
+            track_no INTEGER, duration_ms INTEGER,
+            raw_genre TEXT,
+            rg_track_gain REAL,
+            measured_lufs REAL,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            banned INTEGER NOT NULL DEFAULT 0,
+            present INTEGER NOT NULL DEFAULT 1,
+            year INTEGER,
+            needs_retag INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT, last_error_msg TEXT, last_error_at INTEGER,
+            last_error_server TEXT
+        );
+        CREATE INDEX idx_tracks_artist_album ON tracks(artist, album);
+        CREATE INDEX idx_tracks_year ON tracks(year);
+        CREATE TABLE genres(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, display TEXT NOT NULL);
+        CREATE TABLE track_genres(
+            track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+            genre_id INTEGER NOT NULL REFERENCES genres(id) ON DELETE CASCADE,
+            PRIMARY KEY(track_id, genre_id)
+        );
+        CREATE INDEX idx_track_genres_genre ON track_genres(genre_id);
+        CREATE TABLE genre_rules(from_key TEXT PRIMARY KEY, to_display TEXT NOT NULL);
+        CREATE TABLE selection_state(selection_key TEXT PRIMARY KEY, last_first INTEGER NOT NULL);
+        CREATE TABLE playlist(
+            id INTEGER PRIMARY KEY CHECK (id = 1), selection TEXT NOT NULL,
+            shuffle INTEGER NOT NULL, entries BLOB NOT NULL, format INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE playlist_cursor(
+            id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER, history BLOB NOT NULL,
+            history_pos INTEGER, position_ms INTEGER NOT NULL, resume INTEGER NOT NULL DEFAULT 1
+        );
+    ";
+
+    /// A version-4 catalog file as the owner's is: tagged tracks with years and
+    /// loudness, a ban, failures with reasons, genres, a rule, selections, and a
+    /// saved playlist with a hand-added entry, cursor and history.
+    fn v4_catalog(db: &Path) {
+        let c = Connection::open(db).unwrap();
+        c.execute_batch(SCHEMA_V4).unwrap();
+        c.execute_batch(
+            "INSERT INTO tracks(id, rel_path, size, mtime, artist, title, raw_genre, year,
+                                measured_lufs, fail_count, banned, last_error, last_error_msg,
+                                last_error_at, last_error_server)
+             VALUES (1, 'Rock/a.mp3', 10, 100, 'A', 'Song A', 'Rock', 1991, -9.5, 0, 0,
+                     NULL, NULL, NULL, NULL),
+                    (2, 'Rock/b.mp3', 20, 200, 'B', 'Song B', 'Rock', 1995, NULL, 0, 1,
+                     NULL, NULL, NULL, NULL),
+                    (3, 'Jazz/c.mp3', 30, 300, 'C', 'Song C', 'Jazz', NULL, NULL, 3, 0,
+                     'decode', 'bad frame', 1700000000, 'secondary'),
+                    (4, 'Jazz/d.mp3', 40, 400, 'D', 'Song D', 'Jazz', 2001, -12.0, 1, 0,
+                     'not_found', 'gone', 1700000001, 'primary');
+             INSERT INTO genres VALUES (1, 'rock', 'Rock'), (2, 'jazz', 'Jazz');
+             INSERT INTO track_genres VALUES (1, 1), (2, 1), (3, 2), (4, 2);
+             INSERT INTO genre_rules VALUES ('bebop', 'Jazz');
+             INSERT INTO selection_state VALUES ('rock', 1), ('*', 4);
+             INSERT INTO playlist VALUES (1, '{\"genres\":[\"rock\"]}', 1,
+                 X'01000000000000000400000000000000FDFFFFFFFFFFFFFF', 1);
+             INSERT INTO playlist_cursor VALUES (1, 1, X'01000000000000000400000000000000',
+                 1, 61500, 1);
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    }
+
+    fn library_of(c: &Catalog, id: TrackId) -> LibraryId {
+        c.track(id).unwrap().library_id
+    }
+
+    #[test]
+    fn v4_catalog_moves_to_library_1_keeping_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        v4_catalog(&db);
+        let c = Catalog::open(&db).unwrap();
+        assert_eq!(user_version(&c), CATALOG_VERSION);
+        for id in 1..=4 {
+            assert_eq!(library_of(&c, id), DEFAULT_LIBRARY, "track {id}");
+        }
+        // Bans, loudness, years, failures.
+        assert_eq!(c.banned().unwrap()[0].id, 2);
+        assert_eq!(c.track(1).unwrap().measured_lufs, Some(-9.5));
+        assert_eq!(c.track(4).unwrap().meta.year, Some(2001));
+        assert_eq!(
+            c.playable_tracks(&[]).unwrap(),
+            vec![1, 4],
+            "3 failures excluded"
+        );
+        let u = c.unreadable().unwrap();
+        let u3 = u.iter().find(|t| t.id == 3).unwrap();
+        assert_eq!(
+            (u3.code.as_deref(), u3.fail_count, u3.server),
+            (Some("decode"), 3, Some(Which::Secondary))
+        );
+        assert_eq!(u3.library_id, DEFAULT_LIBRARY);
+        let u4 = u.iter().find(|t| t.id == 4).unwrap();
+        assert_eq!(
+            (u4.message.as_deref(), u4.at),
+            (Some("gone"), Some(1_700_000_001))
+        );
+        // Genres (links kept, not rebuilt), rules, selections.
+        assert_eq!(c.track_genres(3).unwrap(), vec!["Jazz"]);
+        assert_eq!(
+            count_of(&c, "rock"),
+            Some(1),
+            "the banned one is not counted"
+        );
+        assert_eq!(c.last_first("rock").unwrap(), Some(1));
+        assert_eq!(c.last_first("*").unwrap(), Some(4));
+        let rules: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM genre_rules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rules, 1);
+        // The saved playlist, cursor and history.
+        let saved = c.load_playlist().unwrap().unwrap();
+        assert_eq!(saved.selection, r#"{"genres":["rock"]}"#);
+        assert_eq!(
+            saved.order,
+            [Entry::new(1), Entry::new(4), Entry::manual(3)]
+        );
+        assert_eq!(saved.cursor.history, [1, 4]);
+        assert_eq!(
+            (
+                saved.cursor.cursor,
+                saved.cursor.position_ms,
+                saved.cursor.resume
+            ),
+            (Some(1), 61_500, true)
+        );
+        // Unchanged files stay unchanged: no re-read of the whole library.
+        assert!(c
+            .file_unchanged(DEFAULT_LIBRARY, "Rock/a.mp3", 10, 100)
+            .unwrap());
+        // The same path can now be in another library.
+        let other = c
+            .upsert_track(2, "Rock/a.mp3", 1, 1, &meta(Some("Pop")))
+            .unwrap();
+        assert_ne!(other, 1);
+        assert_eq!(c.track(1).unwrap().meta.title.as_deref(), Some("Song A"));
+        // Indexes are back.
+        let indexes: Vec<String> = c
+            .conn
+            .prepare("SELECT name FROM pragma_index_list('tracks') ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for want in [
+            "idx_tracks_artist_album",
+            "idx_tracks_library_path",
+            "idx_tracks_year",
+        ] {
+            assert!(indexes.iter().any(|i| i == want), "{want} in {indexes:?}");
+        }
+        drop(c);
+        // Opening again changes nothing.
+        let c = Catalog::open(&db).unwrap();
+        assert_eq!(c.track(4).unwrap().meta.year, Some(2001));
+        assert_eq!(library_of(&c, other), 2);
+    }
+
+    #[test]
+    fn a_failed_library_migration_leaves_a_working_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        v4_catalog(&db);
+        {
+            // The rebuild copies the tracks: make that fail.
+            let c = Connection::open(&db).unwrap();
+            c.execute_batch("CREATE TABLE tracks_v5(x);").unwrap();
+        }
+        let c = Catalog::open(&db).unwrap();
+        assert_eq!(user_version(&c), 4, "retried next start");
+        assert_eq!(library_of(&c, 1), DEFAULT_LIBRARY, "the column is there");
+        assert_eq!(c.track_genres(1).unwrap(), vec!["Rock"], "rolled back");
+        c.upsert_track(DEFAULT_LIBRARY, "new.mp3", 1, 1, &meta(None))
+            .unwrap();
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
+        c.mark_seen(DEFAULT_LIBRARY, "new.mp3").unwrap();
+        c.abort_scan(DEFAULT_LIBRARY).unwrap();
+        assert_eq!(c.banned().unwrap().len(), 1);
+        assert!(c.load_playlist().unwrap().is_some());
+    }
+
+    #[test]
+    fn the_same_path_in_two_libraries_is_two_tracks() {
+        let c = Catalog::open_in_memory().unwrap();
+        let a = c
+            .upsert_track(1, "Rock/x.mp3", 1, 1, &meta(Some("Rock")))
+            .unwrap();
+        let b = c
+            .upsert_track(2, "Rock/x.mp3", 2, 2, &meta(Some("Jazz")))
+            .unwrap();
+        assert_ne!(a, b);
+        assert!(c.file_unchanged(1, "Rock/x.mp3", 1, 1).unwrap());
+        assert!(!c.file_unchanged(2, "Rock/x.mp3", 1, 1).unwrap());
+        assert!(c.file_unchanged(2, "Rock/x.mp3", 2, 2).unwrap());
+        c.rebuild_genres().unwrap();
+        assert_eq!(c.track_genres(a).unwrap(), vec!["Rock"]);
+        assert_eq!(c.track_genres(b).unwrap(), vec!["Jazz"]);
+        assert_eq!((library_of(&c, a), library_of(&c, b)), (1, 2));
+        // A scan failure lands on the right one.
+        c.record_scan_failure(2, "Rock/x.mp3", 2, 2, &failure(FailCode::Tag, "bad"))
+            .unwrap();
+        let u = c.unreadable().unwrap();
+        assert_eq!((u.len(), u[0].id, u[0].library_id), (1, b, 2));
+    }
+
+    #[test]
+    fn a_scan_of_one_library_never_sweeps_another() {
+        let c = Catalog::open_in_memory().unwrap();
+        let a = c.upsert_track(1, "a.mp3", 1, 1, &meta(None)).unwrap();
+        let b = c.upsert_track(2, "b.mp3", 1, 1, &meta(None)).unwrap();
+        let gone = c.upsert_track(2, "gone.mp3", 1, 1, &meta(None)).unwrap();
+        c.record_failure(a, &failure(FailCode::Decode, "x"), None)
+            .unwrap();
+        c.begin_scan(2).unwrap();
+        c.mark_seen(2, "b.mp3").unwrap();
+        // The same path in library 1 is not marked by library 2's scan.
+        c.mark_seen(2, "a.mp3").unwrap();
+        assert_eq!(c.finish_scan(2, &[]).unwrap(), 1);
+        assert!(c.track(gone).is_err());
+        assert!(c.track(a).is_ok() && c.track(b).is_ok());
+        assert_eq!(
+            c.unreadable().unwrap()[0].fail_count,
+            1,
+            "library 1's failures are not reset by library 2's scan"
+        );
+        // The whole of library 2 unseen (a skipped root): nothing swept.
+        c.begin_scan(2).unwrap();
+        assert_eq!(c.finish_scan(2, &[String::new()]).unwrap(), 0);
+        assert!(c.track(b).is_ok());
+        c.begin_scan(1).unwrap();
+        c.abort_scan(1).unwrap();
+        assert_eq!(c.absent_count(), 0);
+    }
+
+    #[test]
+    fn a_disabled_library_is_hidden_but_kept() {
+        let c = Catalog::open_in_memory().unwrap();
+        let m = |artist: &str, genre: &str| TrackMeta {
+            artist: Some(artist.into()),
+            album: Some("Album".into()),
+            raw_genre: Some(genre.into()),
+            year: Some(1990),
+            ..Default::default()
+        };
+        let a = c.upsert_track(1, "a.mp3", 1, 1, &m("A", "Rock")).unwrap();
+        let b = c.upsert_track(2, "b.mp3", 1, 1, &m("B", "Jazz")).unwrap();
+        let b2 = c.upsert_track(2, "b2.mp3", 1, 1, &m("B", "Rock")).unwrap();
+        c.record_failure(b, &failure(FailCode::Decode, "x"), None)
+            .unwrap();
+        c.set_banned(b2, true).unwrap();
+        c.rebuild_genres().unwrap();
+        assert_eq!(c.library_track_counts().unwrap()[&2], 2);
+
+        c.set_disabled_libraries(&[2]).unwrap();
+        assert_eq!(c.disabled_libraries().unwrap(), [2].into());
+        assert_eq!(c.playable_tracks(&[]).unwrap(), vec![a]);
+        let keys: Vec<String> = c.genres().unwrap().into_iter().map(|g| g.key).collect();
+        assert_eq!(keys, ["rock"]);
+        assert_eq!(count_of(&c, "rock"), Some(1));
+        assert_eq!(c.artists().unwrap(), ["A"]);
+        assert!(c.albums("B").unwrap().is_empty());
+        assert!(c.album_tracks("B", "Album").unwrap().is_empty());
+        assert_eq!(c.years(&[]).unwrap()[0].count, 1);
+        assert!(c.unreadable().unwrap().is_empty());
+        assert_eq!(c.unreadable_count().unwrap(), 0);
+        assert!(c.banned().unwrap().is_empty());
+        assert!(c.track(b).is_ok(), "kept in the catalog");
+        assert_eq!(c.library_track_counts().unwrap()[&2], 2);
+
+        c.set_disabled_libraries(&[]).unwrap();
+        assert_eq!(c.playable_tracks(&[]).unwrap().len(), 2);
+        assert_eq!(c.unreadable_count().unwrap(), 1);
+        assert_eq!(c.banned().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn removing_a_library_deletes_only_its_tracks() {
+        let c = Catalog::open_in_memory().unwrap();
+        let a = c
+            .upsert_track(1, "x.mp3", 1, 1, &meta(Some("Rock")))
+            .unwrap();
+        let b = c
+            .upsert_track(2, "x.mp3", 1, 1, &meta(Some("Jazz")))
+            .unwrap();
+        c.upsert_track(2, "y.mp3", 1, 1, &meta(Some("Jazz")))
+            .unwrap();
+        c.rebuild_genres().unwrap();
+        c.set_last_first("jazz", b).unwrap();
+        c.set_last_first("rock", a).unwrap();
+        c.set_disabled_libraries(&[2]).unwrap();
+        assert_eq!(c.remove_library(2).unwrap(), 2);
+        assert!(c.track(b).is_err());
+        assert!(c.track(a).is_ok());
+        assert_eq!(c.last_first("jazz").unwrap(), None);
+        assert_eq!(c.last_first("rock").unwrap(), Some(a));
+        let keys: Vec<String> = c.genres().unwrap().into_iter().map(|g| g.key).collect();
+        assert_eq!(keys, ["rock"], "its genres are gone");
+        assert!(c.disabled_libraries().unwrap().is_empty());
+        assert_eq!(c.remove_library(2).unwrap(), 0);
     }
 }

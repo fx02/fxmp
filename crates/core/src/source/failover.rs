@@ -54,7 +54,8 @@ impl FailoverSource {
 
 impl MusicSource for FailoverSource {
     /// Walks the primary; entries are buffered so a mid-walk failure never
-    /// delivers a partial listing before the secondary's full one.
+    /// delivers a partial listing before the secondary's full one. A listing by the
+    /// secondary is reported as [`WalkReport::from_backup`].
     /// On failure the primary's error is returned if the secondary fails too.
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
         let mut buf = Vec::new();
@@ -75,7 +76,10 @@ impl MusicSource for FailoverSource {
         };
         self.mark(Which::Secondary);
         buf.into_iter().for_each(on_entry);
-        Ok(report)
+        Ok(WalkReport {
+            from_backup: true,
+            ..report
+        })
     }
 
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
@@ -163,6 +167,7 @@ mod tests {
                 Some(e) => Err(e),
                 None => Ok(WalkReport {
                     skipped_dirs: self.skipped.clone(),
+                    from_backup: false,
                 }),
             }
         }
@@ -274,6 +279,20 @@ mod tests {
         );
         let report = f.walk(&mut |_| {}).unwrap();
         assert_eq!(report.skipped_dirs, ["Rock"], "the secondary's");
+    }
+
+    #[test]
+    fn a_walk_served_by_the_secondary_says_so() {
+        let f = failover(
+            FakeSource::new("p").entry("a.mp3"),
+            Some(FakeSource::new("s")),
+        );
+        assert!(!f.walk(&mut |_| {}).unwrap().from_backup);
+        let f = failover(
+            FakeSource::new("p").walk_err(SourceError::Timeout),
+            Some(FakeSource::new("s").entry("x.mp3")),
+        );
+        assert!(f.walk(&mut |_| {}).unwrap().from_backup);
     }
 
     #[test]

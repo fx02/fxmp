@@ -41,6 +41,8 @@ const RESUME_FADE_SECS: f32 = 0.5;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayItem {
     pub id: TrackId,
+    /// The library the track is in: it is opened with [`MusicSource::open_in`].
+    pub library: crate::LibraryId,
     pub rel_path: String,
     /// Normalisation gain, applied when normalisation is on.
     pub gain_db: f32,

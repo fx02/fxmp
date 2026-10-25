@@ -673,7 +673,10 @@ impl MusicSource for SmbSource {
             on_entry(e);
             true
         })?;
-        Ok(WalkReport { skipped_dirs })
+        Ok(WalkReport {
+            skipped_dirs,
+            from_backup: false,
+        })
     }
 
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {

@@ -379,6 +379,76 @@ mod tests {
         );
     }
 
+    /// Instant reads (a local file) counted, including those at the end.
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for CountingReader {
+        fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(p)
+        }
+    }
+
+    #[test]
+    fn instant_reads_fill_the_window_then_rest() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let src = CountingReader {
+            inner: Cursor::new(data()),
+            calls: calls.clone(),
+        };
+        let cfg = PrefetchConfig {
+            chunk: 64 * 1024,
+            ahead: 256 * 1024,
+            ..PrefetchConfig::default()
+        };
+        let mut r = PrefetchReader::new(Box::new(src), SIZE as u64, cfg);
+        std::thread::sleep(Duration::from_millis(100));
+        let filled = calls.load(Ordering::SeqCst);
+        assert!(filled <= 5, "only the window is fetched: {filled} reads");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            filled,
+            "no busy loop while full"
+        );
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert!(out == data());
+    }
+
+    #[test]
+    fn a_file_shorter_than_its_size_ends_without_spinning() {
+        // A local file cut short after it was opened: reads hit its end early.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let src = CountingReader {
+            inner: Cursor::new(vec![7u8; 1000]),
+            calls: calls.clone(),
+        };
+        let started = Instant::now();
+        let mut r = PrefetchReader::new(Box::new(src), 1_000_000, PrefetchConfig::default());
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out.len(), 1000);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no read timeout"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let n = calls.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(calls.load(Ordering::SeqCst), n, "stopped at the end");
+        assert!(n <= 3, "{n} reads");
+    }
+
     #[test]
     fn read_times_out_when_inner_stalls() {
         let (s, _) = SlowReader::new(data(), Duration::ZERO, Mode::Stall);

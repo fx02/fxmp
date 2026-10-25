@@ -663,7 +663,8 @@ mod tests {
             year,
             ..Default::default()
         };
-        c.upsert_track(path, 1, 1, &meta).unwrap()
+        c.upsert_track(smp_core::DEFAULT_LIBRARY, path, 1, 1, &meta)
+            .unwrap()
     }
 
     impl Fx {

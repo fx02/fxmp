@@ -22,6 +22,7 @@ fn tests_dir() -> PathBuf {
 fn tone(id: TrackId, freq: u32) -> PlayItem {
     PlayItem {
         id,
+        library: crate::DEFAULT_LIBRARY,
         rel_path: format!("fixtures-audio/tone{freq}.flac"),
         gain_db: 0.0,
         start_ms: 0,
@@ -326,6 +327,7 @@ fn broken_track_is_skipped_and_reported() {
     let mut h = Harness::new(Opts::default());
     let broken = PlayItem {
         id: 1,
+        library: crate::DEFAULT_LIBRARY,
         rel_path: "fixtures/broken.mp3".into(),
         gain_db: 0.0,
         start_ms: 0,
@@ -345,11 +347,67 @@ fn broken_track_is_skipped_and_reported() {
     assert!(amplitude(&out[RATE as usize..2 * RATE as usize], 500) > AMP * 0.8);
 }
 
+/// Two libraries: library 2 is the tests folder, any other one has nothing.
+struct TwoLibraries {
+    lib2: LocalSource,
+    opened: Mutex<Vec<(crate::LibraryId, String)>>,
+}
+
+impl MusicSource for TwoLibraries {
+    fn walk(&self, _: &mut dyn FnMut(FileEntry)) -> std::result::Result<WalkReport, SourceError> {
+        Ok(WalkReport::default())
+    }
+    fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+        Err(SourceError::NotFound)
+    }
+    fn open_in(
+        &self,
+        library: crate::LibraryId,
+        rel_path: &str,
+    ) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+        self.opened
+            .lock()
+            .unwrap()
+            .push((library, rel_path.to_string()));
+        match library {
+            2 => self.lib2.open(rel_path),
+            _ => Err(SourceError::NotFound),
+        }
+    }
+    fn describe(&self) -> String {
+        "two libraries".into()
+    }
+}
+
+#[test]
+fn a_track_opens_in_its_own_library() {
+    let src = Arc::new(TwoLibraries {
+        lib2: LocalSource::new(tests_dir()),
+        opened: Mutex::new(Vec::new()),
+    });
+    let mut h = Harness::new(Opts {
+        source: Some(src.clone()),
+        ..Default::default()
+    });
+    let in_lib2 = PlayItem {
+        library: 2,
+        ..tone(1, 500)
+    };
+    h.play(vec![tone(2, 500), in_lib2]);
+    h.wait("start of 1", 10, |e| *e == Event::TrackStarted { id: 1 });
+    assert_eq!(h.calls().first(), Some(&Call::Failed(2, "not_found")));
+    let opened = src.opened.lock().unwrap().clone();
+    assert_eq!(opened[0].0, crate::DEFAULT_LIBRARY);
+    assert!(opened.iter().any(|(lib, _)| *lib == 2));
+    h.player.send(Command::Stop);
+}
+
 #[test]
 fn missing_track_is_reported_as_not_found() {
     let mut h = Harness::new(Opts::default());
     let missing = PlayItem {
         id: 1,
+        library: crate::DEFAULT_LIBRARY,
         rel_path: "fixtures/no-such-file.mp3".into(),
         gain_db: 0.0,
         start_ms: 0,
@@ -364,6 +422,7 @@ fn twenty_failures_in_a_row_go_idle_until_next() {
     let mut h = Harness::new(Opts::default());
     let broken = |id| PlayItem {
         id,
+        library: crate::DEFAULT_LIBRARY,
         rel_path: "fixtures/broken.mp3".into(),
         gain_db: 0.0,
         start_ms: 0,
@@ -444,6 +503,7 @@ fn stalled_source_skips_track() {
     h.play(vec![
         PlayItem {
             id: 1,
+            library: crate::DEFAULT_LIBRARY,
             rel_path: "stall.flac".into(),
             gain_db: 0.0,
             start_ms: 0,
@@ -749,6 +809,7 @@ fn a_rejected_login_mid_track_is_reported_as_unreachable() {
     h.play(vec![
         PlayItem {
             id: 1,
+            library: crate::DEFAULT_LIBRARY,
             rel_path: "authfail-50-500.flac".into(),
             gain_db: 0.0,
             start_ms: 0,
@@ -777,6 +838,7 @@ fn next_on_stalled_track_is_immediate() {
     });
     let stalling = PlayItem {
         id: 1,
+        library: crate::DEFAULT_LIBRARY,
         rel_path: "stall-20-500.flac".into(),
         gain_db: 0.0,
         start_ms: 0,
@@ -797,6 +859,7 @@ fn play_during_crossfade_reports_to_old_provider() {
     // A 1 s first track is crossfaded into the second over its whole length.
     let short = PlayItem {
         id: 1,
+        library: crate::DEFAULT_LIBRARY,
         rel_path: "fixtures-audio/mono.flac".into(),
         gain_db: 0.0,
         start_ms: 0,
@@ -957,6 +1020,7 @@ fn engine_does_not_spin_when_both_decks_starve() {
     // well under the 0.7 s Next crossfade.
     let item = |id, path: &str| PlayItem {
         id,
+        library: crate::DEFAULT_LIBRARY,
         rel_path: path.into(),
         gain_db: 0.0,
         start_ms: 0,
@@ -1261,6 +1325,7 @@ fn play_after_too_many_failures_tries_again() {
         let mut h = Harness::new(Opts::default());
         let broken = |id| PlayItem {
             id,
+            library: crate::DEFAULT_LIBRARY,
             rel_path: "fixtures/broken.mp3".into(),
             gain_db: 0.0,
             start_ms: 0,

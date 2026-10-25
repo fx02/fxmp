@@ -9,7 +9,7 @@ use crate::catalog::{Catalog, TrackMeta};
 use crate::failure::{FailCode, Failure};
 use crate::source::{FileEntry, MusicSource};
 use crate::tags::read_meta;
-use crate::{Error, Result, SetOnDrop};
+use crate::{Error, LibraryId, Result, SetOnDrop};
 
 /// Files committed per catalog transaction.
 const CHUNK: usize = 500;
@@ -35,6 +35,9 @@ pub struct ScanReport {
     pub unchanged: usize,
     pub failed: usize,
     pub removed: usize,
+    /// Listed by the backup server (the primary was down): nothing was removed,
+    /// since the backup may lag behind; removals wait for a scan from the primary.
+    pub from_backup: bool,
 }
 
 /// Throttles progress callbacks to one per `PROGRESS_INTERVAL`.
@@ -78,22 +81,32 @@ impl Default for ScanOptions {
 
 /// [`scan_with`] using [`ScanOptions::default`].
 pub fn scan(
+    library: LibraryId,
     source: &dyn MusicSource,
     catalog: &mut Catalog,
     progress: &mut dyn FnMut(&ScanProgress),
     cancel: &AtomicBool,
 ) -> Result<ScanReport> {
-    scan_with(source, catalog, progress, cancel, &ScanOptions::default())
+    scan_with(
+        library,
+        source,
+        catalog,
+        progress,
+        cancel,
+        &ScanOptions::default(),
+    )
 }
 
-/// Syncs `catalog` with `source`: unchanged files are only marked seen, new or
-/// modified ones (and those marked for a new tag read) are tagged and upserted,
-/// vanished ones are removed. A file whose tags cannot be read counts as failed and
+/// Syncs `library`'s tracks in `catalog` with `source` (other libraries are not
+/// touched): unchanged files are only marked seen, new or modified ones (and those
+/// marked for a new tag read) are tagged and upserted, vanished ones are removed,
+/// unless a backup server did the listing ([`ScanReport::from_backup`]). A file whose tags cannot be read counts as failed and
 /// is read again by the next scan; a known track keeps everything it had, a new
 /// one is stored with empty metadata (see [`Catalog::record_scan_failure`]).
 /// Tagging runs on `opts.workers` threads; only the calling thread writes to the catalog.
 /// On cancel the walk stops and nothing is removed (`finish_scan` is skipped).
 pub fn scan_with(
+    library: LibraryId,
     source: &dyn MusicSource,
     catalog: &mut Catalog,
     progress: &mut dyn FnMut(&ScanProgress),
@@ -114,20 +127,26 @@ pub fn scan_with(
             walk.skipped_dirs
         );
     }
+    if walk.from_backup {
+        log::warn!("scan: listed by the backup server; nothing is removed this time");
+    }
     let report = ScanReport {
         total: entries.len(),
         skipped_dirs: walk.skipped_dirs,
+        from_backup: walk.from_backup,
         ..Default::default()
     };
     if cancel.load(Ordering::Relaxed) {
         progress(&ScanProgress::default());
         return Ok(report);
     }
-    catalog.begin_scan()?;
-    let result = sync_catalog(source, catalog, &entries, report, progress, cancel, opts);
+    catalog.begin_scan(library)?;
+    let result = sync_catalog(
+        library, source, catalog, &entries, report, progress, cancel, opts,
+    );
     // Stopped early: nothing may stay marked unseen.
     if result.is_err() || cancel.load(Ordering::Relaxed) {
-        if let Err(e) = catalog.abort_scan() {
+        if let Err(e) = catalog.abort_scan(library) {
             log::warn!("scan: cannot restore the tracks after stopping: {e}");
         }
     }
@@ -136,7 +155,9 @@ pub fn scan_with(
 
 /// The part of [`scan_with`] after the walk: marks, tags and upserts `entries`,
 /// then sweeps what was not seen (unless cancelled).
+#[allow(clippy::too_many_arguments)]
 fn sync_catalog(
+    library: LibraryId,
     source: &dyn MusicSource,
     catalog: &mut Catalog,
     entries: &[FileEntry],
@@ -162,8 +183,8 @@ fn sync_catalog(
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                if c.file_unchanged(&e.rel_path, e.size, e.mtime)? {
-                    c.mark_seen(&e.rel_path)?;
+                if c.file_unchanged(library, &e.rel_path, e.size, e.mtime)? {
+                    c.mark_seen(library, &e.rel_path)?;
                     report.unchanged += 1;
                     rep.state.seen += 1;
                     rep.state.current.clone_from(&e.rel_path);
@@ -180,24 +201,38 @@ fn sync_catalog(
     }
 
     if !cancel.load(Ordering::Relaxed) {
-        read_parallel(source, catalog, &to_read, opts, cancel, |e, failed| {
-            report.read += 1;
-            rep.state.read += 1;
-            if failed {
-                report.failed += 1;
-                rep.state.failed += 1;
-            }
-            rep.state.seen += 1;
-            rep.state.current.clone_from(&e.rel_path);
-            rep.tick();
-        })?;
+        read_parallel(
+            library,
+            source,
+            catalog,
+            &to_read,
+            opts,
+            cancel,
+            |e, failed| {
+                report.read += 1;
+                rep.state.read += 1;
+                if failed {
+                    report.failed += 1;
+                    rep.state.failed += 1;
+                }
+                rep.state.seen += 1;
+                rep.state.current.clone_from(&e.rel_path);
+                rep.tick();
+            },
+        )?;
     }
 
     if cancel.load(Ordering::Relaxed) {
         (rep.cb)(&rep.state);
         return Ok(report);
     }
-    report.removed = catalog.finish_scan(&report.skipped_dirs)?;
+    // A backup's listing removes nothing: the whole library counts as unseen-but-kept.
+    let keep_under = if report.from_backup {
+        vec![String::new()]
+    } else {
+        report.skipped_dirs.clone()
+    };
+    report.removed = catalog.finish_scan(library, &keep_under)?;
     catalog.rebuild_genres()?;
     (rep.cb)(&rep.state);
     Ok(report)
@@ -231,6 +266,7 @@ fn read_one(source: &dyn MusicSource, index: usize, e: &FileEntry) -> ReadResult
 /// comes first, and on cancel. `on_written(entry, failed)` runs after
 /// each upsert. Stops early (keeping what was written) when `cancel` is set.
 fn read_parallel(
+    library: LibraryId,
     source: &dyn MusicSource,
     catalog: &mut Catalog,
     files: &[&FileEntry],
@@ -286,8 +322,10 @@ fn read_parallel(
                     let e = files[r.index];
                     let failed = r.meta.is_err();
                     match &r.meta {
-                        Ok(meta) => c.upsert_track(&e.rel_path, e.size, e.mtime, meta)?,
-                        Err(f) => c.record_scan_failure(&e.rel_path, e.size, e.mtime, f)?,
+                        Ok(meta) => c.upsert_track(library, &e.rel_path, e.size, e.mtime, meta)?,
+                        Err(f) => {
+                            c.record_scan_failure(library, &e.rel_path, e.size, e.mtime, f)?
+                        }
                     };
                     on_written(e, failed);
                 }
@@ -317,6 +355,7 @@ fn read_parallel(
 mod tests {
     use super::*;
     use crate::source::{LocalSource, ReadSeek, SourceError, WalkReport};
+    use crate::DEFAULT_LIBRARY;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicI64;
@@ -337,7 +376,7 @@ mod tests {
 
     fn run(dir: &Path, cat: &mut Catalog, cancel: &AtomicBool) -> ScanReport {
         let src = LocalSource::new(dir);
-        scan(&src, cat, &mut |_| {}, cancel).unwrap()
+        scan(DEFAULT_LIBRARY, &src, cat, &mut |_| {}, cancel).unwrap()
     }
 
     #[test]
@@ -537,19 +576,20 @@ mod tests {
         );
         let mut cat = Catalog::open_in_memory().unwrap();
         let no = AtomicBool::new(false);
-        let first = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
+        let first = scan(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((first.read, first.failed), (8, 8));
         // Network trouble (and a file that went missing) is retried by the next
         // scan; a broken new file waits until it changes. Size and time are the
         // real ones either way.
         for (name, _) in retried.iter().chain(&kept[1..]) {
             assert!(
-                !cat.file_unchanged(name, 1000, 1_700_000_000).unwrap(),
+                !cat.file_unchanged(DEFAULT_LIBRARY, name, 1000, 1_700_000_000)
+                    .unwrap(),
                 "{name}"
             );
         }
         assert!(cat
-            .file_unchanged("garbage.mp3", 1000, 1_700_000_000)
+            .file_unchanged(DEFAULT_LIBRARY, "garbage.mp3", 1000, 1_700_000_000)
             .unwrap());
         let codes: std::collections::BTreeMap<String, String> = cat
             .unreadable()
@@ -569,7 +609,7 @@ mod tests {
                 .map(|(p, c)| (p.to_string(), c.to_string()))
                 .collect()
         );
-        let second = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
+        let second = scan(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((second.read, second.unchanged), (7, 1));
     }
 
@@ -620,7 +660,7 @@ mod tests {
         let db = tmp.path().join("catalog.db");
         let mut cat = Catalog::open(&db).unwrap();
         let no = AtomicBool::new(false);
-        scan(&good, &mut cat, &mut |_| {}, &no).unwrap();
+        scan(DEFAULT_LIBRARY, &good, &mut cat, &mut |_| {}, &no).unwrap();
         let ids = cat.playable_tracks(&[]).unwrap();
         for &id in &ids {
             cat.set_measured_lufs(id, -10.0).unwrap();
@@ -633,7 +673,7 @@ mod tests {
             .execute("UPDATE tracks SET needs_retag=1", [])
             .unwrap();
 
-        let r = scan(&failing, &mut cat, &mut |_| {}, &no).unwrap();
+        let r = scan(DEFAULT_LIBRARY, &failing, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((r.read, r.failed, r.removed), (6, 6, 0));
         for t in &before {
             assert_eq!(&cat.track(t.id).unwrap(), t, "kept: {}", t.rel_path);
@@ -641,7 +681,8 @@ mod tests {
             // A broken file (unreadable tags) waits until it changes.
             let retried = t.rel_path != "garbage.mp3";
             assert_eq!(
-                cat.file_unchanged(&e.rel_path, e.size, e.mtime).unwrap(),
+                cat.file_unchanged(DEFAULT_LIBRARY, &e.rel_path, e.size, e.mtime)
+                    .unwrap(),
                 !retried,
                 "{}",
                 t.rel_path
@@ -669,7 +710,7 @@ mod tests {
 
         // The share works again: the retried files are read once, loudness kept,
         // and only the broken one is still listed.
-        let r = scan(&good, &mut cat, &mut |_| {}, &no).unwrap();
+        let r = scan(DEFAULT_LIBRARY, &good, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((r.read, r.failed, r.unchanged), (5, 0, 1));
         for t in &before {
             assert_eq!(cat.track(t.id).unwrap().measured_lufs, Some(-10.0));
@@ -681,7 +722,7 @@ mod tests {
             .map(|t| t.rel_path)
             .collect();
         assert_eq!(listed, ["garbage.mp3"]);
-        let r = scan(&good, &mut cat, &mut |_| {}, &no).unwrap();
+        let r = scan(DEFAULT_LIBRARY, &good, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!((r.read, r.unchanged), (0, 6));
     }
 
@@ -727,7 +768,15 @@ mod tests {
             workers,
             ..Default::default()
         };
-        scan_with(src, cat, &mut |_| {}, &AtomicBool::new(false), &opts).unwrap()
+        scan_with(
+            DEFAULT_LIBRARY,
+            src,
+            cat,
+            &mut |_| {},
+            &AtomicBool::new(false),
+            &opts,
+        )
+        .unwrap()
     }
 
     /// Track rows keyed by path, without the insertion-order-dependent id.
@@ -765,12 +814,14 @@ mod tests {
         src.walk(&mut |e| entries.push(e)).unwrap();
         for e in &entries {
             assert!(
-                a.file_unchanged(&e.rel_path, e.size, e.mtime).unwrap(),
+                a.file_unchanged(DEFAULT_LIBRARY, &e.rel_path, e.size, e.mtime)
+                    .unwrap(),
                 "{}",
                 e.rel_path
             );
             assert!(
-                b.file_unchanged(&e.rel_path, e.size, e.mtime).unwrap(),
+                b.file_unchanged(DEFAULT_LIBRARY, &e.rel_path, e.size, e.mtime)
+                    .unwrap(),
                 "{}",
                 e.rel_path
             );
@@ -866,7 +917,7 @@ mod tests {
             assert_eq!((r.read, r.failed), (2, 2));
             // Real size/mtime kept: not retried until the file changes.
             assert!(cat
-                .file_unchanged("panics.mp3", 1000, 1_700_000_000)
+                .file_unchanged(DEFAULT_LIBRARY, "panics.mp3", 1000, 1_700_000_000)
                 .unwrap());
             assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 2);
             let codes: Vec<_> = cat
@@ -932,7 +983,7 @@ mod tests {
             rebuild_every,
             rebuild_interval: Duration::from_secs(3600),
         };
-        let r = scan_with(&src, &mut cat, &mut |_| {}, &cancel, &opts).unwrap();
+        let r = scan_with(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &cancel, &opts).unwrap();
         assert!(r.read >= 500 && r.read < 1200, "{r:?}");
         assert_eq!(r.removed, 0);
         cat.genres().unwrap()
@@ -1008,7 +1059,7 @@ mod tests {
             rebuild_interval,
         };
         let no = AtomicBool::new(false);
-        let r = scan_with(&src, &mut cat, &mut |_| {}, &no, &opts).unwrap();
+        let r = scan_with(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no, &opts).unwrap();
         assert_eq!(r.read, 100);
         let seen = src.genres_seen.lock().unwrap().expect("probe ran");
         seen
@@ -1041,7 +1092,7 @@ mod tests {
         let src = SlowSource::new(40, Duration::from_millis(60));
         let mut cat = Catalog::open_in_memory().unwrap();
         let no = AtomicBool::new(false);
-        let full = scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
+        let full = scan(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no).unwrap();
         assert_eq!(full.read, 40);
 
         // Rescan where every listed file changed and ten files vanished; cancel
@@ -1050,6 +1101,7 @@ mod tests {
         src.visible.store(30, Ordering::SeqCst);
         let cancel = AtomicBool::new(false);
         let r = scan(
+            DEFAULT_LIBRARY,
             &src,
             &mut cat,
             &mut |p| {
@@ -1119,7 +1171,7 @@ mod tests {
         let no = AtomicBool::new(false);
         run(dir.path(), &mut cat, &no);
         let src = LocalSource::new(dir.path().join("no-such-root"));
-        assert!(scan(&src, &mut cat, &mut |_| {}, &no).is_err());
+        assert!(scan(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no).is_err());
         assert_eq!(cat.absent_count(), 0);
         assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 4);
     }
@@ -1130,10 +1182,11 @@ mod tests {
         let src = SlowSource::new(40, Duration::from_millis(30));
         let mut cat = Catalog::open_in_memory().unwrap();
         let no = AtomicBool::new(false);
-        scan(&src, &mut cat, &mut |_| {}, &no).unwrap();
+        scan(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no).unwrap();
         src.mtime.store(1_800_000_000, Ordering::SeqCst);
         let cancel = AtomicBool::new(false);
         scan(
+            DEFAULT_LIBRARY,
             &src,
             &mut cat,
             &mut |p| {
@@ -1173,7 +1226,9 @@ mod tests {
         };
         let no = AtomicBool::new(false);
         std::thread::scope(|s| {
-            let scan = s.spawn(|| scan_with(&src, &mut cat, &mut |_| {}, &no, &opts).unwrap());
+            let scan = s.spawn(|| {
+                scan_with(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no, &opts).unwrap()
+            });
             let mut worst = Duration::ZERO;
             while !scan.is_finished() {
                 let t = Instant::now();
@@ -1187,5 +1242,119 @@ mod tests {
                 "a write waited {worst:?}"
             );
         });
+    }
+
+    /// A temp dir with `tone.mp3` copied to each of `paths` and their genre in the
+    /// first folder name (the folder fallback).
+    fn library_dir(paths: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for p in paths {
+            let to = dir.path().join(p);
+            fs::create_dir_all(to.parent().unwrap()).unwrap();
+            fs::copy(fixtures().join("tone.mp3"), to).unwrap();
+        }
+        dir
+    }
+
+    fn scan_lib(
+        lib: crate::LibraryId,
+        src: &dyn MusicSource,
+        cat: &mut Catalog,
+    ) -> Result<ScanReport> {
+        scan(lib, src, cat, &mut |_| {}, &AtomicBool::new(false))
+    }
+
+    #[test]
+    fn two_libraries_scan_into_one_catalog_with_combined_genres() {
+        let one = library_dir(&["Jazz/a.mp3", "Rock/b.mp3"]);
+        // The same path in both, and unicode names with an AppleDouble file.
+        let two = library_dir(&["Jazz/a.mp3", "Trance/Čuvarkuća 🎶.mp3"]);
+        fs::write(two.path().join("Trance/._Čuvarkuća 🎶.mp3"), "x").unwrap();
+        fs::write(two.path().join("Trance/.hidden.mp3"), "x").unwrap();
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let r1 = scan_lib(1, &LocalSource::new(one.path()), &mut cat).unwrap();
+        let r2 = scan_lib(2, &LocalSource::new(two.path()), &mut cat).unwrap();
+        assert_eq!((r1.total, r2.total), (2, 2), "the ._ file is skipped");
+        // The fixture is tagged "Trance; Chillout": the genres count both libraries.
+        let genres = |cat: &Catalog| -> Vec<(String, usize)> {
+            cat.genres()
+                .unwrap()
+                .into_iter()
+                .map(|g| (g.key, g.count))
+                .collect()
+        };
+        assert_eq!(
+            genres(&cat),
+            [("chillout".to_string(), 4), ("trance".to_string(), 4)]
+        );
+        assert_eq!(cat.library_track_counts().unwrap(), [(1, 2), (2, 2)].into());
+        // Scanning one again leaves the other alone.
+        fs::remove_file(one.path().join("Rock/b.mp3")).unwrap();
+        let r1 = scan_lib(1, &LocalSource::new(one.path()), &mut cat).unwrap();
+        assert_eq!((r1.removed, r1.unchanged), (1, 1));
+        assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 3);
+        // Disabling library 2 hides its tracks.
+        cat.set_disabled_libraries(&[2]).unwrap();
+        assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 1);
+        assert_eq!(
+            genres(&cat),
+            [("chillout".to_string(), 1), ("trance".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn an_offline_library_keeps_its_tracks() {
+        let disk = library_dir(&["Jazz/a.mp3", "Rock/b.mp3"]);
+        let mut cat = Catalog::open_in_memory().unwrap();
+        scan_lib(2, &LocalSource::new(disk.path()), &mut cat).unwrap();
+        let other = library_dir(&["Pop/c.mp3"]);
+        scan_lib(1, &LocalSource::new(other.path()), &mut cat).unwrap();
+        // The disk is unplugged: the scan of its library fails, nothing goes.
+        let unplugged = LocalSource::new(disk.path().join("not-mounted"));
+        assert!(scan_lib(2, &unplugged, &mut cat).is_err());
+        assert_eq!(cat.library_track_counts().unwrap()[&2], 2);
+        assert_eq!(cat.playable_tracks(&[]).unwrap().len(), 3);
+    }
+
+    /// A failover pair whose primary is down: the listing comes from the backup.
+    fn backup_walk(backup: &Path) -> crate::source::FailoverSource {
+        struct Down;
+        impl MusicSource for Down {
+            fn walk(
+                &self,
+                _: &mut dyn FnMut(FileEntry),
+            ) -> std::result::Result<WalkReport, SourceError> {
+                Err(SourceError::Unreachable)
+            }
+            fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+                Err(SourceError::Unreachable)
+            }
+            fn describe(&self) -> String {
+                "down".into()
+            }
+        }
+        crate::source::FailoverSource::new(Box::new(Down), Some(Box::new(LocalSource::new(backup))))
+    }
+
+    #[test]
+    fn a_scan_from_the_backup_server_removes_nothing() {
+        let primary = library_dir(&["Jazz/a.mp3", "Rock/new-on-primary.mp3"]);
+        let mut cat = Catalog::open_in_memory().unwrap();
+        scan_lib(1, &LocalSource::new(primary.path()), &mut cat).unwrap();
+        // The backup lags: it lacks the newest file but has one of its own.
+        let backup = library_dir(&["Jazz/a.mp3", "Pop/only-on-backup.mp3"]);
+        let r = scan_lib(1, &backup_walk(backup.path()), &mut cat).unwrap();
+        assert!(r.from_backup);
+        assert_eq!(r.removed, 0, "removals wait for the primary");
+        assert_eq!(
+            cat.playable_tracks(&[]).unwrap().len(),
+            3,
+            "added, none removed"
+        );
+        assert_eq!(cat.absent_count(), 0, "nothing left marked unseen");
+        // Back on the primary: what it lacks goes.
+        let r = scan_lib(1, &LocalSource::new(primary.path()), &mut cat).unwrap();
+        assert!(!r.from_backup);
+        assert_eq!(r.removed, 1);
     }
 }

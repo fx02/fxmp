@@ -1,5 +1,6 @@
 //! Music source backed by a local directory.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,14 +18,31 @@ impl LocalSource {
     }
 
     /// Walks `dir`; a subfolder that cannot be listed is skipped and added to
-    /// `skipped` (the root failing is an error).
+    /// `skipped` (the root failing is an error). Linked folders are followed, but a
+    /// folder already walked (`visited`, by its resolved path) is not walked again,
+    /// so a link loop ends.
     fn walk_dir(
         &self,
         dir: &Path,
         rel: &str,
+        visited: &mut HashSet<PathBuf>,
         skipped: &mut Vec<String>,
         on_entry: &mut dyn FnMut(FileEntry),
     ) -> Result<(), SourceError> {
+        match fs::canonicalize(dir) {
+            Ok(real) => {
+                if !visited.insert(real) {
+                    log::debug!("not walking '{rel}' again (a link to a folder already walked)");
+                    return Ok(());
+                }
+            }
+            Err(e) if rel.is_empty() => return Err(map_io(e)),
+            Err(e) => {
+                log::warn!("skipping unreadable folder '{rel}': {e}");
+                skipped.push(rel.to_string());
+                return Ok(());
+            }
+        }
         let items = match fs::read_dir(dir) {
             Ok(items) => items,
             Err(e) if !rel.is_empty() => {
@@ -36,7 +54,14 @@ impl LocalSource {
         };
         for item in items {
             let item = item.map_err(map_io)?;
-            let name = item.file_name().to_string_lossy().into_owned();
+            // Hidden files, including macOS `._*` AppleDouble companions.
+            let Some(name) = item.file_name().to_str().map(str::to_string) else {
+                log::warn!(
+                    "skipping a file whose name is not valid Unicode: {:?}",
+                    item.path()
+                );
+                continue;
+            };
             if name.starts_with('.') {
                 continue;
             }
@@ -52,7 +77,7 @@ impl LocalSource {
                 Err(e) => return Err(map_io(e)),
             };
             if md.is_dir() {
-                self.walk_dir(&item.path(), &rel_path, skipped, on_entry)?;
+                self.walk_dir(&item.path(), &rel_path, visited, skipped, on_entry)?;
             } else if md.is_file() && is_supported(&rel_path) {
                 let mtime = md
                     .modified()
@@ -81,8 +106,17 @@ fn map_io(e: io::Error) -> SourceError {
 impl MusicSource for LocalSource {
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
         let mut skipped_dirs = Vec::new();
-        self.walk_dir(&self.root, "", &mut skipped_dirs, on_entry)?;
-        Ok(WalkReport { skipped_dirs })
+        self.walk_dir(
+            &self.root,
+            "",
+            &mut HashSet::new(),
+            &mut skipped_dirs,
+            on_entry,
+        )?;
+        Ok(WalkReport {
+            skipped_dirs,
+            from_backup: false,
+        })
     }
 
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
@@ -197,5 +231,60 @@ mod tests {
         assert!(LocalSource::new(tmp.path().join("nope"))
             .walk(&mut |_| {})
             .is_err());
+    }
+
+    #[test]
+    fn local_walk_takes_unicode_and_spaces_and_skips_apple_double_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Čćž Ђ 🎵 folder");
+        fs::create_dir(&dir).unwrap();
+        for name in ["Pjesma čćžšđ 🎶.mp3", "a b  c.flac"] {
+            fs::copy(fixtures().join("tone.mp3"), dir.join(name)).unwrap();
+        }
+        // AppleDouble companions (resource forks on non-Mac disks) and hidden files.
+        fs::write(dir.join("._Pjesma čćžšđ 🎶.mp3"), "x").unwrap();
+        fs::write(tmp.path().join("._root.mp3"), "x").unwrap();
+        fs::write(tmp.path().join(".DS_Store"), "x").unwrap();
+
+        let src = LocalSource::new(tmp.path());
+        let mut got = Vec::new();
+        src.walk(&mut |e| got.push(e.rel_path)).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "Čćž Ђ 🎵 folder/Pjesma čćžšđ 🎶.mp3",
+                "Čćž Ђ 🎵 folder/a b  c.flac"
+            ]
+        );
+        // And they open by the path the walk gave.
+        for rel in &got {
+            let mut buf = Vec::new();
+            src.open(rel).unwrap().read_to_end(&mut buf).unwrap();
+            assert!(!buf.is_empty(), "{rel}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_walk_does_not_follow_symlink_loops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        fs::create_dir_all(a.join("b")).unwrap();
+        fs::copy(fixtures().join("tone.mp3"), a.join("b/x.mp3")).unwrap();
+        // b/up -> a and loop -> the root itself: endless if followed blindly.
+        std::os::unix::fs::symlink(&a, a.join("b/up")).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
+        // A link to a folder outside the root is followed (once).
+        let outside = tempfile::tempdir().unwrap();
+        fs::copy(fixtures().join("tone.ogg"), outside.path().join("o.ogg")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("ext")).unwrap();
+
+        let mut got = Vec::new();
+        LocalSource::new(tmp.path())
+            .walk(&mut |e| got.push(e.rel_path))
+            .unwrap();
+        got.sort();
+        assert_eq!(got, ["a/b/x.mp3", "ext/o.ogg"]);
     }
 }
