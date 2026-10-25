@@ -24,6 +24,7 @@ fn tone(id: TrackId, freq: u32) -> PlayItem {
         id,
         rel_path: format!("fixtures-audio/tone{freq}.flac"),
         gain_db: 0.0,
+        start_ms: 0,
     }
 }
 
@@ -327,6 +328,7 @@ fn broken_track_is_skipped_and_reported() {
         id: 1,
         rel_path: "fixtures/broken.mp3".into(),
         gain_db: 0.0,
+        start_ms: 0,
     };
     h.play(vec![broken, tone(2, 500)]);
     h.wait("skip", 10, |e| {
@@ -350,6 +352,7 @@ fn missing_track_is_reported_as_not_found() {
         id: 1,
         rel_path: "fixtures/no-such-file.mp3".into(),
         gain_db: 0.0,
+        start_ms: 0,
     };
     h.play(vec![missing, tone(2, 500)]);
     h.wait("start of 2", 10, |e| *e == Event::TrackStarted { id: 2 });
@@ -363,6 +366,7 @@ fn twenty_failures_in_a_row_go_idle_until_next() {
         id,
         rel_path: "fixtures/broken.mp3".into(),
         gain_db: 0.0,
+        start_ms: 0,
     };
     let mut items: Vec<PlayItem> = (1..=20).map(broken).collect();
     items.push(tone(21, 500));
@@ -442,6 +446,7 @@ fn stalled_source_skips_track() {
             id: 1,
             rel_path: "stall.flac".into(),
             gain_db: 0.0,
+            start_ms: 0,
         },
         tone(2, 500),
     ]);
@@ -622,6 +627,7 @@ fn gain_ratio(normalize: bool) -> f32 {
     h.player.send(Command::SetNormalize(normalize));
     let quiet = PlayItem {
         gain_db: -6.0,
+        start_ms: 0,
         ..tone(2, 1500)
     };
     h.play(vec![tone(1, 500), quiet]);
@@ -716,6 +722,7 @@ fn a_rejected_login_mid_track_is_reported_as_unreachable() {
             id: 1,
             rel_path: "authfail-50-500.flac".into(),
             gain_db: 0.0,
+            start_ms: 0,
         },
         tone(2, 1500),
     ]);
@@ -743,6 +750,7 @@ fn next_on_stalled_track_is_immediate() {
         id: 1,
         rel_path: "stall-20-500.flac".into(),
         gain_db: 0.0,
+        start_ms: 0,
     };
     h.play(vec![stalling, tone(2, 1500)]);
     h.wait("first track", 5, |e| *e == Event::TrackStarted { id: 1 });
@@ -762,6 +770,7 @@ fn play_during_crossfade_reports_to_old_provider() {
         id: 1,
         rel_path: "fixtures-audio/mono.flac".into(),
         gain_db: 0.0,
+        start_ms: 0,
     };
     h.play(vec![short, tone(2, 500)]);
     h.wait("crossfade", 5, |e| *e == Event::TrackStarted { id: 2 });
@@ -921,6 +930,7 @@ fn engine_does_not_spin_when_both_decks_starve() {
         id,
         rel_path: path.into(),
         gain_db: 0.0,
+        start_ms: 0,
     };
     h.play(vec![
         item(1, "stall-60-500.flac"),
@@ -978,4 +988,231 @@ fn resume_during_pause_fade_keeps_events_paired() {
         assert_eq!(*p, i % 2 == 0, "unpaired Paused events: {paused:?}");
     }
     assert_eq!(paused.len() % 2, 0, "unpaired Paused events: {paused:?}");
+}
+
+impl Harness {
+    /// Position reports seen so far: (track, ms).
+    fn positions(&self) -> Vec<(TrackId, u64)> {
+        self.seen
+            .iter()
+            .filter_map(|e| match e {
+                Event::Position { id, ms, .. } => Some((*id, *ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn written_ms(&self) -> u64 {
+        (self.out.lock().unwrap().len() / 2) as u64 * 1000 / RATE as u64
+    }
+}
+
+fn at(id: TrackId, freq: u32, start_ms: u64) -> PlayItem {
+    PlayItem {
+        start_ms,
+        ..tone(id, freq)
+    }
+}
+
+#[test]
+fn position_follows_played_audio_and_resets_on_a_new_track() {
+    let mut h = Harness::new(Opts {
+        speed: Some(4.0),
+        ..Default::default()
+    });
+    h.player.send(Command::SetCrossfade {
+        enabled: false,
+        secs: 5,
+    });
+    h.play(vec![tone(1, 500), tone(2, 1500)]);
+    h.wait("start of 1", 5, |e| *e == Event::TrackStarted { id: 1 });
+    let mut last = 0;
+    // About every 250 ms while playing, never ahead of what was written.
+    for _ in 0..4 {
+        let e = h.wait("position", 2, |e| {
+            matches!(e, Event::Position { id: 1, .. })
+        });
+        let Event::Position {
+            ms, duration_ms, ..
+        } = e
+        else {
+            unreachable!()
+        };
+        assert!(ms >= last, "position went back: {last} -> {ms}");
+        assert!(ms <= h.written_ms() + 50, "{ms} ms ahead of the output");
+        assert_eq!(duration_ms, Some(20_000));
+        last = ms;
+    }
+    assert!(last > 1000, "8x speed for 1 s: {last} ms");
+    h.wait("start of 2", 10, |e| *e == Event::TrackStarted { id: 2 });
+    let before = h.positions().iter().rev().find(|p| p.0 == 1).unwrap().1;
+    assert!(before > 18_000, "track 1 reached {before} ms");
+    let first = h.wait("position of 2", 2, |e| {
+        matches!(e, Event::Position { id: 2, .. })
+    });
+    let Event::Position { ms, .. } = first else {
+        unreachable!()
+    };
+    assert!(ms < 300, "a new track starts at 0, got {ms}");
+}
+
+#[test]
+fn pause_freezes_the_position() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    h.play(vec![tone(1, 500)]);
+    h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    std::thread::sleep(Duration::from_millis(400));
+    h.player.send(Command::Pause);
+    h.wait("paused", 5, |e| *e == Event::Paused(true));
+    let frozen = h.positions().last().copied().unwrap();
+    assert!(frozen.1 > 300, "position at the pause: {frozen:?}");
+    std::thread::sleep(Duration::from_millis(700));
+    while let Ok(e) = h.events.try_recv() {
+        h.seen.push(e);
+    }
+    assert_eq!(
+        h.positions().last().copied(),
+        Some(frozen),
+        "moved while paused"
+    );
+}
+
+#[test]
+fn a_track_can_start_part_way_in() {
+    let mut h = Harness::new(Opts::default());
+    h.play(vec![at(1, 500, 15_000)]);
+    let e = h.wait("position", 5, |e| {
+        matches!(e, Event::Position { id: 1, .. })
+    });
+    let Event::Position { ms, .. } = e else {
+        unreachable!()
+    };
+    assert!((15_000..15_300).contains(&ms), "started at {ms}");
+    h.wait("idle", 10, |e| *e == Event::Idle);
+    let secs = h.output().len() as f32 / 2.0 / RATE as f32;
+    assert!((secs - 5.0).abs() < 0.2, "played {secs} s of the last 5");
+    assert_eq!(h.calls(), [Call::Played(1, None)]);
+}
+
+#[test]
+fn a_failed_seek_plays_the_track_from_the_start() {
+    let mut h = Harness::new(Opts::default());
+    h.play(vec![at(1, 500, 60_000)]);
+    h.wait("idle", 10, |e| *e == Event::Idle);
+    assert_eq!(h.started(), [1], "never skipped");
+    let secs = h.output().len() as f32 / 2.0 / RATE as f32;
+    assert!((secs - 20.0).abs() < 0.2, "played {secs} s");
+}
+
+#[test]
+fn cue_loads_paused_at_the_position_and_play_continues_there() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    let provider = FakeProvider {
+        items: vec![at(1, 500, 10_000)].into(),
+        calls: h.calls.clone(),
+    };
+    h.player.send(Command::Cue(Box::new(provider)));
+    h.wait("paused", 5, |e| *e == Event::Paused(true));
+    h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    let e = h.wait("position", 5, |e| {
+        matches!(e, Event::Position { id: 1, .. })
+    });
+    let Event::Position { ms, .. } = e else {
+        unreachable!()
+    };
+    assert!((10_000..10_100).contains(&ms), "cued at {ms}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(h.output().is_empty(), "nothing plays while cued");
+    h.player.send(Command::TogglePause);
+    h.wait("playing", 5, |e| *e == Event::Paused(false));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!h.output().is_empty(), "plays after resume");
+    let e = h.wait("position", 2, |e| {
+        matches!(e, Event::Position { id: 1, .. })
+    });
+    let Event::Position { ms, .. } = e else {
+        unreachable!()
+    };
+    assert!((10_000..11_000).contains(&ms), "continues from 10 s: {ms}");
+}
+
+/// Hands out a shared list; records which tracks started.
+struct SharedProvider {
+    items: Arc<Mutex<VecDeque<PlayItem>>>,
+    asked: Arc<Mutex<u32>>,
+    starts: Arc<Mutex<Vec<TrackId>>>,
+}
+
+impl TrackProvider for SharedProvider {
+    fn next_track(&mut self) -> Option<PlayItem> {
+        *self.asked.lock().unwrap() += 1;
+        self.items.lock().unwrap().pop_front()
+    }
+    fn on_failed(&mut self, _: TrackId, _: &Failure) {}
+    fn on_played(&mut self, _: TrackId, _: Option<f32>) {}
+    fn on_started(&mut self, id: TrackId) {
+        self.starts.lock().unwrap().push(id);
+    }
+}
+
+#[test]
+fn requeue_replaces_the_prepared_next_track_and_starts_are_reported() {
+    let mut h = Harness::new(Opts {
+        speed: Some(4.0),
+        ..Default::default()
+    });
+    let items = Arc::new(Mutex::new(VecDeque::from(vec![
+        tone(1, 500),
+        tone(2, 1500),
+    ])));
+    let asked = Arc::new(Mutex::new(0));
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    h.player.send(Command::Play(Box::new(SharedProvider {
+        items: items.clone(),
+        asked: asked.clone(),
+        starts: starts.clone(),
+    })));
+    h.wait("start of 1", 5, |e| *e == Event::TrackStarted { id: 1 });
+    // Track 2 is prepared 15 s before the end of track 1.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while *asked.lock().unwrap() < 2 {
+        assert!(Instant::now() < deadline, "track 2 never prepared");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    items.lock().unwrap().push_front(tone(3, 2500));
+    h.player.send(Command::Requeue);
+    h.wait("idle", 30, |e| *e == Event::Idle);
+    assert_eq!(h.started(), [1, 3]);
+    assert_eq!(*starts.lock().unwrap(), [1, 3]);
+}
+
+#[test]
+fn requeue_wakes_a_provider_that_ran_out() {
+    let mut h = Harness::new(Opts {
+        speed: Some(4.0),
+        ..Default::default()
+    });
+    let items = Arc::new(Mutex::new(VecDeque::from(vec![tone(1, 500)])));
+    let asked = Arc::new(Mutex::new(0));
+    h.player.send(Command::Play(Box::new(SharedProvider {
+        items: items.clone(),
+        asked: asked.clone(),
+        starts: Arc::default(),
+    })));
+    h.wait("start of 1", 5, |e| *e == Event::TrackStarted { id: 1 });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while *asked.lock().unwrap() < 2 {
+        assert!(Instant::now() < deadline, "never asked for a second track");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    items.lock().unwrap().push_back(tone(2, 1500));
+    h.player.send(Command::Requeue);
+    h.wait("idle", 30, |e| *e == Event::Idle);
+    assert_eq!(h.started(), [1, 2]);
 }

@@ -400,6 +400,7 @@ fn on_player_event(app: &AppHandle, ev: Event) {
             emit_now_playing(app, &np);
         }
         Event::DeviceChanged(name) => log::info!("output device: {name}"),
+        Event::Position { .. } => {}
         Event::Idle => {
             *lock(&st.now_playing) = None;
             emit_now_playing(app, &None);

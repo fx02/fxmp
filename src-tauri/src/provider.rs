@@ -141,6 +141,7 @@ impl TrackProvider for CatalogProvider {
                 id,
                 rel_path: row.rel_path,
                 gain_db: track_gain_db(row.meta.rg_track_gain_db, row.measured_lufs),
+                start_ms: 0,
             });
         }
     }

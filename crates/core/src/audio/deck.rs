@@ -33,6 +33,8 @@ struct DeckBuf {
     /// Some audio was decoded (the track did not fail before its first sample).
     decoded_any: bool,
     duration_ms: Option<u64>,
+    /// Where decoding started, in ms from the start of the track.
+    start_ms: u64,
     cancelled: bool,
 }
 
@@ -57,10 +59,13 @@ pub(super) struct LoadCtx {
     pub(super) wake: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// Starts decoding `rel_path` at `start_ms` (from 0 if it cannot be positioned
+/// there), dropping a further `skip_frames` output frames.
 fn spawn_deck_thread(
     ctx: &LoadCtx,
     rel_path: &str,
     rate: u32,
+    start_ms: u64,
     skip_frames: u64,
 ) -> Arc<DeckShared> {
     let shared = Arc::new(DeckShared {
@@ -69,6 +74,7 @@ fn spawn_deck_thread(
             phase: Phase::Loading,
             decoded_any: false,
             duration_ms: None,
+            start_ms: 0,
             cancelled: false,
         }),
         space: Condvar::new(),
@@ -77,8 +83,9 @@ fn spawn_deck_thread(
     std::thread::Builder::new()
         .name("player-deck".into())
         .spawn(move || {
-            let run =
-                std::panic::AssertUnwindSafe(|| deck_thread(&s, &ctx, &path, rate, skip_frames));
+            let run = std::panic::AssertUnwindSafe(|| {
+                deck_thread(&s, &ctx, &path, rate, start_ms, skip_frames)
+            });
             if std::panic::catch_unwind(run).is_err() {
                 // A decoder panic must not leave the engine waiting on this deck forever.
                 s.lock().phase = Phase::Failed(Failure::new(FailCode::Decode, "decoder panicked"));
@@ -159,7 +166,14 @@ fn open_decoder(
     Decoder::open(Box::new(tapped), Some(len), ext, rate).map_err(|e| source_cause(e, last))
 }
 
-fn deck_thread(shared: &DeckShared, ctx: &LoadCtx, rel_path: &str, rate: u32, skip_frames: u64) {
+fn deck_thread(
+    shared: &DeckShared,
+    ctx: &LoadCtx,
+    rel_path: &str,
+    rate: u32,
+    start_ms: u64,
+    skip_frames: u64,
+) {
     let set_phase = |phase: Phase| {
         shared.lock().phase = phase;
         (ctx.wake)();
@@ -169,11 +183,28 @@ fn deck_thread(shared: &DeckShared, ctx: &LoadCtx, rel_path: &str, rate: u32, sk
         Ok(d) => d,
         Err(e) => return set_phase(Phase::Failed(Failure::from_error(&e))),
     };
+    let mut started_at = 0;
+    if start_ms > 0 {
+        match dec.seek_to(start_ms) {
+            Ok(ms) => started_at = ms,
+            Err(e) => {
+                // Never skip a track for this: play it from the start.
+                log::warn!(
+                    "cannot start {rel_path} at {start_ms} ms ({e}); playing from the start"
+                );
+                dec = match open_decoder(ctx, rel_path, rate, &last_io) {
+                    Ok(d) => d,
+                    Err(e) => return set_phase(Phase::Failed(Failure::from_error(&e))),
+                };
+            }
+        }
+    }
     // Errors the probe got past are not the cause of a later failure.
     last_io.lock().unwrap_or_else(|p| p.into_inner()).take();
     {
         let mut b = shared.lock();
         b.duration_ms = dec.duration_ms();
+        b.start_ms = started_at;
         b.phase = Phase::Decoding;
     }
     let cap = DECK_BUFFER_SECS * rate as usize * 2;
@@ -236,6 +267,8 @@ pub(super) struct Status {
     pub(super) error: Option<Failure>,
     pub(super) decoded_any: bool,
     pub(super) duration_ms: Option<u64>,
+    /// Where decoding started, in ms from the start of the track.
+    pub(super) start_ms: u64,
 }
 
 pub(super) struct Deck {
@@ -255,7 +288,7 @@ pub(super) struct Deck {
 
 impl Deck {
     pub(super) fn load(ctx: &LoadCtx, item: PlayItem, rate: u32) -> Self {
-        let shared = spawn_deck_thread(ctx, &item.rel_path, rate, 0);
+        let shared = spawn_deck_thread(ctx, &item.rel_path, rate, item.start_ms, 0);
         Self {
             item,
             shared,
@@ -270,9 +303,10 @@ impl Deck {
 
     /// Restarts decoding at a new output rate, resuming where playback was.
     pub(super) fn reload(&mut self, ctx: &LoadCtx, old_rate: u32, rate: u32) {
+        let start_ms = self.status().start_ms;
         self.cancel();
         self.played = self.played * rate as u64 / old_rate.max(1) as u64;
-        self.shared = spawn_deck_thread(ctx, &self.item.rel_path, rate, self.played);
+        self.shared = spawn_deck_thread(ctx, &self.item.rel_path, rate, start_ms, self.played);
         self.meter = Some(LoudnessMeter::new(rate));
         self.fade_in = None;
     }
@@ -290,6 +324,7 @@ impl Deck {
             error,
             decoded_any: b.decoded_any,
             duration_ms: b.duration_ms,
+            start_ms: b.start_ms,
         }
     }
 

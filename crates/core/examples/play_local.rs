@@ -57,6 +57,7 @@ fn main() {
             id: i as TrackId + 1,
             rel_path,
             gain_db: 0.0,
+            start_ms: 0,
         })
         .collect();
     for it in &items {

@@ -32,6 +32,10 @@ const OUT_STALL_GRACE: Duration = Duration::from_millis(100);
 const SINK_RETRY: Duration = Duration::from_secs(1);
 const SINK_FULL_WAIT: Duration = Duration::from_millis(10);
 const IDLE_WAIT: Duration = Duration::from_millis(500);
+/// How often the position of the playing track is reported.
+const POSITION_EVERY: Duration = Duration::from_millis(250);
+/// Fade-in of a track that starts part way in (resuming where it stopped).
+const RESUME_FADE_SECS: f32 = 0.5;
 
 /// A track to play, as handed out by a [`TrackProvider`].
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +44,9 @@ pub struct PlayItem {
     pub rel_path: String,
     /// Normalisation gain, applied when normalisation is on.
     pub gain_db: f32,
+    /// Where to start, in ms from the beginning (resuming); 0 = the start. If the
+    /// track cannot be positioned there it plays from the start.
+    pub start_ms: u64,
 }
 
 /// Decides what plays next and hears how it went.
@@ -48,10 +55,21 @@ pub trait TrackProvider: Send {
     /// `id` could not be opened or decoded, for this reason.
     fn on_failed(&mut self, id: TrackId, failure: &Failure);
     fn on_played(&mut self, id: TrackId, measured_lufs: Option<f32>);
+    /// `id`, handed out by `next_track`, became the current (audible) track. Until
+    /// then, `next_track` may be asked again (after [`Command::Play`] or
+    /// [`Command::Requeue`]) and should hand out what is due at that moment.
+    fn on_started(&mut self, _id: TrackId) {}
 }
 
 pub enum Command {
+    /// Plays the provider's tracks, fading out what plays now (as `Next` does).
     Play(Box<dyn TrackProvider>),
+    /// As `Play`, but paused: the first track is loaded (and reported as started)
+    /// without being heard until `Resume`.
+    Cue(Box<dyn TrackProvider>),
+    /// The provider's upcoming tracks changed: the prepared next track (not started
+    /// yet) is dropped and asked for again, and a provider that ran out is asked again.
+    Requeue,
     Pause,
     Resume,
     TogglePause,
@@ -69,11 +87,25 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    TrackStarted { id: TrackId },
-    TrackSkipped { id: TrackId, reason: String },
+    TrackStarted {
+        id: TrackId,
+    },
+    TrackSkipped {
+        id: TrackId,
+        reason: String,
+    },
     Paused(bool),
     DeviceChanged(String),
     Idle,
+    /// Where the current track is: `ms` of it have been played (counting from the
+    /// start of the track). Sent about every 250 ms while playing, when a track
+    /// starts, and when a pause has taken effect.
+    Position {
+        id: TrackId,
+        ms: u64,
+        /// From the decoder, if the file tells.
+        duration_ms: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -168,6 +200,8 @@ struct Engine {
     /// Since when the outgoing deck has had too little audio.
     out_starved_since: Option<Instant>,
 
+    /// When the position was last reported.
+    position_at: Option<Instant>,
     paused: bool,
     /// `Paused(true)` has been emitted for the current pause (after its fade-out).
     pause_reported: bool,
@@ -221,6 +255,7 @@ impl Engine {
             pending_skips: 0,
             grace_since: None,
             out_starved_since: None,
+            position_at: None,
             paused: false,
             pause_reported: false,
             pause_gain: 1.0,
@@ -248,6 +283,7 @@ impl Engine {
                 Step::Progress => None,
                 Step::Wait(d) => Some(d),
             };
+            self.report_position(false);
         }
     }
 
@@ -279,6 +315,20 @@ impl Engine {
 
     fn command(&mut self, c: Command) {
         match c {
+            Command::Cue(p) => {
+                self.command(Command::Play(p));
+                self.set_paused(true);
+            }
+            Command::Requeue => {
+                if self.provider.is_some() {
+                    self.next = None;
+                    self.grace_since = None;
+                    if self.exhausted {
+                        self.exhausted = false;
+                        self.stopped_feeding = false;
+                    }
+                }
+            }
             Command::Play(p) => {
                 // A track that already played to its end belongs to the old provider.
                 if let Some(mut out) = self.out.take() {
@@ -363,8 +413,31 @@ impl Engine {
     fn report_pause(&mut self) {
         if self.paused && !self.pause_reported {
             self.pause_reported = true;
+            // Where it stopped, before the pause itself.
+            self.report_position(true);
             self.emit(Event::Paused(true));
         }
+    }
+
+    /// Reports where the current track is: when `force`d, else at most every
+    /// [`POSITION_EVERY`] while playing.
+    fn report_position(&mut self, force: bool) {
+        let Some(cur) = &self.cur else { return };
+        let due = self
+            .position_at
+            .is_none_or(|t| t.elapsed() >= POSITION_EVERY);
+        if !force && (self.paused || !due || self.rate == 0) {
+            return;
+        }
+        let s = cur.status();
+        let ms = s.start_ms + cur.played * 1000 / self.rate.max(1) as u64;
+        let (id, duration_ms) = (cur.item.id, s.duration_ms);
+        self.position_at = Some(Instant::now());
+        self.emit(Event::Position {
+            id,
+            ms,
+            duration_ms,
+        });
     }
 
     fn nothing_loaded(&self) -> bool {
@@ -502,11 +575,17 @@ impl Engine {
     /// Makes the prepared next deck the current one.
     fn start_next(&mut self, fade_in: Option<u64>) {
         let mut deck = self.next.take().expect("start_next needs a next deck");
-        deck.fade_in = fade_in.map(Ramp::new);
+        let resumed = (deck.item.start_ms > 0).then(|| self.secs_to_frames(RESUME_FADE_SECS));
+        deck.fade_in = fade_in.or(resumed).map(Ramp::new);
         self.failures = 0;
         self.grace_since = None;
-        self.emit(Event::TrackStarted { id: deck.item.id });
+        let id = deck.item.id;
+        if let Some(p) = self.provider.as_mut() {
+            p.on_started(id);
+        }
+        self.emit(Event::TrackStarted { id });
         self.cur = Some(deck);
+        self.report_position(true);
     }
 
     /// Drops the outgoing deck, reporting it if it had played to its end.

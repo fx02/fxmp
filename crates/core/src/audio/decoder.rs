@@ -8,10 +8,11 @@ use rubato::{FftFixedIn, Resampler};
 use symphonia::core::audio::{Channels, SampleBuffer};
 use symphonia::core::codecs::{Decoder as CodecDecoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymError;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::{Time, TimeBase};
 
 use crate::source::ReadSeek;
 use crate::{Error, Result};
@@ -160,6 +161,9 @@ pub struct Decoder {
     seg_out_frames: u64,
     out_rate: u32,
     ended: bool,
+    /// Source frames still to drop after an accurate seek (decoded from the packet
+    /// before the target).
+    discard_src_frames: u64,
 }
 
 fn decode_err(e: impl std::fmt::Display) -> Error {
@@ -233,6 +237,7 @@ impl Decoder {
             seg_out_frames: 0,
             out_rate,
             ended: false,
+            discard_src_frames: 0,
         })
     }
 
@@ -247,6 +252,54 @@ impl Decoder {
 
     pub fn duration_ms(&self) -> Option<u64> {
         self.duration_ms
+    }
+
+    /// Moves to `ms` from the start (accurate: frames before it are decoded and
+    /// dropped) and returns where reading continues, in ms. On an error the decoder is
+    /// in an unknown state: open the track again.
+    pub fn seek_to(&mut self, ms: u64) -> Result<u64> {
+        if self.duration_ms.is_some_and(|d| ms > d) {
+            return Err(Error::Decode(format!("seek to {ms} ms is past the end")));
+        }
+        let time = Time::new(ms / 1000, (ms % 1000) as f64 / 1000.0);
+        let seeked = self
+            .format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time,
+                    track_id: Some(self.track_id),
+                },
+            )
+            .map_err(map_open_err)?;
+        self.codec.reset();
+        let params = self
+            .format
+            .tracks()
+            .iter()
+            .find(|t| t.id == self.track_id)
+            .map(|t| t.codec_params.clone())
+            .ok_or_else(|| Error::Decode("track vanished while seeking".into()))?;
+        let rate = params.sample_rate.unwrap_or(self.cur_rate);
+        let tb = params.time_base.unwrap_or(TimeBase::new(1, rate));
+        let to_frames = |ts: u64| {
+            let t = tb.calc_time(ts);
+            t.seconds * rate as u64 + (t.frac * rate as f64).round() as u64
+        };
+        let required = to_frames(seeked.required_ts);
+        let actual = to_frames(seeked.actual_ts);
+        self.discard_src_frames = required.saturating_sub(actual);
+        // Start over with an empty resampler, as at the start of the stream.
+        self.ready.clear();
+        let (resample, skip) = Self::make_resample(self.cur_rate, self.out_rate)?;
+        self.resample = resample;
+        self.skip_frames = skip;
+        self.seg_src_frames = 0;
+        self.seg_out_frames = 0;
+        self.ended = false;
+        let delay = params.delay.unwrap_or(0) as u64;
+        let landed = required.max(actual).saturating_sub(delay);
+        Ok(landed * 1000 / rate.max(1) as u64)
     }
 
     /// Fills `out` with interleaved stereo samples and returns how many it wrote.
@@ -337,7 +390,9 @@ impl Decoder {
             .as_ref()
             .expect("sample buffer was just filled");
         self.stereo.clear();
-        for frame in buf.samples().chunks_exact(nch) {
+        let drop_n = (self.discard_src_frames as usize).min(frames);
+        self.discard_src_frames -= drop_n as u64;
+        for frame in buf.samples().chunks_exact(nch).skip(drop_n) {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             for (s, (gl, gr)) in frame.iter().zip(&self.downmix.gains) {
                 l += s * gl;
@@ -347,7 +402,7 @@ impl Decoder {
             self.stereo.push(r);
         }
         self.got_samples = true;
-        self.seg_src_frames += frames as u64;
+        self.seg_src_frames += (frames - drop_n) as u64;
         self.push_source_frames()
     }
 
@@ -650,6 +705,86 @@ mod tests {
             Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
             other => panic!("expected Io(TimedOut), got {other:?}"),
         }
+    }
+
+    /// Power of `freq` in mono `x` (Goertzel).
+    fn power(x: &[f32], freq: f32, rate: u32) -> f32 {
+        let w = 2.0 * std::f32::consts::PI * freq / rate as f32;
+        let c = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for &v in x {
+            let s0 = v + c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        s1 * s1 + s2 * s2 - c * s1 * s2
+    }
+
+    /// Where the step fixtures switch from 500 Hz to 1500 Hz, in ms of `stereo`.
+    fn switch_ms(stereo: &[f32], rate: u32) -> Option<u64> {
+        let mono: Vec<f32> = stereo.iter().step_by(2).copied().collect();
+        let win = rate as usize / 100; // 10 ms
+        mono.chunks_exact(win)
+            .position(|w| power(w, 1500.0, rate) > power(w, 500.0, rate))
+            .map(|i| i as u64 * 10)
+    }
+
+    #[test]
+    fn seek_to_lands_within_100_ms_for_every_format() {
+        let rate = 44100;
+        for name in ["step.mp3", "step.flac", "step.ogg"] {
+            for target in [0u64, 1000, 2500, 4200] {
+                let mut d = open("fixtures-audio", name, rate).unwrap();
+                let landed = d.seek_to(target).unwrap();
+                assert!(
+                    (landed as i64 - target as i64).abs() <= 100,
+                    "{name} @ {target}: reports {landed} ms"
+                );
+                let s = drain(&mut d);
+                let left_ms = (s.len() / 2) as i64 * 1000 / rate as i64;
+                assert!(
+                    (left_ms - (6000 - target as i64)).abs() <= 100,
+                    "{name} @ {target}: {left_ms} ms left"
+                );
+                match switch_ms(&s, rate) {
+                    Some(at) if target < 3000 => assert!(
+                        (at as i64 - (3000 - target as i64)).abs() <= 100,
+                        "{name} @ {target}: switch at {at} ms"
+                    ),
+                    Some(at) => assert_eq!(at, 0, "{name} @ {target}: already 1500 Hz"),
+                    None => panic!("{name} @ {target}: no 1500 Hz part"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seek_works_through_a_small_prefetch_window() {
+        use crate::audio::prefetch::{PrefetchConfig, PrefetchReader};
+        let rate = 44100;
+        for name in ["step.mp3", "step.flac", "step.ogg"] {
+            let p = path("fixtures-audio", name);
+            let len = std::fs::metadata(&p).unwrap().len();
+            // A few KB ahead only: the seek target is far outside what is buffered.
+            let cfg = PrefetchConfig {
+                chunk: 2048,
+                ahead: 4096,
+                read_timeout: std::time::Duration::from_secs(5),
+            };
+            let reader = PrefetchReader::new(Box::new(File::open(&p).unwrap()), len, cfg);
+            let ext = p.extension().unwrap().to_str().unwrap();
+            let mut d = Decoder::open(Box::new(reader), Some(len), ext, rate).unwrap();
+            d.seek_to(2000).unwrap();
+            let s = drain(&mut d);
+            let at = switch_ms(&s, rate).expect("1500 Hz part");
+            assert!((at as i64 - 1000).abs() <= 100, "{name}: switch at {at} ms");
+        }
+    }
+
+    #[test]
+    fn seek_past_the_end_fails() {
+        let mut d = open("fixtures-audio", "step.flac", 44100).unwrap();
+        assert!(d.seek_to(60_000).is_err());
     }
 
     #[test]
