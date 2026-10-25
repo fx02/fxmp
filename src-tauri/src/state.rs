@@ -144,11 +144,12 @@ pub struct AppState {
     pub playlist: SharedPlaylist,
     save_playlist: Mutex<Sender<()>>,
     playlist_saved_at: Mutex<Instant>,
-    /// The restored playlist waits for the share to be reachable (cleared once it
-    /// is cued, or once the user plays something else).
-    pub resume_pending: AtomicBool,
-    /// Play was pressed while the resume waited: it plays rather than cues.
-    pub play_requested: AtomicBool,
+    /// The restored playlist waiting for the share, and Play presses meanwhile.
+    /// Held while the resume, or a press, decides and sends its command.
+    pub resume: Mutex<ResumeGate>,
+    /// The engine's current track (playing, paused or cued): set by every start,
+    /// also of a track the catalog no longer has; cleared when it goes idle.
+    pub engine_track: Mutex<Option<TrackId>>,
     launched_at: Instant,
     scanning: AtomicBool,
     /// "Clear library" holds the scan slot: shown as such, not as a scan.
@@ -248,8 +249,8 @@ impl AppState {
             playlist: Arc::new(Mutex::new(saved_playlist)),
             save_playlist: Mutex::new(save_tx),
             playlist_saved_at: Mutex::new(Instant::now()),
-            resume_pending: AtomicBool::new(true),
-            play_requested: AtomicBool::new(false),
+            resume: Mutex::new(ResumeGate::waiting()),
+            engine_track: Mutex::new(None),
             launched_at: Instant::now(),
             scanning: AtomicBool::new(false),
             clearing: AtomicBool::new(false),
@@ -305,9 +306,7 @@ impl AppState {
                     let _ = handle.emit("connection-status", StatusPayload::from(status));
                     // At login the VPN may come up later: resume once the share answers,
                     // or the saved track would fail and be passed over.
-                    if resume_due(&st.resume_pending, status) {
-                        st.resume_playlist();
-                    }
+                    st.resume_playlist(status);
                 })
             })?;
 
@@ -366,7 +365,8 @@ impl AppState {
     /// Plays the playlist from what is due now (fading out what plays), as the user
     /// asked; a held-back resume is dropped.
     pub fn play_playlist(&self) {
-        self.resume_pending.store(false, Ordering::SeqCst);
+        let mut gate = lock(&self.resume);
+        gate.cancel();
         self.player.send(Command::Play(self.provider()));
     }
 
@@ -376,9 +376,16 @@ impl AppState {
         self.save_playlist_soon();
     }
 
-    /// On start: loads the saved playlist's current track (or the next one) where it
-    /// stopped, paused unless "Resume playing automatically on start" is on.
-    pub fn resume_playlist(&self) {
+    /// On start, once the share answers (`status`): loads the saved playlist's
+    /// current track (or the next one) where it stopped, paused unless "Resume
+    /// playing automatically on start" is on or Play was pressed meanwhile.
+    pub fn resume_playlist(&self, status: ConnStatus) {
+        // Held until the command is sent: a press either comes before (and is
+        // taken along) or after (and finds the track loaded or loading).
+        let mut gate = lock(&self.resume);
+        let Some(pressed) = gate.due(status) else {
+            return;
+        };
         let due = {
             let mut l = lock(&self.playlist);
             !l.ended && l.queue.successor().is_some()
@@ -387,7 +394,6 @@ impl AppState {
             return;
         }
         let late = resume_is_late(self.launched_at, Instant::now());
-        let pressed = self.play_requested.swap(false, Ordering::SeqCst);
         let command = resume_command(&self.settings.get(), self.provider(), late, pressed);
         log::info!(
             "playlist restored, {}",
@@ -473,10 +479,72 @@ pub fn resume_is_late(launched: Instant, now: Instant) -> bool {
     now.saturating_duration_since(launched) > LATE_RESUME
 }
 
-/// Whether the held-back resume goes now: once, when the share is reachable.
-pub fn resume_due(pending: &AtomicBool, status: ConnStatus) -> bool {
-    matches!(status, ConnStatus::Ok | ConnStatus::Secondary)
-        && pending.swap(false, Ordering::SeqCst)
+/// A Play/Pause press, as far as a waiting resume cares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Press {
+    /// Play/Pause.
+    Toggle,
+    Play,
+    Pause,
+}
+
+/// The restored playlist waiting for the share (`pending`), and whether the
+/// user's presses meanwhile add up to "play" (`play_requested`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResumeGate {
+    pub pending: bool,
+    pub play_requested: bool,
+}
+
+impl ResumeGate {
+    /// At start: the resume waits for the share.
+    pub fn waiting() -> Self {
+        Self {
+            pending: true,
+            play_requested: false,
+        }
+    }
+
+    /// Whether the resume goes now (once, when the share is reachable): then
+    /// `Some(whether Play was pressed meanwhile)`.
+    pub fn due(&mut self, status: ConnStatus) -> Option<bool> {
+        if !self.pending || !matches!(status, ConnStatus::Ok | ConnStatus::Secondary) {
+            return None;
+        }
+        self.pending = false;
+        Some(std::mem::take(&mut self.play_requested))
+    }
+
+    /// The user played something else: the resume is dropped.
+    pub fn cancel(&mut self) {
+        self.pending = false;
+        self.play_requested = false;
+    }
+
+    /// While the resume waits, a press is remembered (the last one counts: a
+    /// second Play/Pause or a Pause takes a Play back) and `true` is returned;
+    /// otherwise `false` and the press goes on to the player.
+    pub fn press(&mut self, press: Press) -> bool {
+        if !self.pending {
+            return false;
+        }
+        self.play_requested = match press {
+            Press::Toggle => !self.play_requested,
+            Press::Play => true,
+            Press::Pause => false,
+        };
+        true
+    }
+}
+
+/// The engine's current track after event `ev`: a start sets it (whatever the
+/// catalog knows), going idle clears it.
+pub fn engine_track_after(current: Option<TrackId>, ev: &Event) -> Option<TrackId> {
+    match ev {
+        Event::TrackStarted { id } => Some(*id),
+        Event::Idle => None,
+        _ => current,
+    }
 }
 
 fn send_mix_settings(player: &Player, s: &Settings) {
@@ -538,6 +606,10 @@ pub fn on_now_playing(app: &AppHandle, f: impl Fn(Option<NowPlaying>) + Send + '
 
 fn on_player_event(app: &AppHandle, ev: Event) {
     let st = app.state::<AppState>();
+    {
+        let mut engine = lock(&st.engine_track);
+        *engine = engine_track_after(*engine, &ev);
+    }
     match ev {
         Event::TrackStarted { id } => {
             let paused = st.paused.load(Ordering::SeqCst);
@@ -876,16 +948,69 @@ mod tests {
 
     #[test]
     fn the_resume_waits_for_the_share_and_happens_once() {
-        let pending = AtomicBool::new(true);
-        assert!(
-            !resume_due(&pending, ConnStatus::Unreachable),
-            "VPN not up yet"
+        let mut gate = ResumeGate::waiting();
+        assert_eq!(gate.due(ConnStatus::Unreachable), None, "VPN not up yet");
+        assert_eq!(gate.due(ConnStatus::Auth), None);
+        assert_eq!(gate.due(ConnStatus::Secondary), Some(false));
+        assert_eq!(gate.due(ConnStatus::Ok), None, "only once");
+        let mut played_meanwhile = ResumeGate::waiting();
+        played_meanwhile.cancel();
+        assert_eq!(played_meanwhile.due(ConnStatus::Ok), None);
+    }
+
+    #[test]
+    fn a_remembered_press_follows_the_last_press() {
+        let mut gate = ResumeGate::waiting();
+        assert!(gate.press(Press::Toggle), "remembered while waiting");
+        assert!(gate.press(Press::Toggle), "a second toggle takes it back");
+        assert_eq!(gate.clone().due(ConnStatus::Ok), Some(false));
+        assert!(gate.press(Press::Play));
+        assert!(gate.press(Press::Play), "Play twice is still Play");
+        assert_eq!(gate.clone().due(ConnStatus::Ok), Some(true));
+        assert!(gate.press(Press::Pause), "Pause cancels it");
+        assert_eq!(gate.clone().due(ConnStatus::Ok), Some(false));
+        assert!(gate.press(Press::Toggle));
+        assert_eq!(gate.due(ConnStatus::Ok), Some(true));
+        // Resumed: presses go to the player again, and leave nothing behind.
+        assert!(!gate.press(Press::Toggle));
+        assert!(!gate.press(Press::Play));
+        assert!(!gate.play_requested);
+    }
+
+    #[test]
+    fn a_press_racing_the_resume_is_never_lost() {
+        for _ in 0..500 {
+            let gate = Mutex::new(ResumeGate::waiting());
+            let (resumed_with_press, press_went_on) = std::thread::scope(|s| {
+                let resume = s.spawn(|| lock(&gate).due(ConnStatus::Ok));
+                let press = s.spawn(|| !lock(&gate).press(Press::Play));
+                (resume.join().unwrap(), press.join().unwrap())
+            });
+            // Either the resume took the press (and plays), or the press came after
+            // the resume and goes to the player itself: exactly one of them.
+            assert!(
+                (resumed_with_press == Some(true)) != press_went_on,
+                "{resumed_with_press:?} / {press_went_on}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_engine_track_follows_starts_and_idle_not_the_catalog() {
+        let started = engine_track_after(None, &Event::TrackStarted { id: 7 });
+        assert_eq!(started, Some(7), "also for a track the catalog lost");
+        let pos = Event::Position {
+            id: 7,
+            ms: 10,
+            duration_ms: None,
+        };
+        assert_eq!(engine_track_after(started, &pos), Some(7));
+        assert_eq!(engine_track_after(started, &Event::Paused(true)), Some(7));
+        assert_eq!(
+            engine_track_after(Some(7), &Event::TrackStarted { id: 9 }),
+            Some(9)
         );
-        assert!(!resume_due(&pending, ConnStatus::Auth));
-        assert!(resume_due(&pending, ConnStatus::Secondary));
-        assert!(!resume_due(&pending, ConnStatus::Ok), "only once");
-        let played_meanwhile = AtomicBool::new(false);
-        assert!(!resume_due(&played_meanwhile, ConnStatus::Ok));
+        assert_eq!(engine_track_after(Some(9), &Event::Idle), None);
     }
 
     /// A scan of a slow source on its own thread, keeping `scanning` the way

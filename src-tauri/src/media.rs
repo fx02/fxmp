@@ -14,7 +14,7 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(target_os = "macos")]
-use crate::commands::{play_pause_now, previous_now, spawn_action};
+use crate::commands::{pause_now, play_pause_now, previous_now, spawn_action};
 use crate::state::{self, lock, AppState, NowPlaying};
 #[cfg(target_os = "macos")]
 use crate::tray::show_main_window;
@@ -83,7 +83,12 @@ fn on_media_event(app: &AppHandle, event: MediaControlEvent) {
                 Ok(())
             });
         }
-        MediaControlEvent::Pause | MediaControlEvent::Stop => Command::Pause,
+        MediaControlEvent::Pause | MediaControlEvent::Stop => {
+            return spawn_action(app, "pause", |_, st| {
+                pause_now(st);
+                Ok(())
+            });
+        }
         MediaControlEvent::Next => Command::Next,
         MediaControlEvent::Previous => {
             return spawn_action(app, "previous", |_, st| previous_now(st));

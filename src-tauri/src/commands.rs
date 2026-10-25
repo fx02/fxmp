@@ -20,7 +20,7 @@ use crate::i18n;
 use crate::playlist::{self, PlaylistFacets, PlaylistPage, PreviousAction, QueueFilter, Selection};
 use crate::settings::{ServerConfig, Settings, SettingsStore};
 use crate::state::{
-    self, apply_player_settings, lock, AppState, NowPlaying, PositionPayload, ScanStatus,
+    self, apply_player_settings, lock, AppState, NowPlaying, PositionPayload, Press, ScanStatus,
 };
 use crate::tray;
 
@@ -357,20 +357,41 @@ pub fn play_action(loaded: bool, pending: bool, has_next: bool) -> PlayAction {
 }
 
 /// Play/Pause (`TogglePause`) or Play (`Resume`) from the UI, tray or media keys;
-/// pressing Play is never silent while there is something to play.
+/// pressing Play is never silent while there is something to play. "Loaded" is
+/// what the engine reports (a started track until it goes idle), not what the
+/// window shows.
 pub fn play_pause_now(st: &AppState, command: Command) {
-    let loaded = lock(&st.now_playing).is_some();
-    let pending = st.resume_pending.load(std::sync::atomic::Ordering::SeqCst);
+    let press = match command {
+        Command::Resume => Press::Play,
+        Command::Pause => Press::Pause,
+        _ => Press::Toggle,
+    };
+    // Held while deciding and sending, so the resume cannot slip in between.
+    let mut gate = lock(&st.resume);
+    let loaded = lock(&st.engine_track).is_some();
+    let pending = gate.pending;
     let has_next = !loaded && lock(&st.playlist).queue.successor().is_some();
     match play_action(loaded, pending, has_next) {
         PlayAction::Player => st.player.send(command),
         PlayAction::RememberForResume => {
-            log::info!("play pressed while the playlist waits for the share");
-            st.play_requested
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            gate.press(press);
+            log::info!(
+                "play/pause pressed while the playlist waits for the share (play: {})",
+                gate.play_requested
+            );
         }
-        PlayAction::StartPlaylist => st.play_playlist(),
+        PlayAction::StartPlaylist => {
+            drop(gate);
+            st.play_playlist();
+        }
     }
+}
+
+/// Pause (media key Pause/Stop): also takes back a Play pressed while the resume
+/// waits.
+pub fn pause_now(st: &AppState) {
+    lock(&st.resume).press(Press::Pause);
+    st.player.send(Command::Pause);
 }
 
 #[tauri::command(rename_all = "snake_case")]
