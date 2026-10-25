@@ -235,8 +235,8 @@ fn on_icon_event(app: &AppHandle, event: TrayIconEvent) {
     match action {
         Some(ClickAction::Toggle) => {
             log::debug!("tray: double click, play/pause");
-            spawn_action(app, "play/pause", |_, st| {
-                play_pause_now(st, Command::TogglePause);
+            spawn_action(app, "play/pause", |app, st| {
+                play_pause_now(app, st, Command::TogglePause);
                 Ok(())
             });
         }
@@ -249,7 +249,7 @@ fn on_icon_event(app: &AppHandle, event: TrayIconEvent) {
                     std::thread::sleep(window);
                     if clicks(&handle, |c| c.due(seq, Instant::now())) == Some(true) {
                         log::debug!("tray: single click, next track");
-                        next_now(&handle.state::<AppState>());
+                        next_now(&handle, &handle.state::<AppState>());
                     }
                 });
             if let Err(e) = spawned {
@@ -449,13 +449,13 @@ pub fn relabel(app: &AppHandle) {
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     let id = event.id().as_ref();
     match id {
-        ID_TOGGLE => spawn_action(app, "play/pause", |_, st| {
-            play_pause_now(st, Command::TogglePause);
+        ID_TOGGLE => spawn_action(app, "play/pause", |app, st| {
+            play_pause_now(app, st, Command::TogglePause);
             Ok(())
         }),
         ID_PREVIOUS => spawn_action(app, "previous", |_, st| previous_now(st)),
-        ID_NEXT => spawn_action(app, "next", |_, st| {
-            next_now(st);
+        ID_NEXT => spawn_action(app, "next", |app, st| {
+            next_now(app, st);
             Ok(())
         }),
         ID_BAN => spawn_action(app, "ban", ban_current_now),

@@ -108,6 +108,10 @@ server's address), an **On** switch and (except the main one) **Remove**:
   library answers: the playlist goes on with what can be played. Pressing Play
   or Next while it waits, with another library answering, gives up the saved
   position and plays on at once.
+- Play, Next and the menu bar icon are never silent: with an empty or
+  played-out playlist they start a fresh shuffle of everything ("All"), and
+  Next on a paused or cued track (the playlist restored paused on start)
+  plays the next track.
 - A removed library's id is never given to a new library.
 - Each track plays from its own library. While a library is offline (and
   another one answers) its tracks in the playlist are passed over without

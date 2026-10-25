@@ -376,6 +376,9 @@ impl Engine {
                     // Gave up waiting after too many failures: trying again.
                 } else if !self.nothing_loaded() || self.provider.is_some() {
                     self.pending_skips += 1;
+                    // Next plays the next track, also from a pause or a cue
+                    // (a skip nobody hears would look like a dead button).
+                    self.set_paused(false);
                 }
             }
             Command::SetVolume(v) => {

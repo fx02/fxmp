@@ -1244,6 +1244,47 @@ fn cue_loads_paused_at_the_position_and_play_continues_there() {
     assert!((10_000..11_000).contains(&ms), "continues from 10 s: {ms}");
 }
 
+#[test]
+fn next_on_a_cued_track_plays_the_next_one() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    let provider = FakeProvider {
+        items: vec![at(1, 500, 10_000), tone(2, 1500)].into(),
+        calls: h.calls.clone(),
+    };
+    h.player.send(Command::Cue(Box::new(provider)));
+    h.wait("cued", 5, |e| *e == Event::TrackStarted { id: 1 });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(h.output().is_empty(), "nothing plays while cued");
+    h.player.send(Command::Next);
+    h.wait("playing", 5, |e| *e == Event::Paused(false));
+    h.wait("next", 5, |e| *e == Event::TrackStarted { id: 2 });
+    std::thread::sleep(Duration::from_millis(400));
+    let heard = |x: &[f32]| x.iter().any(|v| v.abs() > AMP * 0.5);
+    assert!(heard(&h.output()), "the next track is heard");
+}
+
+#[test]
+fn next_on_a_paused_track_plays_the_next_one() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    h.play(vec![tone(1, 500), tone(2, 1500)]);
+    h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    h.player.send(Command::Pause);
+    h.wait("paused", 5, |e| *e == Event::Paused(true));
+    h.player.send(Command::Next);
+    h.wait("playing", 5, |e| *e == Event::Paused(false));
+    h.wait("next", 5, |e| *e == Event::TrackStarted { id: 2 });
+    let n = h.output().len();
+    std::thread::sleep(Duration::from_millis(400));
+    let heard = |x: &[f32]| x.iter().any(|v| v.abs() > AMP * 0.5);
+    assert!(heard(&h.output()[n..]), "the next track is heard");
+}
+
 /// Hands out a shared list; records which tracks started.
 struct SharedProvider {
     items: Arc<Mutex<VecDeque<PlayItem>>>,

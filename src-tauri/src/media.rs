@@ -71,12 +71,12 @@ fn create_controls(app: &AppHandle) -> Result<MediaControls, String> {
 fn on_media_event(app: &AppHandle, event: MediaControlEvent) {
     log::debug!("media key: {event:?}");
     match event {
-        MediaControlEvent::Toggle => spawn_action(app, "play/pause", |_, st| {
-            play_pause_now(st, Command::TogglePause);
+        MediaControlEvent::Toggle => spawn_action(app, "play/pause", |app, st| {
+            play_pause_now(app, st, Command::TogglePause);
             Ok(())
         }),
-        MediaControlEvent::Play => spawn_action(app, "play", |_, st| {
-            play_pause_now(st, Command::Resume);
+        MediaControlEvent::Play => spawn_action(app, "play", |app, st| {
+            play_pause_now(app, st, Command::Resume);
             Ok(())
         }),
         MediaControlEvent::Pause | MediaControlEvent::Stop => {
@@ -85,8 +85,8 @@ fn on_media_event(app: &AppHandle, event: MediaControlEvent) {
                 Ok(())
             })
         }
-        MediaControlEvent::Next => spawn_action(app, "next", |_, st| {
-            next_now(st);
+        MediaControlEvent::Next => spawn_action(app, "next", |app, st| {
+            next_now(app, st);
             Ok(())
         }),
         MediaControlEvent::Previous => spawn_action(app, "previous", |_, st| previous_now(st)),

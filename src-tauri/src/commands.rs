@@ -732,6 +732,9 @@ pub enum PlayAction {
     /// one answers: the saved position is given up and the playlist plays (its
     /// tracks of the offline library are passed over).
     PlayWithoutResume,
+    /// Nothing loaded and nothing due (an empty or played-out playlist): a fresh
+    /// shuffle of everything ("All") plays.
+    StartAll,
 }
 
 /// `loaded`: a track is playing, paused or cued; `pending`: the restored playlist
@@ -747,7 +750,7 @@ pub fn play_action(loaded: bool, pending: bool, has_next: bool, elsewhere: bool)
     } else if has_next {
         PlayAction::StartPlaylist
     } else {
-        PlayAction::Player
+        PlayAction::StartAll
     }
 }
 
@@ -755,7 +758,7 @@ pub fn play_action(loaded: bool, pending: bool, has_next: bool, elsewhere: bool)
 /// pressing Play is never silent while there is something to play. "Loaded" is
 /// what the engine reports (from a sent Play/Cue until it goes idle), not what
 /// the window shows.
-pub fn play_pause_now(st: &AppState, command: Command) {
+pub fn play_pause_now(app: &AppHandle, st: &AppState, command: Command) {
     press_play_pause(
         &st.resume,
         &st.engine,
@@ -772,6 +775,12 @@ pub fn play_pause_now(st: &AppState, command: Command) {
         command,
         |c| st.player.send(c),
         || st.play_playlist(),
+        || {
+            log::info!("Play pressed with nothing to play: shuffling everything");
+            if let Err(e) = play_genres_now(app, st, Vec::new()) {
+                log::warn!("cannot start a shuffle of everything: {e}");
+            }
+        },
     );
 }
 
@@ -780,6 +789,7 @@ pub fn play_pause_now(st: &AppState, command: Command) {
 /// `start_playlist` runs after the gate is let go (it takes it itself); before it,
 /// `give_up_resume` drops the saved position when the press moves on from a
 /// resume waiting on an offline library (`elsewhere`: another library answers).
+/// `start_all` (also after the gate is let go) replaces an empty playlist.
 #[allow(clippy::too_many_arguments)]
 pub fn press_play_pause(
     gate: &Mutex<ResumeGate>,
@@ -790,6 +800,7 @@ pub fn press_play_pause(
     command: Command,
     send: impl FnOnce(Command),
     start_playlist: impl FnOnce(),
+    start_all: impl FnOnce(),
 ) {
     let press = match command {
         Command::Resume => Press::Play,
@@ -819,17 +830,22 @@ pub fn press_play_pause(
             give_up_resume();
             start_playlist();
         }
+        PlayAction::StartAll => {
+            drop(gate);
+            start_all();
+        }
     }
 }
 
-/// Next from the UI, tray or media keys. While the restored playlist still waits
-/// for its library nothing is loaded to skip: it counts as Play (which moves on
-/// when another library answers, see [`play_pause_now`]).
-pub fn next_now(st: &AppState) {
-    if lock(&st.resume).pending && !lock(&st.engine).loaded() {
-        play_pause_now(st, Command::Resume);
-    } else {
+/// Next from the UI, tray or media keys. With nothing loaded to skip (the
+/// restored playlist still waits for its library, the playlist ran out or is
+/// empty) it counts as Play, which is never silent (see [`play_pause_now`]).
+/// A paused or cued track is skipped and the next one plays.
+pub fn next_now(app: &AppHandle, st: &AppState) {
+    if lock(&st.engine).loaded() {
         st.player.send(Command::Next);
+    } else {
+        play_pause_now(app, st, Command::Resume);
     }
 }
 
@@ -843,8 +859,8 @@ pub fn pause_now(st: &AppState) {
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn toggle_pause(app: AppHandle) -> CmdResult<()> {
-    run(app, |_, st| {
-        play_pause_now(st, Command::TogglePause);
+    run(app, |app, st| {
+        play_pause_now(app, st, Command::TogglePause);
         Ok(())
     })
     .await
@@ -852,8 +868,8 @@ pub async fn toggle_pause(app: AppHandle) -> CmdResult<()> {
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn next(app: AppHandle) -> CmdResult<()> {
-    run(app, |_, st| {
-        next_now(st);
+    run(app, |app, st| {
+        next_now(app, st);
         Ok(())
     })
     .await
@@ -1877,8 +1893,9 @@ mod tests {
         assert_eq!(play_action(false, true, true, true), PlayWithoutResume);
         // Nothing loaded (the playlist ran out or stopped): play it from what is due.
         assert_eq!(play_action(false, false, true, true), StartPlaylist);
-        // Nothing to play at all: the player is asked anyway (it may re-try).
-        assert_eq!(play_action(false, false, false, true), Player);
+        // Nothing to play at all: a shuffle of everything starts.
+        assert_eq!(play_action(false, false, false, true), StartAll);
+        assert_eq!(play_action(false, false, false, false), StartAll);
     }
 
     use crate::connection::ConnStatus as Status;
@@ -1922,6 +1939,7 @@ mod tests {
                 out.borrow_mut().push(kind(&c));
             },
             || out.borrow_mut().push("start"),
+            || unreachable!("something is due"),
         );
         assert_eq!(
             *out.borrow(),
@@ -1940,8 +1958,31 @@ mod tests {
             Command::TogglePause,
             |c| out.borrow_mut().push(kind(&c)),
             || out.borrow_mut().push("start"),
+            || unreachable!("something is due"),
         );
         assert_eq!(*out.borrow(), ["start"]);
+    }
+
+    #[test]
+    fn a_press_with_an_empty_playlist_shuffles_everything() {
+        let gate = Mutex::new(ResumeGate::default());
+        let engine = Mutex::new(Engine::Empty);
+        let out = std::cell::RefCell::new(Vec::new());
+        press_play_pause(
+            &gate,
+            &engine,
+            || false,
+            || false,
+            || unreachable!("no resume to give up"),
+            Command::TogglePause,
+            |c| out.borrow_mut().push(kind(&c)),
+            || unreachable!("nothing is due"),
+            || {
+                assert!(gate.try_lock().is_ok(), "the gate is let go first");
+                out.borrow_mut().push("all");
+            },
+        );
+        assert_eq!(*out.borrow(), ["all"]);
     }
 
     #[test]
@@ -1960,6 +2001,7 @@ mod tests {
             Command::Resume,
             |c| out.borrow_mut().push(kind(&c)),
             || start_with(&gate, &engine, || out.borrow_mut().push("start")),
+            || unreachable!("something is due"),
         );
         assert_eq!(*out.borrow(), ["give up the resume", "start"]);
         assert!(
@@ -1979,6 +2021,7 @@ mod tests {
             Command::Resume,
             |c| out.borrow_mut().push(kind(&c)),
             || out.borrow_mut().push("start"),
+            || unreachable!("something is due"),
         );
         assert!(out.borrow().is_empty());
         assert!(lock(&gate).play_requested);
@@ -2016,6 +2059,7 @@ mod tests {
                         Command::Resume,
                         |c| log.lock().unwrap().push(kind(&c)),
                         || start_with(&gate, &engine, || log.lock().unwrap().push("start")),
+                        || unreachable!("something is due"),
                     );
                 });
             });
