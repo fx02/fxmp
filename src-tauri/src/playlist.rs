@@ -12,7 +12,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use smp_core::catalog::{
     selection_key, Catalog, PlaylistCursor, SavedPlaylist, TrackFilter, TrackRow, YearCount,
@@ -20,6 +19,7 @@ use smp_core::catalog::{
 use smp_core::genre::UNKNOWN_KEY;
 use smp_core::m3u::{M3uTrack, M3uWriter};
 use smp_core::queue::{Entry, Queue, QueueState};
+use smp_core::shuffle::entropy_rng;
 use smp_core::TrackId;
 
 use crate::i18n;
@@ -105,7 +105,7 @@ pub struct Playlist {
 impl Default for Playlist {
     fn default() -> Self {
         Self {
-            queue: Queue::fixed(&[], StdRng::from_entropy()),
+            queue: Queue::fixed(&[], entropy_rng()),
             selection: Selection::Manual,
             generation: 0,
             saved_order: None,
@@ -140,7 +140,7 @@ impl Playlist {
 pub fn genres_queue(query: &Catalog, keys: &[String]) -> smp_core::Result<Queue<StdRng>> {
     let pool = query.playable_tracks(keys)?;
     let avoid = query.last_first(&selection_key(keys))?;
-    Ok(Queue::shuffled(&pool, avoid, StdRng::from_entropy()))
+    Ok(Queue::shuffled(&pool, avoid, entropy_rng()))
 }
 
 /// An album in track order, without banned tracks.
@@ -151,7 +151,7 @@ pub fn album_queue(query: &Catalog, artist: &str, album: &str) -> smp_core::Resu
         .into_iter()
         .filter(|id| !banned.contains(id))
         .collect();
-    Ok(Queue::fixed(&tracks, StdRng::from_entropy()))
+    Ok(Queue::fixed(&tracks, entropy_rng()))
 }
 
 /// The playable tracks of `filter`, as a set; `None` for an empty filter (all).
@@ -201,10 +201,7 @@ pub fn filtered_queue(
         base,
         filter: filter.clone(),
     };
-    Ok((
-        selection,
-        Queue::shuffled(&pool, current, StdRng::from_entropy()),
-    ))
+    Ok((selection, Queue::shuffled(&pool, current, entropy_rng())))
 }
 
 /// The selection's name in `lang`: "Trance + Chillout", "All", "Artist – Album",
@@ -534,14 +531,19 @@ pub fn previous_action(position_ms: u64, can_go_back: bool) -> PreviousAction {
 
 /// A playlist save: the order when it changed since the last save, and the cursor.
 pub struct SaveJob {
+    list: SharedPlaylist,
+    /// The playlist version the order is of.
+    version: (u64, u64),
     order: Option<(String, bool, Vec<Entry>)>,
     cursor: PlaylistCursor,
 }
 
 impl SaveJob {
+    /// Writes it; the order counts as saved only once this succeeded.
     pub fn run(self, c: &Catalog) -> smp_core::Result<()> {
         if let Some((selection, shuffle, order)) = &self.order {
             c.save_playlist_order(selection, *shuffle, order)?;
+            lock(&self.list).saved_order = Some(self.version);
         }
         c.save_playlist_cursor(&self.cursor)
     }
@@ -549,10 +551,9 @@ impl SaveJob {
 
 /// What to save of `list`; `position` is the last reported position (track, ms).
 pub fn save_job(list: &SharedPlaylist, position: Option<(TrackId, u64)>) -> SaveJob {
-    let mut l = lock(list);
+    let l = lock(list);
     let version = l.version();
     let order = (l.saved_order != Some(version)).then(|| {
-        l.saved_order = Some(version);
         let selection = serde_json::to_string(&l.selection).unwrap_or_else(|_| "{}".into());
         (selection, l.queue.is_shuffle(), l.queue.order().to_vec())
     });
@@ -565,6 +566,8 @@ pub fn save_job(list: &SharedPlaylist, position: Option<(TrackId, u64)>) -> Save
         _ => 0,
     };
     SaveJob {
+        list: list.clone(),
+        version,
         order,
         cursor: PlaylistCursor {
             cursor: state.cursor,
@@ -576,8 +579,8 @@ pub fn save_job(list: &SharedPlaylist, position: Option<(TrackId, u64)>) -> Save
     }
 }
 
-/// The saved playlist as it was, without tracks that are gone, banned or left out
-/// meanwhile. Its current track is due again at its position, unless the playlist
+/// The saved playlist as it was, without tracks that are gone or banned meanwhile,
+/// or left out of the shuffle (unless added by hand). Its current track is due again at its position, unless the playlist
 /// had ended or that track is gone (then the next one is due, from its start).
 pub fn restore(query: &Catalog, saved: SavedPlaylist) -> smp_core::Result<Playlist> {
     let selection = serde_json::from_str(&saved.selection).unwrap_or(Selection::Manual);
@@ -589,12 +592,29 @@ pub fn restore(query: &Catalog, saved: SavedPlaylist) -> smp_core::Result<Playli
         history: saved.cursor.history,
         history_pos: saved.cursor.history_pos,
     };
-    let mut queue = Queue::restore(state, resume, StdRng::from_entropy());
+    let mut queue = Queue::restore(state, resume, entropy_rng());
     let saved_version = queue.version();
-    let playable: HashSet<TrackId> = query
+    let mut playable: HashSet<TrackId> = query
         .filtered_tracks(&TrackFilter::default())?
         .into_iter()
         .collect();
+    // Added by hand (from the Unreadable list, say): kept unless gone or banned.
+    let manual: Vec<TrackId> = queue
+        .order()
+        .iter()
+        .filter(|e| e.manual && !playable.contains(&e.id))
+        .map(|e| e.id)
+        .collect();
+    if !manual.is_empty() {
+        let banned: HashSet<TrackId> = query.banned()?.into_iter().map(|t| t.id).collect();
+        playable.extend(
+            query
+                .tracks_by_ids(&manual)?
+                .into_iter()
+                .map(|t| t.id)
+                .filter(|id| !banned.contains(id)),
+        );
+    }
     queue.forget_where(|id| !playable.contains(&id));
     let current = queue.current().filter(|id| playable.contains(id));
     let mut list = Playlist {
@@ -842,7 +862,7 @@ mod tests {
     #[test]
     fn manual_edits_through_the_provider() {
         let fx = Fx::new();
-        lock(&fx.list).replace(Selection::Manual, Queue::fixed(&[], StdRng::from_entropy()));
+        lock(&fx.list).replace(Selection::Manual, Queue::fixed(&[], entropy_rng()));
         let mut p = fx.provider();
         assert_eq!(p.next_track(), None);
         lock(&fx.list).queue.append(&[1, 2]);
@@ -914,13 +934,94 @@ mod tests {
         assert_eq!((item.id, item.start_ms), (order[2], 0));
     }
 
+    /// Saves the playlist with `current` at `ms` and restores it, as on a restart.
+    fn saved_and_restored(fx: &Fx, current: TrackId, ms: u64) -> SharedPlaylist {
+        let job = save_job(&fx.list, Some((current, ms)));
+        fx.ctx.writer.call(move |c| job.run(c)).unwrap();
+        let saved = lock(&fx.query).load_playlist().unwrap().unwrap();
+        Arc::new(Mutex::new(restore(&lock(&fx.query), saved).unwrap()))
+    }
+
+    #[test]
+    fn the_resume_track_is_kept_while_the_share_is_unreachable() {
+        use smp_core::failure::{FailCode, Failure};
+        let fx = Fx::new();
+        let mut p = fx.play_genres(&["jazz"]);
+        take(&mut p);
+        let current = take(&mut p).unwrap();
+        let list = saved_and_restored(&fx, current, 42_000);
+        let mut p = CatalogProvider::new(fx.ctx.clone(), list.clone());
+        // WireGuard not up yet: every try fails with network trouble.
+        for _ in 0..25 {
+            let item = p.next_track().unwrap();
+            assert_eq!((item.id, item.start_ms), (current, 42_000));
+            p.on_failed(item.id, &Failure::new(FailCode::Unreachable, "no route"));
+        }
+        assert_eq!(lock(&list).resume_at, Some((current, 42_000)));
+        // A bad file is a different matter: the next one plays.
+        p.on_failed(current, &Failure::new(FailCode::Decode, "bad"));
+        assert_ne!(p.next_track().unwrap().id, current);
+    }
+
+    #[test]
+    fn the_order_counts_as_saved_only_once_written() {
+        let fx = Fx::new();
+        fx.play_genres(&["jazz"]);
+        let lost = save_job(&fx.list, None);
+        assert!(lost.order.is_some());
+        drop(lost); // never ran (the write failed or was not made)
+        let job = save_job(&fx.list, None);
+        assert!(job.order.is_some(), "still to be saved");
+        fx.ctx.writer.call(move |c| job.run(c)).unwrap();
+        assert!(save_job(&fx.list, None).order.is_none(), "saved now");
+    }
+
+    #[test]
+    fn restore_keeps_hand_added_tracks_that_failed() {
+        use smp_core::failure::{FailCode, Failure};
+        let fx = Fx::new();
+        let mut p = fx.play_genres(&["jazz"]);
+        let current = take(&mut p).unwrap();
+        let shuffled = row_ids(&fx.page(0, 100, None))[3];
+        // Track 1 (Trance) is in the Unreadable list and added by hand.
+        lock(&fx.list).queue.append(&[1]);
+        for id in [1, shuffled] {
+            for _ in 0..3 {
+                lock(&fx.query)
+                    .record_failure(id, &Failure::new(FailCode::Decode, "bad"), None)
+                    .unwrap();
+            }
+        }
+        let list = saved_and_restored(&fx, current, 0);
+        let order: Vec<TrackId> = lock(&list).queue.order().iter().map(|e| e.id).collect();
+        assert!(order.contains(&1), "added by hand: kept");
+        assert!(
+            !order.contains(&shuffled),
+            "left out of the shuffle: dropped"
+        );
+    }
+
+    #[test]
+    fn every_genre_run_shuffles_anew_and_avoids_the_last_first_track() {
+        let fx = Fx::new();
+        let key = selection_key(&["trance".to_string()]);
+        let last = lock(&fx.query).playable_tracks(&["trance".into()]).unwrap()[0];
+        lock(&fx.query).set_last_first(&key, last).unwrap();
+        let firsts: HashSet<TrackId> = (0..40)
+            .map(|_| {
+                let mut q = genres_queue(&lock(&fx.query), &["trance".into()]).unwrap();
+                let first = q.successor().unwrap();
+                assert_ne!(first, last, "not the first track of the last run");
+                first
+            })
+            .collect();
+        assert!(firsts.len() > 5, "entropy-seeded: {firsts:?}");
+    }
+
     #[test]
     fn an_ended_playlist_is_restored_without_a_track_to_resume() {
         let fx = Fx::new();
-        lock(&fx.list).replace(
-            Selection::Manual,
-            Queue::fixed(&[1], StdRng::from_entropy()),
-        );
+        lock(&fx.list).replace(Selection::Manual, Queue::fixed(&[1], entropy_rng()));
         let mut p = fx.provider();
         take(&mut p);
         assert_eq!(p.next_track(), None);
@@ -937,10 +1038,7 @@ mod tests {
     #[test]
     fn export_writes_m3u8_of_the_playlist_or_the_filtered_rows() {
         let fx = Fx::new();
-        lock(&fx.list).replace(
-            Selection::Manual,
-            Queue::fixed(&[3, 31, 1], StdRng::from_entropy()),
-        );
+        lock(&fx.list).replace(Selection::Manual, Queue::fixed(&[3, 31, 1], entropy_rng()));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Mix 2026-10-25.m3u8");
         assert_eq!(export_m3u8(&fx.list, &fx.query, &path, None).unwrap(), 3);

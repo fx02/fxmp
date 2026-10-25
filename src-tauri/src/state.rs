@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use smp_core::audio::output::CpalSinkFactory;
-use smp_core::audio::player::{Command, Event, Player, PlayerConfig};
+use smp_core::audio::player::{Command, Event, Player, PlayerConfig, TrackProvider};
 use smp_core::catalog::Catalog;
 use smp_core::genre::{migrate_selection, UNKNOWN_DISPLAY};
 use smp_core::scan::{scan_with, ScanOptions, ScanProgress};
@@ -42,6 +42,8 @@ pub const POSITION_EVENT: &str = "position";
 const PLAYLIST_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
 /// While playing, the position is saved this often.
 const POSITION_SAVE_EVERY: Duration = Duration::from_secs(10);
+/// Longest wait on quit for the playlist to be saved.
+const QUIT_SAVE_WAIT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NowPlaying {
@@ -138,6 +140,9 @@ pub struct AppState {
     pub playlist: SharedPlaylist,
     save_playlist: Mutex<Sender<()>>,
     playlist_saved_at: Mutex<Instant>,
+    /// The restored playlist waits for the share to be reachable (cleared once it
+    /// is cued, or once the user plays something else).
+    resume_pending: AtomicBool,
     scanning: AtomicBool,
     /// "Clear library" holds the scan slot: shown as such, not as a scan.
     clearing: AtomicBool,
@@ -222,6 +227,7 @@ impl AppState {
             playlist: Arc::new(Mutex::new(saved_playlist)),
             save_playlist: Mutex::new(save_tx),
             playlist_saved_at: Mutex::new(Instant::now()),
+            resume_pending: AtomicBool::new(true),
             scanning: AtomicBool::new(false),
             clearing: AtomicBool::new(false),
             cancel_scan: Arc::new(AtomicBool::new(false)),
@@ -271,8 +277,14 @@ impl AppState {
             .spawn(move || {
                 monitor(source, wake_rx, |status| {
                     log::info!("connection status: {status:?}");
-                    *lock(&handle.state::<AppState>().status) = Some(status);
+                    let st = handle.state::<AppState>();
+                    *lock(&st.status) = Some(status);
                     let _ = handle.emit("connection-status", StatusPayload::from(status));
+                    // At login the VPN may come up later: resume once the share answers,
+                    // or the saved track would fail and be passed over.
+                    if resume_due(&st.resume_pending, status) {
+                        st.resume_playlist();
+                    }
                 })
             })?;
 
@@ -289,7 +301,6 @@ impl AppState {
                         return; // Settings were saved meanwhile.
                     }
                     st.wake_monitor();
-                    st.resume_playlist();
                     if catalog_empty {
                         log::info!("catalog is empty: starting the first scan");
                         if let Err(e) = start_scan(&handle) {
@@ -317,12 +328,23 @@ impl AppState {
         playlist::save_job(&self.playlist, position)
     }
 
-    /// Saves the playlist now and waits for it (on quit).
+    /// Saves the playlist now and waits for it, briefly (on quit: a scan holding the
+    /// database must not hold up quitting).
     pub fn save_playlist_now(&self) {
         let job = self.playlist_save_job();
-        if let Err(e) = self.writer.call(move |c| job.run(c)) {
+        if let Err(e) = self
+            .writer
+            .call_timeout(QUIT_SAVE_WAIT, move |c| job.run(c))
+        {
             log::warn!("cannot save the playlist: {e}");
         }
+    }
+
+    /// Plays the playlist from what is due now (fading out what plays), as the user
+    /// asked; a held-back resume is dropped.
+    pub fn play_playlist(&self) {
+        self.resume_pending.store(false, Ordering::SeqCst);
+        self.player.send(Command::Play(self.provider()));
     }
 
     /// The playlist changed: tells the UI and saves it.
@@ -341,14 +363,16 @@ impl AppState {
         if !due {
             return;
         }
-        let provider = self.provider();
-        if start_paused(&self.settings.get()) {
-            log::info!("playlist restored, paused");
-            self.player.send(Command::Cue(provider));
-        } else {
-            log::info!("playlist restored, playing");
-            self.player.send(Command::Play(provider));
-        }
+        let command = resume_command(&self.settings.get(), self.provider());
+        log::info!(
+            "playlist restored, {}",
+            if matches!(command, Command::Cue(_)) {
+                "paused"
+            } else {
+                "playing"
+            }
+        );
+        self.player.send(command);
     }
 
     pub fn wake_monitor(&self) {
@@ -403,10 +427,20 @@ impl AppState {
     }
 }
 
-/// A restored playlist waits paused unless the user asked for it to play on start
-/// (start at login should not start music unasked).
-pub fn start_paused(s: &Settings) -> bool {
-    !s.resume_autoplay
+/// A restored playlist waits paused (`Cue`) unless the user asked for it to play on
+/// start (start at login should not start music unasked).
+pub fn resume_command(s: &Settings, provider: Box<dyn TrackProvider>) -> Command {
+    if s.resume_autoplay {
+        Command::Play(provider)
+    } else {
+        Command::Cue(provider)
+    }
+}
+
+/// Whether the held-back resume goes now: once, when the share is reachable.
+pub fn resume_due(pending: &AtomicBool, status: ConnStatus) -> bool {
+    matches!(status, ConnStatus::Ok | ConnStatus::Secondary)
+        && pending.swap(false, Ordering::SeqCst)
 }
 
 fn send_mix_settings(player: &Player, s: &Settings) {
@@ -720,7 +754,11 @@ pub fn clear_library(app: &AppHandle) -> Result<(), String> {
     st.player.send(Command::Stop);
     let cleared = st.writer.call(|c| c.clear());
     lock(&st.banned).clear();
-    *lock(&st.playlist) = Default::default();
+    // Replaced, not reset: its version keeps counting up.
+    lock(&st.playlist).replace(
+        playlist::Selection::Manual,
+        smp_core::queue::Queue::fixed(&[], smp_core::shuffle::entropy_rng()),
+    );
     *lock(&st.position) = None;
     let _ = app.emit(PLAYLIST_EVENT, ());
     st.settings.update(|s| s.last_selection.clear(), |_| {});
@@ -766,15 +804,45 @@ mod tests {
         assert!(np.paused);
     }
 
+    struct Nothing;
+    impl smp_core::audio::player::TrackProvider for Nothing {
+        fn next_track(&mut self) -> Option<smp_core::audio::player::PlayItem> {
+            None
+        }
+        fn on_failed(&mut self, _: TrackId, _: &smp_core::failure::Failure) {}
+        fn on_played(&mut self, _: TrackId, _: Option<f32>) {}
+    }
+
     #[test]
     fn a_restored_playlist_waits_paused_unless_asked_to_play() {
         let s = Settings::default();
         assert!(!s.resume_autoplay, "off by default");
-        assert!(start_paused(&s));
-        assert!(!start_paused(&Settings {
+        assert!(matches!(
+            resume_command(&s, Box::new(Nothing)),
+            Command::Cue(_)
+        ));
+        let on = Settings {
             resume_autoplay: true,
             ..s
-        }));
+        };
+        assert!(matches!(
+            resume_command(&on, Box::new(Nothing)),
+            Command::Play(_)
+        ));
+    }
+
+    #[test]
+    fn the_resume_waits_for_the_share_and_happens_once() {
+        let pending = AtomicBool::new(true);
+        assert!(
+            !resume_due(&pending, ConnStatus::Unreachable),
+            "VPN not up yet"
+        );
+        assert!(!resume_due(&pending, ConnStatus::Auth));
+        assert!(resume_due(&pending, ConnStatus::Secondary));
+        assert!(!resume_due(&pending, ConnStatus::Ok), "only once");
+        let played_meanwhile = AtomicBool::new(false);
+        assert!(!resume_due(&played_meanwhile, ConnStatus::Ok));
     }
 
     /// A scan of a slow source on its own thread, keeping `scanning` the way

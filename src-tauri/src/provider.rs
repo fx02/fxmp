@@ -82,13 +82,16 @@ impl TrackProvider for CatalogProvider {
 
     fn on_started(&mut self, id: TrackId) {
         let mut l = lock(&self.list);
-        l.queue.started(id);
+        let expected = l.queue.started(id);
         l.ended = false;
         if l.resume_at.is_some_and(|r| r.0 == id) {
             l.resume_at = None;
         }
         let key = match &l.selection {
-            Selection::Genres { keys } if !l.first_recorded => Some(selection_key(keys)),
+            // Not a track of an older selection that started just as this one came.
+            Selection::Genres { keys } if expected && !l.first_recorded => {
+                Some(selection_key(keys))
+            }
             _ => None,
         };
         if let Some(key) = key {
@@ -107,7 +110,10 @@ impl TrackProvider for CatalogProvider {
             c.record_failure(id, &failure, server).map(drop)
         });
         let mut l = lock(&self.list);
-        if transient {
+        if transient && l.resume_at.is_some_and(|r| r.0 == id) {
+            // The share is not up yet (at login, before the VPN): keep the track to
+            // resume and where, rather than walking the playlist.
+        } else if transient {
             // Network trouble is not the file's fault: it stays in the playlist.
             l.queue.pass_over(id);
         } else {
@@ -261,6 +267,23 @@ mod tests {
             fx.flush();
             assert_eq!(fx.query.last_first(&key).unwrap(), Some(id));
         }
+    }
+
+    #[test]
+    fn a_track_of_the_old_selection_is_not_recorded_as_the_first() {
+        let (fx, trance) = Fx::with_genres();
+        let keys = vec!["jazz".to_string()];
+        let mut p = fx.shuffle(&keys);
+        // The old selection's prepared track starts before Play reaches the player.
+        p.on_started(trance[0]);
+        fx.flush();
+        assert_eq!(fx.query.last_first(&selection_key(&keys)).unwrap(), None);
+        let first = take_item(&mut p);
+        fx.flush();
+        assert_eq!(
+            fx.query.last_first(&selection_key(&keys)).unwrap(),
+            Some(first.id)
+        );
     }
 
     #[test]

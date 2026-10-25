@@ -306,7 +306,7 @@ pub async fn get_genres(app: AppHandle) -> CmdResult<Vec<Genre>> {
 pub fn play_genres_now(app: &AppHandle, st: &AppState, keys: Vec<String>) -> CmdResult<()> {
     let queue = playlist::genres_queue(&lock(&st.query), &keys).map_err(db_err)?;
     lock(&st.playlist).replace(Selection::Genres { keys: keys.clone() }, queue);
-    st.player.send(Command::Play(st.provider()));
+    st.play_playlist();
     st.settings.update(|s| s.last_selection = keys, |_| {});
     // The tray's genre menu lists the last selection.
     tray::refresh_genres(app);
@@ -324,7 +324,7 @@ pub async fn play_album(app: AppHandle, artist: String, album: String) -> CmdRes
     run(app, move |app, st| {
         let queue = playlist::album_queue(&lock(&st.query), &artist, &album).map_err(db_err)?;
         lock(&st.playlist).replace(Selection::Album { artist, album }, queue);
-        st.player.send(Command::Play(st.provider()));
+        st.play_playlist();
         st.playlist_changed(app);
         Ok(())
     })
@@ -373,7 +373,7 @@ pub fn previous_now(st: &AppState) -> CmdResult<()> {
             }
         }
     }
-    st.player.send(Command::Play(st.provider()));
+    st.play_playlist();
     st.save_playlist_soon();
     Ok(())
 }
@@ -442,7 +442,7 @@ pub async fn playlist_jump(app: AppHandle, index: usize, id: TrackId) -> CmdResu
             l.queue.jump(index);
             l.resume_at = None;
         }
-        st.player.send(Command::Play(st.provider()));
+        st.play_playlist();
         st.save_playlist_soon();
         Ok(())
     })
@@ -571,7 +571,7 @@ pub async fn playlist_move(app: AppHandle, from: usize, to: usize, id: TrackId) 
 pub async fn playlist_new(app: AppHandle) -> CmdResult<()> {
     run(app, |app, st| {
         edit_playlist(app, st, |l| {
-            let empty = smp_core::queue::Queue::fixed(&[], rand::SeedableRng::from_entropy());
+            let empty = smp_core::queue::Queue::fixed(&[], smp_core::shuffle::entropy_rng());
             l.replace(Selection::Manual, empty);
             Ok(())
         })
@@ -589,7 +589,7 @@ pub async fn playlist_play_filtered(app: AppHandle, filter: QueueFilter) -> CmdR
             return Err(i18n::t("err.filter_empty"));
         }
         lock(&st.playlist).replace(selection, queue);
-        st.player.send(Command::Play(st.provider()));
+        st.play_playlist();
         st.playlist_changed(app);
         Ok(())
     })
