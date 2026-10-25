@@ -144,9 +144,10 @@ pub fn selection_key(genre_keys: &[String]) -> String {
 /// The columns of `tracks` as this version creates it: a path is unique within its
 /// library (see the unique index made in `add_missing_columns`). Older catalogs get
 /// the later columns added ([`ADDED_TRACK_COLUMNS`]) and the table rebuilt
-/// (migration 5).
+/// (migration 5). `AUTOINCREMENT`: the id of a deleted track is never given to
+/// another file (a ban or a playlist entry still holding it would hit that file).
 const TRACKS_COLUMNS: &str = "
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     rel_path TEXT NOT NULL,
     size INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
@@ -2942,6 +2943,32 @@ mod tests {
 
     fn library_of(c: &Catalog, id: TrackId) -> LibraryId {
         c.track(id).unwrap().library_id
+    }
+
+    #[test]
+    fn ids_of_deleted_tracks_are_not_given_out_again() {
+        let c = Catalog::open_in_memory().unwrap();
+        let m = TrackMeta::default();
+        c.upsert_track(1, "a.mp3", 1, 1, &m).unwrap();
+        let last = c.upsert_track(2, "b.mp3", 1, 1, &m).unwrap();
+        c.remove_library(2).unwrap();
+        let new = c.upsert_track(1, "c.mp3", 1, 1, &m).unwrap();
+        assert!(new > last, "{new} reuses a deleted id");
+        // Also in a catalog migrated from version 4.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        v4_catalog(&db);
+        let c = Catalog::open(&db).unwrap();
+        c.begin_scan(DEFAULT_LIBRARY).unwrap();
+        for p in ["Rock/a.mp3", "Rock/b.mp3", "Jazz/c.mp3"] {
+            c.mark_seen(DEFAULT_LIBRARY, p).unwrap();
+        }
+        assert_eq!(
+            c.finish_scan(DEFAULT_LIBRARY, &[]).unwrap(),
+            1,
+            "track 4 swept"
+        );
+        assert_eq!(c.upsert_track(1, "new.mp3", 1, 1, &m).unwrap(), 5);
     }
 
     #[test]

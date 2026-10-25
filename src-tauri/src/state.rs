@@ -1241,6 +1241,18 @@ pub fn delete_library_tracks(st: &AppState, ids: &[LibraryId]) -> Result<(), Str
     Ok(())
 }
 
+/// Drops from the bans of this run the tracks no longer in the catalog.
+pub fn forget_deleted_bans(banned: &BannedSet, catalog: &Catalog) -> smp_core::Result<()> {
+    let ids: Vec<TrackId> = lock(banned).iter().copied().collect();
+    let known: std::collections::HashSet<TrackId> = catalog
+        .tracks_by_ids(&ids)?
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    lock(banned).retain(|id| known.contains(id));
+    Ok(())
+}
+
 /// Removes library `id` (not the first one): stops a scan (no scan starts until
 /// it is done), drops the library from the settings, deletes its tracks and takes
 /// them out of the playlist, and forgets its passwords.
@@ -1275,6 +1287,9 @@ pub fn remove_library(app: &AppHandle, id: LibraryId) -> Result<(), String> {
                 log::warn!("library {id}: password not deleted: {e}");
             }
         }
+    }
+    if let Err(e) = forget_deleted_bans(&st.banned, &lock(&st.query)) {
+        log::warn!("bans after removing library {id}: {e}");
     }
     if let Err(e) = prune_playlist(app, &st) {
         log::warn!("playlist after removing library {id}: {e}");
@@ -1773,5 +1788,18 @@ mod tests {
         assert!(woken.try_recv().is_err());
         live.recheck(2);
         assert!(woken.try_recv().is_ok());
+    }
+
+    #[test]
+    fn bans_of_deleted_tracks_are_forgotten() {
+        let c = Catalog::open_in_memory().unwrap();
+        let m = smp_core::catalog::TrackMeta::default();
+        let keep = c.upsert_track(1, "a.mp3", 1, 1, &m).unwrap();
+        let gone = c.upsert_track(2, "b.mp3", 1, 1, &m).unwrap();
+        let banned = BannedSet::default();
+        lock(&banned).extend([keep, gone]);
+        c.remove_library(2).unwrap();
+        forget_deleted_bans(&banned, &c).unwrap();
+        assert_eq!(lock(&banned).iter().copied().collect::<Vec<_>>(), [keep]);
     }
 }
