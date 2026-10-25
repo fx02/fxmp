@@ -187,7 +187,11 @@ fn sync_catalog(
         last: None,
     };
 
-    // Unchanged files only need marking; the rest go to the workers.
+    // Unchanged files only need marking; the rest go to the workers. A backup
+    // server's copy of the same size counts as unchanged whatever its mtime (a
+    // copy that did not keep the times would otherwise be read again in full,
+    // losing every measured loudness, and again at the next primary scan).
+    let backup = report.from_backup;
     let mut to_read = Vec::new();
     'chunks: for chunk in entries.chunks(CHUNK) {
         if cancel.load(Ordering::Relaxed) {
@@ -198,7 +202,12 @@ fn sync_catalog(
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                if c.file_unchanged(library, &e.rel_path, e.size, e.mtime)? {
+                let unchanged = if backup {
+                    c.file_same_size(library, &e.rel_path, e.size)?
+                } else {
+                    c.file_unchanged(library, &e.rel_path, e.size, e.mtime)?
+                };
+                if unchanged {
                     c.mark_seen(library, &e.rel_path)?;
                     report.unchanged += 1;
                     rep.state.seen += 1;
@@ -1436,6 +1445,50 @@ mod tests {
             }
         }
         crate::source::FailoverSource::new(Box::new(Down), Some(Box::new(LocalSource::new(backup))))
+    }
+
+    #[test]
+    fn a_backup_copy_of_the_same_size_counts_as_unchanged_whatever_its_mtime() {
+        let primary = library_dir(&["Jazz/a.mp3", "Rock/b.mp3"]);
+        let mut cat = Catalog::open_in_memory().unwrap();
+        scan_lib(1, &LocalSource::new(primary.path()), &mut cat).unwrap();
+        let ids = cat.playable_tracks(&[]).unwrap();
+        for id in &ids {
+            cat.set_measured_lufs(*id, -9.5).unwrap();
+        }
+        let before = cat.tracks_by_ids(&ids).unwrap();
+        // The backup's copies were made without keeping the times; b.mp3 differs.
+        let backup = library_dir(&["Jazz/a.mp3", "Rock/b.mp3", "Pop/new.mp3"]);
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for p in ["Jazz/a.mp3", "Rock/b.mp3"] {
+            let f = fs::File::options()
+                .append(true)
+                .open(backup.path().join(p))
+                .unwrap();
+            if p == "Rock/b.mp3" {
+                f.set_len(f.metadata().unwrap().len() + 1).unwrap();
+            }
+            f.set_modified(old).unwrap();
+        }
+        let r = scan_lib(1, &backup_walk(backup.path()), &mut cat).unwrap();
+        assert!(r.from_backup);
+        assert_eq!(
+            (r.unchanged, r.read),
+            (1, 2),
+            "only the new and the resized file are read"
+        );
+        let a = before.iter().find(|t| t.rel_path == "Jazz/a.mp3").unwrap();
+        assert_eq!(&cat.track(a.id).unwrap(), a, "tags, loudness and year kept");
+        let b = before.iter().find(|t| t.rel_path == "Rock/b.mp3").unwrap();
+        assert_eq!(
+            cat.track(b.id).unwrap().measured_lufs,
+            None,
+            "a changed file is measured again"
+        );
+        // From the primary, the times count again (they match the catalog).
+        let r = scan_lib(1, &LocalSource::new(primary.path()), &mut cat).unwrap();
+        assert_eq!(r.read, 1, "only b.mp3 (its size changed back)");
+        assert_eq!(cat.track(a.id).unwrap().measured_lufs, Some(-9.5));
     }
 
     #[test]

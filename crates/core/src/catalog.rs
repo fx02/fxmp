@@ -665,6 +665,19 @@ impl Catalog {
         Ok(hit)
     }
 
+    /// A known track with this size that needs no new tag read, whatever its
+    /// mtime: how a backup server's copy is judged (copies often lose the time).
+    pub fn file_same_size(&self, library: LibraryId, rel_path: &str, size: u64) -> Result<bool> {
+        let hit = self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM tracks
+                 WHERE library_id=?3 AND rel_path=?1 AND size=?2 AND needs_retag=0",
+            )?
+            .exists(params![rel_path, size as i64, library])?;
+        Ok(hit)
+    }
+
     /// Insert or update a track by library and path after reading its tags; marks
     /// it present. A changed file loses its measured loudness and stored failure, a
     /// tag failure is cleared; the failure count is left to
