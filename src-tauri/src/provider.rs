@@ -1,21 +1,22 @@
-//! Track providers over the catalog: a genre shuffle or an album in order.
+//! The track provider over the catalog: hands the player the playlist's tracks.
 //!
 //! The player calls a provider on its audio engine thread, so a provider only reads
 //! (on a connection of its own, which a scan's write transaction never blocks under
-//! WAL) and hands every write to the [`CatalogWriter`].
+//! WAL) and hands every write to the [`CatalogWriter`]. The playlist itself is
+//! shared with the commands (see [`crate::playlist`]); its lock is held only briefly.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use rand::rngs::StdRng;
 use smp_core::audio::dsp::track_gain_db;
 use smp_core::audio::player::{PlayItem, TrackProvider};
 use smp_core::catalog::{selection_key, Catalog};
 use smp_core::failure::Failure;
-use smp_core::shuffle::{entropy_shuffler, Shuffler};
 use smp_core::source::Which;
 use smp_core::TrackId;
 
+use crate::playlist::{Selection, SharedPlaylist};
+use crate::state::lock;
 use crate::writer::CatalogWriter;
 
 /// Tracks banned while the app runs, so a running shuffle stops handing them out.
@@ -34,125 +35,84 @@ pub struct Playback {
     pub active_server: ActiveServer,
 }
 
-enum Order {
-    Shuffle {
-        shuffler: Box<Shuffler<StdRng>>,
-        selection_key: String,
-        first_recorded: bool,
-    },
-    Album(VecDeque<TrackId>),
-}
-
+/// Plays the shared playlist. Several can exist (one per `Play`); they all work on
+/// the same playlist.
 pub struct CatalogProvider {
     ctx: Playback,
-    order: Order,
+    list: SharedPlaylist,
 }
 
 impl CatalogProvider {
-    /// Fresh shuffle of the playable tracks in `genre_keys` (empty = everything);
-    /// `query` is used to build the pool.
-    pub fn shuffle(
-        query: &Catalog,
-        ctx: Playback,
-        genre_keys: &[String],
-    ) -> smp_core::Result<Self> {
-        let selection_key = selection_key(genre_keys);
-        let shuffler = entropy_shuffler(
-            query.playable_tracks(genre_keys)?,
-            query.last_first(&selection_key)?,
-        );
-        Ok(Self {
-            ctx,
-            order: Order::Shuffle {
-                shuffler: Box::new(shuffler),
-                selection_key,
-                first_recorded: false,
-            },
-        })
-    }
-
-    /// An album in track order, without banned tracks.
-    pub fn album(
-        query: &Catalog,
-        ctx: Playback,
-        artist: &str,
-        album: &str,
-    ) -> smp_core::Result<Self> {
-        let banned: HashSet<TrackId> = query.banned()?.into_iter().map(|t| t.id).collect();
-        let tracks = query
-            .album_tracks(artist, album)?
-            .into_iter()
-            .filter(|id| !banned.contains(id))
-            .collect();
-        Ok(Self {
-            ctx,
-            order: Order::Album(tracks),
-        })
-    }
-
-    fn next_id(&mut self) -> Option<TrackId> {
-        match &mut self.order {
-            Order::Shuffle { shuffler, .. } => shuffler.next(),
-            Order::Album(q) => q.pop_front(),
-        }
-    }
-
-    fn forget(&mut self, id: TrackId) {
-        match &mut self.order {
-            Order::Shuffle { shuffler, .. } => shuffler.remove(id),
-            Order::Album(q) => q.retain(|&t| t != id),
-        }
+    pub fn new(ctx: Playback, list: SharedPlaylist) -> Self {
+        Self { ctx, list }
     }
 }
 
 impl TrackProvider for CatalogProvider {
     fn next_track(&mut self) -> Option<PlayItem> {
         loop {
-            let id = self.next_id()?;
-            if crate::state::lock(&self.ctx.banned).contains(&id) {
-                self.forget(id);
+            let (id, start_ms) = {
+                let mut l = lock(&self.list);
+                let id = l.queue.successor()?;
+                let start = l.resume_at.filter(|r| r.0 == id).map_or(0, |r| r.1);
+                (id, start)
+            };
+            if lock(&self.ctx.banned).contains(&id) {
+                lock(&self.list).queue.forget(id);
                 continue;
             }
-            let row = crate::state::lock(&self.ctx.db).track(id);
+            let row = lock(&self.ctx.db).track(id);
             let row = match row {
                 Ok(row) => row,
                 Err(e) => {
-                    // Removed by a rescan since the run started.
+                    // Removed by a rescan since the playlist was made.
                     log::debug!("track {id} unavailable: {e}");
-                    self.forget(id);
+                    lock(&self.list).queue.forget(id);
                     continue;
                 }
             };
-            if let Order::Shuffle {
-                selection_key,
-                first_recorded,
-                ..
-            } = &mut self.order
-            {
-                if !*first_recorded {
-                    *first_recorded = true;
-                    let key = selection_key.clone();
-                    self.ctx
-                        .writer
-                        .send("first track", move |c| c.set_last_first(&key, id));
-                }
-            }
             return Some(PlayItem {
                 id,
                 rel_path: row.rel_path,
                 gain_db: track_gain_db(row.meta.rg_track_gain_db, row.measured_lufs),
-                start_ms: 0,
+                start_ms,
             });
         }
     }
 
+    fn on_started(&mut self, id: TrackId) {
+        let mut l = lock(&self.list);
+        l.queue.started(id);
+        l.ended = false;
+        if l.resume_at.is_some_and(|r| r.0 == id) {
+            l.resume_at = None;
+        }
+        let key = match &l.selection {
+            Selection::Genres { keys } if !l.first_recorded => Some(selection_key(keys)),
+            _ => None,
+        };
+        if let Some(key) = key {
+            l.first_recorded = true;
+            self.ctx
+                .writer
+                .send("first track", move |c| c.set_last_first(&key, id));
+        }
+    }
+
     fn on_failed(&mut self, id: TrackId, failure: &Failure) {
+        let transient = failure.code.is_transient();
         let failure = failure.clone();
         let server = (self.ctx.active_server)();
         self.ctx.writer.send("failure", move |c| {
             c.record_failure(id, &failure, server).map(drop)
         });
-        self.forget(id);
+        let mut l = lock(&self.list);
+        if transient {
+            // Network trouble is not the file's fault: it stays in the playlist.
+            l.queue.pass_over(id);
+        } else {
+            l.queue.forget(id);
+        }
     }
 
     fn on_played(&mut self, id: TrackId, measured_lufs: Option<f32>) {
@@ -169,9 +129,23 @@ impl TrackProvider for CatalogProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playlist::{album_queue, genres_queue};
     use smp_core::catalog::TrackMeta;
     use smp_core::failure::FailCode;
     use std::time::{Duration, Instant};
+
+    /// As the player does: ask for the next track, then start it.
+    fn take_item(p: &mut CatalogProvider) -> PlayItem {
+        let item = p.next_track().unwrap();
+        p.on_started(item.id);
+        item
+    }
+
+    fn take(p: &mut CatalogProvider) -> Option<TrackId> {
+        let item = p.next_track()?;
+        p.on_started(item.id);
+        Some(item.id)
+    }
 
     fn decode_failure() -> Failure {
         Failure::new(FailCode::Decode, "bad frame")
@@ -229,7 +203,15 @@ mod tests {
         }
 
         fn shuffle(&self, keys: &[String]) -> CatalogProvider {
-            CatalogProvider::shuffle(&self.query, self.ctx.clone(), keys).unwrap()
+            let q = genres_queue(&self.query, keys).unwrap();
+            let list = SharedPlaylist::default();
+            lock(&list).replace(
+                Selection::Genres {
+                    keys: keys.to_vec(),
+                },
+                q,
+            );
+            CatalogProvider::new(self.ctx.clone(), list)
         }
 
         /// Waits until queued writes are done.
@@ -246,13 +228,13 @@ mod tests {
 
         let mut p = fx.shuffle(&keys);
         assert_eq!(fx.query.last_first(&key).unwrap(), None);
-        let first = p.next_track().unwrap();
+        let first = take_item(&mut p);
         assert!(trance.contains(&first.id));
         fx.flush();
         assert_eq!(fx.query.last_first(&key).unwrap(), Some(first.id));
 
         // Only the first track of the run is recorded.
-        let second = p.next_track().unwrap();
+        let second = take_item(&mut p);
         assert_ne!(second.id, first.id);
         fx.flush();
         assert_eq!(fx.query.last_first(&key).unwrap(), Some(first.id));
@@ -260,7 +242,7 @@ mod tests {
         // A failed track is counted in the catalog and leaves this run's shuffle.
         p.on_failed(second.id, &decode_failure());
         for _ in 0..20 {
-            assert_ne!(p.next_track().unwrap().id, second.id);
+            assert_ne!(take_item(&mut p).id, second.id);
         }
         p.on_failed(second.id, &decode_failure());
         p.on_failed(second.id, &decode_failure());
@@ -274,7 +256,7 @@ mod tests {
         // The next run of the same selection avoids the previous first track.
         for _ in 0..20 {
             let prev = fx.query.last_first(&key).unwrap();
-            let id = fx.shuffle(&keys).next_track().unwrap().id;
+            let id = take_item(&mut fx.shuffle(&keys)).id;
             assert_ne!(Some(id), prev);
             fx.flush();
             assert_eq!(fx.query.last_first(&key).unwrap(), Some(id));
@@ -285,7 +267,7 @@ mod tests {
     fn failures_are_stored_with_reason_and_server() {
         let (fx, _) = Fx::with_genres();
         let mut p = fx.shuffle(&["jazz".to_string()]);
-        let item = p.next_track().unwrap();
+        let item = take_item(&mut p);
         p.on_failed(item.id, &Failure::new(FailCode::NotFound, "not found"));
         fx.flush();
         let u = fx.query.unreadable().unwrap();
@@ -300,7 +282,7 @@ mod tests {
     fn on_played_resets_failures_and_stores_loudness() {
         let (fx, _) = Fx::with_genres();
         let mut p = fx.shuffle(&["jazz".to_string()]);
-        let item = p.next_track().unwrap();
+        let item = take_item(&mut p);
         assert_eq!(item.gain_db, 0.0, "no ReplayGain, not measured yet");
         p.on_failed(item.id, &decode_failure());
         p.on_failed(item.id, &decode_failure());
@@ -346,8 +328,11 @@ mod tests {
         let t2 = track(&fx.query, "al/2.mp3", "Rock", Some(("Album", 2)));
         fx.query.set_banned(t2, true).unwrap();
 
-        let mut p = CatalogProvider::album(&fx.query, fx.ctx.clone(), "Artist", "Album").unwrap();
-        let got: Vec<_> = std::iter::from_fn(|| p.next_track().map(|i| i.id)).collect();
+        let list = SharedPlaylist::default();
+        let q = album_queue(&fx.query, "Artist", "Album").unwrap();
+        lock(&list).replace(Selection::Manual, q);
+        let mut p = CatalogProvider::new(fx.ctx.clone(), list);
+        let got: Vec<_> = std::iter::from_fn(|| take(&mut p)).collect();
         assert_eq!(got, vec![t1, t3]);
     }
 
@@ -357,7 +342,7 @@ mod tests {
         let mut p = fx.shuffle(&["trance".into()]);
         fx.ctx.banned.lock().unwrap().insert(trance[0]);
         for _ in 0..30 {
-            assert_ne!(p.next_track().unwrap().id, trance[0]);
+            assert_ne!(take_item(&mut p).id, trance[0]);
         }
     }
 
@@ -383,7 +368,7 @@ mod tests {
         locked_rx.recv().unwrap();
 
         let t = Instant::now();
-        let item = p.next_track().unwrap();
+        let item = take_item(&mut p);
         p.on_played(item.id, Some(-20.0));
         let other = *ids.iter().find(|&&i| i != item.id).unwrap();
         p.on_failed(other, &decode_failure());

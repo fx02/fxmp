@@ -57,6 +57,8 @@ pub struct Settings {
     pub last_selection: Vec<String>,
     /// UI language code (a file in `ui/locales`).
     pub language: String,
+    /// A restored playlist plays on start (else it waits, paused, where it stopped).
+    pub resume_autoplay: bool,
 }
 
 impl Default for Settings {
@@ -73,6 +75,7 @@ impl Default for Settings {
             autostart: false,
             last_selection: Vec::new(),
             language: i18n::DEFAULT_LANGUAGE.into(),
+            resume_autoplay: false,
         }
     }
 }
@@ -260,6 +263,9 @@ mod tests {
         assert_eq!(s.device, None);
         assert!(s.last_selection.is_empty());
         assert_eq!(s.language, "en");
+        assert!(!s.resume_autoplay);
+        let old: Settings = serde_json::from_str(r#"{"volume": 0.5}"#).unwrap();
+        assert!(!old.resume_autoplay, "settings from before the option");
     }
 
     #[test]
@@ -296,6 +302,7 @@ mod tests {
             autostart: true,
             last_selection: vec!["rock".into()],
             language: "hr".into(),
+            resume_autoplay: true,
         }
     }
 

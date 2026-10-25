@@ -4,6 +4,7 @@
   "player.pause": "Pauza",
   "player.resume": "Nastavi",
   "player.next": "Sljedeća",
+  "player.previous": "Prethodna",
   "player.ban": "Nikad više ne puštaj ovu pjesmu",
   "player.ban_label": "Zabrani pjesmu",
   "player.ban_confirm": "Sigurno?",
@@ -159,5 +160,12 @@
   "err.keychain_delete": "Lozinku nije moguće obrisati iz keychaina: {error}",
   "err.clear_busy": "Skeniranje se nije zaustavilo pa biblioteka nije ispražnjena. Pokušaj ponovno.",
   "err.clearing": "Biblioteka se prazni.",
-  "err.language": "Nepoznat jezik: {code}"
+  "err.language": "Nepoznat jezik: {code}",
+  "playlist.all": "Sve",
+  "playlist.manual": "Moj popis",
+  "playlist.filtered": "{name} (filtrirano)",
+  "settings.resume_autoplay": "Pri pokretanju automatski nastavi svirati",
+  "err.playlist_changed": "Popis se u međuvremenu promijenio. Pokušaj ponovno.",
+  "err.filter_empty": "Nijedna pjesma ne odgovara filtru.",
+  "err.export": "Ne mogu spremiti popis: {error}"
 }

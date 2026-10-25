@@ -13,6 +13,8 @@ use souvlaki::{MediaControls, MediaMetadata, MediaPlayback};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
+#[cfg(target_os = "macos")]
+use crate::commands::{previous_now, spawn_action};
 use crate::state::{self, lock, AppState, NowPlaying};
 #[cfg(target_os = "macos")]
 use crate::tray::show_main_window;
@@ -73,6 +75,9 @@ fn on_media_event(app: &AppHandle, event: MediaControlEvent) {
         MediaControlEvent::Play => Command::Resume,
         MediaControlEvent::Pause | MediaControlEvent::Stop => Command::Pause,
         MediaControlEvent::Next => Command::Next,
+        MediaControlEvent::Previous => {
+            return spawn_action(app, "previous", |_, st| previous_now(st));
+        }
         MediaControlEvent::Raise => return show_main_window(app),
         _ => return,
     };
@@ -148,6 +153,7 @@ mod tests {
 
     fn np(artist: &str, title: &str, year: Option<u16>) -> NowPlaying {
         NowPlaying {
+            duration_ms: None,
             id: 1,
             artist: artist.into(),
             title: title.into(),

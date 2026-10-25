@@ -20,7 +20,8 @@ use tauri::{AppHandle, Emitter, Listener, Manager};
 use crate::connection::{monitor, AppSource, ConnStatus, Servers, StatusPayload};
 use crate::credentials::{CredentialStore, Keychain};
 use crate::i18n;
-use crate::provider::{BannedSet, Playback};
+use crate::playlist::{self, SharedPlaylist};
+use crate::provider::{BannedSet, CatalogProvider, Playback};
 use crate::settings::{self, Settings, SettingsStore};
 use crate::writer::CatalogWriter;
 
@@ -33,6 +34,14 @@ const UNREADABLE_DEBOUNCE: Duration = Duration::from_secs(1);
 const CLEAR_SCAN_WAIT: Duration = Duration::from_secs(30);
 /// Tells the UI that the "Unreadable" list changed.
 pub const UNREADABLE_EVENT: &str = "unreadable-changed";
+/// Tells the UI that the playlist was replaced or its order changed.
+pub const PLAYLIST_EVENT: &str = "playlist-changed";
+/// Where the playing track is (see [`PositionPayload`]).
+pub const POSITION_EVENT: &str = "position";
+/// Playlist changes come in bursts: they are saved once they settle this long.
+const PLAYLIST_SAVE_DEBOUNCE: Duration = Duration::from_secs(1);
+/// While playing, the position is saved this often.
+const POSITION_SAVE_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NowPlaying {
@@ -43,6 +52,18 @@ pub struct NowPlaying {
     pub year: Option<u16>,
     pub genre_display: String,
     pub paused: bool,
+    /// From the catalog; the `position` event also has the decoder's when this is
+    /// unknown.
+    pub duration_ms: Option<u64>,
+}
+
+/// The `position` event: `position_ms` of track `id` have played. `duration_ms`
+/// comes from the catalog, else from the decoder; none if neither knows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PositionPayload {
+    pub id: TrackId,
+    pub position_ms: u64,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +130,14 @@ pub struct AppState {
     pub status: Mutex<Option<ConnStatus>>,
     wake_monitor: Mutex<Sender<()>>,
     pub now_playing: Mutex<Option<NowPlaying>>,
+    /// The player is paused (also before a track is loaded).
+    pub paused: AtomicBool,
+    /// The last reported position.
+    pub position: Mutex<Option<PositionPayload>>,
+    /// The playlist, shared with the providers the player pulls from.
+    pub playlist: SharedPlaylist,
+    save_playlist: Mutex<Sender<()>>,
+    playlist_saved_at: Mutex<Instant>,
     scanning: AtomicBool,
     /// "Clear library" holds the scan slot: shown as such, not as a scan.
     clearing: AtomicBool,
@@ -142,6 +171,17 @@ impl AppState {
         settings.last_selection = migrate_selection(&settings.last_selection);
         let query = Catalog::open(&catalog_path)?;
         let catalog_empty = query.is_empty()?;
+        let saved_playlist = match query.load_playlist() {
+            Ok(Some(saved)) => playlist::restore(&query, saved).unwrap_or_else(|e| {
+                log::warn!("cannot restore the playlist: {e}");
+                Default::default()
+            }),
+            Ok(None) => Default::default(),
+            Err(e) => {
+                log::warn!("cannot read the saved playlist: {e}");
+                Default::default()
+            }
+        };
         let playback_db = Catalog::open(&catalog_path)?;
         let writer = CatalogWriter::spawn(Catalog::open(&catalog_path)?)?;
         let creds: Arc<dyn CredentialStore> = Arc::new(Keychain);
@@ -163,6 +203,7 @@ impl AppState {
 
         let (wake_tx, wake_rx) = mpsc::channel();
         let (unreadable_tx, unreadable_rx) = mpsc::channel::<()>();
+        let (save_tx, save_rx) = mpsc::channel::<()>();
         app.manage(AppState {
             catalog_path,
             settings: SettingsStore::new(settings_path, settings)?,
@@ -176,6 +217,11 @@ impl AppState {
             status: Mutex::new(None),
             wake_monitor: Mutex::new(wake_tx),
             now_playing: Mutex::new(None),
+            paused: AtomicBool::new(false),
+            position: Mutex::new(None),
+            playlist: Arc::new(Mutex::new(saved_playlist)),
+            save_playlist: Mutex::new(save_tx),
+            playlist_saved_at: Mutex::new(Instant::now()),
             scanning: AtomicBool::new(false),
             clearing: AtomicBool::new(false),
             cancel_scan: Arc::new(AtomicBool::new(false)),
@@ -194,6 +240,19 @@ impl AppState {
                     // Failures are written by the writer: wait for those queued.
                     let _ = handle.state::<AppState>().writer.call(|_| Ok(()));
                     let _ = handle.emit(UNREADABLE_EVENT, ());
+                }
+            })?;
+
+        let handle = app.clone();
+        std::thread::Builder::new()
+            .name("playlist-save".into())
+            .spawn(move || {
+                while save_rx.recv().is_ok() {
+                    std::thread::sleep(PLAYLIST_SAVE_DEBOUNCE);
+                    while save_rx.try_recv().is_ok() {}
+                    let st = handle.state::<AppState>();
+                    let job = st.playlist_save_job();
+                    st.writer.send("playlist", move |c| job.run(c));
                 }
             })?;
 
@@ -230,6 +289,7 @@ impl AppState {
                         return; // Settings were saved meanwhile.
                     }
                     st.wake_monitor();
+                    st.resume_playlist();
                     if catalog_empty {
                         log::info!("catalog is empty: starting the first scan");
                         if let Err(e) = start_scan(&handle) {
@@ -239,6 +299,56 @@ impl AppState {
                 })?;
         }
         Ok(())
+    }
+
+    /// A provider over the playlist, for `Play`/`Cue`.
+    pub fn provider(&self) -> Box<CatalogProvider> {
+        Box::new(CatalogProvider::new(self.playback(), self.playlist.clone()))
+    }
+
+    /// Saves the playlist soon (debounced, through the writer).
+    pub fn save_playlist_soon(&self) {
+        *lock(&self.playlist_saved_at) = Instant::now();
+        let _ = lock(&self.save_playlist).send(());
+    }
+
+    fn playlist_save_job(&self) -> playlist::SaveJob {
+        let position = lock(&self.position).as_ref().map(|p| (p.id, p.position_ms));
+        playlist::save_job(&self.playlist, position)
+    }
+
+    /// Saves the playlist now and waits for it (on quit).
+    pub fn save_playlist_now(&self) {
+        let job = self.playlist_save_job();
+        if let Err(e) = self.writer.call(move |c| job.run(c)) {
+            log::warn!("cannot save the playlist: {e}");
+        }
+    }
+
+    /// The playlist changed: tells the UI and saves it.
+    pub fn playlist_changed(&self, app: &AppHandle) {
+        let _ = app.emit(PLAYLIST_EVENT, ());
+        self.save_playlist_soon();
+    }
+
+    /// On start: loads the saved playlist's current track (or the next one) where it
+    /// stopped, paused unless "Resume playing automatically on start" is on.
+    pub fn resume_playlist(&self) {
+        let due = {
+            let mut l = lock(&self.playlist);
+            !l.ended && l.queue.successor().is_some()
+        };
+        if !due {
+            return;
+        }
+        let provider = self.provider();
+        if start_paused(&self.settings.get()) {
+            log::info!("playlist restored, paused");
+            self.player.send(Command::Cue(provider));
+        } else {
+            log::info!("playlist restored, playing");
+            self.player.send(Command::Play(provider));
+        }
     }
 
     pub fn wake_monitor(&self) {
@@ -293,6 +403,12 @@ impl AppState {
     }
 }
 
+/// A restored playlist waits paused unless the user asked for it to play on start
+/// (start at login should not start music unasked).
+pub fn start_paused(s: &Settings) -> bool {
+    !s.resume_autoplay
+}
+
 fn send_mix_settings(player: &Player, s: &Settings) {
     player.send(Command::SetVolume(s.volume));
     player.send(Command::SetCrossfade {
@@ -310,17 +426,9 @@ pub fn apply_player_settings(player: &Player, s: &Settings) {
 
 fn now_playing_of(catalog: &Catalog, id: TrackId, paused: bool) -> smp_core::Result<NowPlaying> {
     let row = catalog.track(id)?;
-    let title = row
-        .meta
-        .title
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| {
-            let name = row.rel_path.rsplit('/').next().unwrap_or(&row.rel_path);
-            name.rsplit_once('.')
-                .map_or(name, |(stem, _)| stem)
-                .to_string()
-        });
+    let title = playlist::track_title(&row);
     Ok(NowPlaying {
+        duration_ms: row.meta.duration_ms,
         id,
         artist: row.meta.artist.unwrap_or_default(),
         title,
@@ -362,7 +470,7 @@ fn on_player_event(app: &AppHandle, ev: Event) {
     let st = app.state::<AppState>();
     match ev {
         Event::TrackStarted { id } => {
-            let paused = lock(&st.now_playing).as_ref().is_some_and(|n| n.paused);
+            let paused = st.paused.load(Ordering::SeqCst);
             let np = match now_playing_of(&lock(&st.query), id, paused) {
                 Ok(np) => Some(np),
                 Err(e) => {
@@ -372,6 +480,7 @@ fn on_player_event(app: &AppHandle, ev: Event) {
             };
             *lock(&st.now_playing) = np.clone();
             emit_now_playing(app, &np);
+            st.save_playlist_soon();
             // Playback moved between servers: let the monitor confirm and report it.
             if let Some(servers) = st.source.servers() {
                 let expected = match servers.failover.active() {
@@ -386,10 +495,14 @@ fn on_player_event(app: &AppHandle, ev: Event) {
         Event::TrackSkipped { id, reason } => {
             let _ = app.emit("track-skipped", TrackSkippedPayload { id, reason });
             st.unreadable_changed();
+            // A bad file leaves the playlist.
+            st.playlist_changed(app);
             // Possibly the network: re-check the connection.
             st.wake_monitor();
         }
         Event::Paused(paused) => {
+            st.paused.store(paused, Ordering::SeqCst);
+            st.save_playlist_soon();
             let np = {
                 let mut np = lock(&st.now_playing);
                 if let Some(n) = np.as_mut() {
@@ -400,10 +513,36 @@ fn on_player_event(app: &AppHandle, ev: Event) {
             emit_now_playing(app, &np);
         }
         Event::DeviceChanged(name) => log::info!("output device: {name}"),
-        Event::Position { .. } => {}
+        Event::Position {
+            id,
+            ms,
+            duration_ms,
+        } => {
+            let known = lock(&st.now_playing)
+                .as_ref()
+                .filter(|n| n.id == id)
+                .and_then(|n| n.duration_ms);
+            let payload = PositionPayload {
+                id,
+                position_ms: ms,
+                duration_ms: known.or(duration_ms),
+            };
+            *lock(&st.position) = Some(payload.clone());
+            let _ = app.emit(POSITION_EVENT, payload);
+            let due = lock(&st.playlist_saved_at).elapsed() >= POSITION_SAVE_EVERY;
+            if due && !st.paused.load(Ordering::SeqCst) {
+                st.save_playlist_soon();
+            }
+        }
         Event::Idle => {
             *lock(&st.now_playing) = None;
+            *lock(&st.position) = None;
             emit_now_playing(app, &None);
+            // Ran out (not stopped by failures): nothing to resume next time.
+            let mut l = lock(&st.playlist);
+            l.ended = l.queue.successor().is_none();
+            drop(l);
+            st.save_playlist_soon();
         }
     }
 }
@@ -581,6 +720,9 @@ pub fn clear_library(app: &AppHandle) -> Result<(), String> {
     st.player.send(Command::Stop);
     let cleared = st.writer.call(|c| c.clear());
     lock(&st.banned).clear();
+    *lock(&st.playlist) = Default::default();
+    *lock(&st.position) = None;
+    let _ = app.emit(PLAYLIST_EVENT, ());
     st.settings.update(|s| s.last_selection.clear(), |_| {});
     *lock(&st.now_playing) = None;
     emit_now_playing(app, &None);
@@ -620,7 +762,19 @@ mod tests {
         assert_eq!(np.album, "");
         assert_eq!(np.genre_display, "Chillout, Trance");
         assert_eq!(np.year, Some(1997));
+        assert_eq!(np.duration_ms, None);
         assert!(np.paused);
+    }
+
+    #[test]
+    fn a_restored_playlist_waits_paused_unless_asked_to_play() {
+        let s = Settings::default();
+        assert!(!s.resume_autoplay, "off by default");
+        assert!(start_paused(&s));
+        assert!(!start_paused(&Settings {
+            resume_autoplay: true,
+            ..s
+        }));
     }
 
     /// A scan of a slow source on its own thread, keeping `scanning` the way

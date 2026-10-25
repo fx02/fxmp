@@ -2,7 +2,10 @@
 //! commands on the main thread and async ones on its tokio runtime, and neither may
 //! block on SMB, the keychain or long catalog queries.
 
-use serde::Serialize;
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 use smp_core::audio::output::list_output_devices;
 use smp_core::audio::player::Command;
 use smp_core::genre::{known_genre, known_genre_names};
@@ -14,9 +17,11 @@ use crate::autostart;
 use crate::connection::{status_of, test_server, test_target, ConnStatus, StatusPayload};
 use crate::credentials::CredentialStore;
 use crate::i18n;
-use crate::provider::CatalogProvider;
+use crate::playlist::{self, PlaylistFacets, PlaylistPage, PreviousAction, QueueFilter, Selection};
 use crate::settings::{ServerConfig, Settings, SettingsStore};
-use crate::state::{self, apply_player_settings, lock, AppState, NowPlaying, ScanStatus};
+use crate::state::{
+    self, apply_player_settings, lock, AppState, NowPlaying, PositionPayload, ScanStatus,
+};
 use crate::tray;
 
 type CmdResult<T> = Result<T, String>;
@@ -296,14 +301,16 @@ pub async fn get_genres(app: AppHandle) -> CmdResult<Vec<Genre>> {
     .await
 }
 
-/// Shuffles the selected genres (empty = everything) and remembers the selection.
+/// Shuffles the selected genres (empty = everything) into the playlist, plays it
+/// and remembers the selection.
 pub fn play_genres_now(app: &AppHandle, st: &AppState, keys: Vec<String>) -> CmdResult<()> {
-    let provider =
-        CatalogProvider::shuffle(&lock(&st.query), st.playback(), &keys).map_err(db_err)?;
-    st.player.send(Command::Play(Box::new(provider)));
+    let queue = playlist::genres_queue(&lock(&st.query), &keys).map_err(db_err)?;
+    lock(&st.playlist).replace(Selection::Genres { keys: keys.clone() }, queue);
+    st.player.send(Command::Play(st.provider()));
     st.settings.update(|s| s.last_selection = keys, |_| {});
     // The tray's genre menu lists the last selection.
     tray::refresh_genres(app);
+    st.playlist_changed(app);
     Ok(())
 }
 
@@ -314,10 +321,11 @@ pub async fn play_genres(app: AppHandle, keys: Vec<String>) -> CmdResult<()> {
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn play_album(app: AppHandle, artist: String, album: String) -> CmdResult<()> {
-    run(app, move |_, st| {
-        let provider = CatalogProvider::album(&lock(&st.query), st.playback(), &artist, &album)
-            .map_err(db_err)?;
-        st.player.send(Command::Play(Box::new(provider)));
+    run(app, move |app, st| {
+        let queue = playlist::album_queue(&lock(&st.query), &artist, &album).map_err(db_err)?;
+        lock(&st.playlist).replace(Selection::Album { artist, album }, queue);
+        st.player.send(Command::Play(st.provider()));
+        st.playlist_changed(app);
         Ok(())
     })
     .await
@@ -336,6 +344,374 @@ pub async fn toggle_pause(app: AppHandle) -> CmdResult<()> {
 pub async fn next(app: AppHandle) -> CmdResult<()> {
     run(app, |_, st| {
         st.player.send(Command::Next);
+        Ok(())
+    })
+    .await
+}
+
+/// "Previous": more than 3 s into the track it starts again, otherwise the track
+/// before it plays (with the same fade as "Next"). Shared by the UI, the tray and
+/// the media keys.
+pub fn previous_now(st: &AppState) -> CmdResult<()> {
+    let position = lock(&st.position).clone();
+    {
+        let mut l = lock(&st.playlist);
+        let current = l
+            .queue
+            .current()
+            .ok_or_else(|| i18n::t("err.nothing_playing"))?;
+        let ms = position
+            .filter(|p| p.id == current)
+            .map_or(0, |p| p.position_ms);
+        match playlist::previous_action(ms, l.queue.can_go_back()) {
+            PreviousAction::Restart => {
+                l.queue.restart();
+                l.resume_at = None;
+            }
+            PreviousAction::Back => {
+                l.queue.go_back();
+            }
+        }
+    }
+    st.player.send(Command::Play(st.provider()));
+    st.save_playlist_soon();
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn previous(app: AppHandle) -> CmdResult<()> {
+    run(app, |_, st| previous_now(st)).await
+}
+
+/// The last reported position of the playing track.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_position(app: AppHandle) -> CmdResult<Option<PositionPayload>> {
+    run(app, |_, st| Ok(lock(&st.position).clone())).await
+}
+
+/// Rows `offset..offset + limit` (at most 500) of the playlist, or of what
+/// `filter` leaves of it.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_playlist(
+    app: AppHandle,
+    offset: usize,
+    limit: usize,
+    filter: Option<QueueFilter>,
+) -> CmdResult<PlaylistPage> {
+    run(app, move |_, st| {
+        playlist::page(
+            &st.playlist,
+            &st.query,
+            &i18n::current(),
+            offset,
+            limit,
+            filter.as_ref(),
+        )
+        .map_err(db_err)
+    })
+    .await
+}
+
+/// The genres and years in the playlist, for its filters.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_facets(app: AppHandle) -> CmdResult<PlaylistFacets> {
+    run(app, |_, st| {
+        playlist::facets(&st.playlist, &st.query, &i18n::current()).map_err(db_err)
+    })
+    .await
+}
+
+/// The entry at `index` must still be track `id` (the list may have changed since
+/// the UI showed it).
+fn check_entry(l: &playlist::Playlist, index: usize, id: TrackId) -> CmdResult<()> {
+    if l.queue.order().get(index).map(|e| e.id) == Some(id) {
+        Ok(())
+    } else {
+        Err(i18n::t("err.playlist_changed"))
+    }
+}
+
+/// Plays the playlist entry at `index` now; the playlist goes on from there in
+/// its order (a shuffle is not reshuffled).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_jump(app: AppHandle, index: usize, id: TrackId) -> CmdResult<()> {
+    run(app, move |_, st| {
+        {
+            let mut l = lock(&st.playlist);
+            check_entry(&l, index, id)?;
+            l.queue.jump(index);
+            l.resume_at = None;
+        }
+        st.player.send(Command::Play(st.provider()));
+        st.save_playlist_soon();
+        Ok(())
+    })
+    .await
+}
+
+/// Changes the playlist; if that changed the track due next, the player drops the
+/// one it prepared. Tells the UI and saves (unless `f` failed).
+fn edit_playlist<T>(
+    app: &AppHandle,
+    st: &AppState,
+    f: impl FnOnce(&mut playlist::Playlist) -> CmdResult<T>,
+) -> CmdResult<T> {
+    let (result, due_changed) = {
+        let mut l = lock(&st.playlist);
+        let before = l.queue.successor();
+        let result = f(&mut l)?;
+        (result, l.queue.successor() != before)
+    };
+    if due_changed {
+        st.player.send(Command::Requeue);
+    }
+    st.playlist_changed(app);
+    Ok(result)
+}
+
+/// Where hand-added tracks go.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddAt {
+    /// Right after the current track ("Play next").
+    Next,
+    /// At the end ("Add to end").
+    End,
+}
+
+fn add_to_playlist(
+    app: &AppHandle,
+    st: &AppState,
+    ids: Vec<TrackId>,
+    at: AddAt,
+) -> CmdResult<usize> {
+    let banned: HashSet<TrackId> = lock(&st.query)
+        .banned()
+        .map_err(db_err)?
+        .into_iter()
+        .map(|t| t.id)
+        .chain(lock(&st.banned).iter().copied())
+        .collect();
+    let known: HashSet<TrackId> = lock(&st.query)
+        .tracks_by_ids(&ids)
+        .map_err(db_err)?
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    let ids: Vec<TrackId> = ids
+        .into_iter()
+        .filter(|id| known.contains(id) && !banned.contains(id))
+        .collect();
+    let n = ids.len();
+    edit_playlist(app, st, |l| {
+        match at {
+            AddAt::Next => l.queue.insert_next(&ids),
+            AddAt::End => l.queue.append(&ids),
+        }
+        Ok(n)
+    })
+}
+
+/// Adds tracks by hand ("Play next" or "Add to end"); returns how many (banned
+/// and unknown ones are left out).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_add(app: AppHandle, ids: Vec<TrackId>, at: AddAt) -> CmdResult<usize> {
+    run(app, move |app, st| add_to_playlist(app, st, ids, at)).await
+}
+
+/// Adds an album's tracks in order, as [`playlist_add`].
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_add_album(
+    app: AppHandle,
+    artist: String,
+    album: String,
+    at: AddAt,
+) -> CmdResult<usize> {
+    run(app, move |app, st| {
+        let ids = lock(&st.query)
+            .album_tracks(&artist, &album)
+            .map_err(db_err)?;
+        add_to_playlist(app, st, ids, at)
+    })
+    .await
+}
+
+/// Takes the entry at `index` (track `id`) out of the playlist.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_remove(app: AppHandle, index: usize, id: TrackId) -> CmdResult<()> {
+    run(app, move |app, st| {
+        edit_playlist(app, st, |l| {
+            check_entry(l, index, id)?;
+            l.queue.remove(index);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// Moves the entry at `from` (track `id`) to `to`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_move(app: AppHandle, from: usize, to: usize, id: TrackId) -> CmdResult<()> {
+    run(app, move |app, st| {
+        edit_playlist(app, st, |l| {
+            check_entry(l, from, id)?;
+            if l.queue.move_entry(from, to) {
+                Ok(())
+            } else {
+                Err(i18n::t("err.playlist_changed"))
+            }
+        })
+    })
+    .await
+}
+
+/// "New empty playlist": the playing track plays on, then nothing until tracks are
+/// added by hand.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_new(app: AppHandle) -> CmdResult<()> {
+    run(app, |app, st| {
+        edit_playlist(app, st, |l| {
+            let empty = smp_core::queue::Queue::fixed(&[], rand::SeedableRng::from_entropy());
+            l.replace(Selection::Manual, empty);
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// "Play filtered": a new shuffled playlist of what `filter` leaves of this one.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_play_filtered(app: AppHandle, filter: QueueFilter) -> CmdResult<()> {
+    run(app, move |app, st| {
+        let (selection, queue) =
+            playlist::filtered_queue(&lock(&st.query), &st.playlist, &filter).map_err(db_err)?;
+        if queue.is_empty() {
+            return Err(i18n::t("err.filter_empty"));
+        }
+        lock(&st.playlist).replace(selection, queue);
+        st.player.send(Command::Play(st.provider()));
+        st.playlist_changed(app);
+        Ok(())
+    })
+    .await
+}
+
+/// Saves the playlist (what `filter` leaves of it) as an `.m3u8` file at `path`
+/// (`.m3u8` is added when it has no extension); returns how many tracks it holds.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_export(
+    app: AppHandle,
+    path: String,
+    filter: Option<QueueFilter>,
+) -> CmdResult<usize> {
+    run(app, move |_, st| {
+        let mut path = PathBuf::from(path);
+        if path.extension().is_none() {
+            path.set_extension("m3u8");
+        }
+        playlist::export_m3u8(&st.playlist, &st.query, &path, filter.as_ref()).map_err(|e| {
+            log::warn!("export to {}: {e}", path.display());
+            i18n::tf("err.export", &[("error", &e)])
+        })
+    })
+    .await
+}
+
+/// Suggestions for the export dialog.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExportHint {
+    /// The playlist's name as a file name, without date or extension.
+    pub file_stem: String,
+    /// The music folder on the share (`F/MP3/`): where the file belongs, since its
+    /// paths are relative to it.
+    pub music_folder: String,
+    /// That folder where the share is mounted on this Mac, if it is.
+    pub default_dir: Option<String>,
+}
+
+/// `share/root/` of a server, without stray slashes.
+pub fn music_folder(server: &ServerConfig) -> String {
+    let parts: Vec<&str> = [server.share.trim(), server.root.trim()]
+        .iter()
+        .flat_map(|p| p.split('/'))
+        .filter(|p| !p.is_empty())
+        .collect();
+    format!("{}/", parts.join("/"))
+}
+
+/// The music folder where macOS mounts the share (`/Volumes/<share>/<root>`), or the
+/// share itself, if it is mounted.
+fn mounted_music_folder(server: &ServerConfig, exists: impl Fn(&str) -> bool) -> Option<String> {
+    let share = server.share.trim().trim_matches('/');
+    if share.is_empty() {
+        return None;
+    }
+    let root = format!("/Volumes/{}", music_folder(server));
+    let root = root.trim_end_matches('/').to_string();
+    let share_dir = format!("/Volumes/{share}");
+    [root, share_dir].into_iter().find(|d| exists(d))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_export_hint(app: AppHandle) -> CmdResult<ExportHint> {
+    run(app, |_, st| {
+        let selection = lock(&st.playlist).selection.clone();
+        let title = playlist::title(&lock(&st.query), &i18n::current(), &selection);
+        let server = st.settings.get().primary;
+        Ok(ExportHint {
+            file_stem: playlist::file_stem(&title),
+            music_folder: music_folder(&server),
+            default_dir: if cfg!(target_os = "macos") {
+                mounted_music_folder(&server, |d| std::path::Path::new(d).is_dir())
+            } else {
+                None
+            },
+        })
+    })
+    .await
+}
+
+/// A track of an album, for adding single tracks by hand.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlbumTrack {
+    pub id: TrackId,
+    pub track_no: Option<u32>,
+    pub artist: String,
+    pub title: String,
+    pub year: Option<u16>,
+    pub duration_ms: Option<u64>,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn list_album_tracks(
+    app: AppHandle,
+    artist: String,
+    album: String,
+) -> CmdResult<Vec<AlbumTrack>> {
+    run(app, move |_, st| {
+        let q = lock(&st.query);
+        let ids = q.album_tracks(&artist, &album).map_err(db_err)?;
+        let rows = q.tracks_by_ids(&ids).map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AlbumTrack {
+                id: r.id,
+                track_no: r.meta.track_no,
+                artist: r.meta.artist.clone().unwrap_or_default(),
+                title: playlist::track_title(&r),
+                year: r.meta.year,
+                duration_ms: r.meta.duration_ms,
+            })
+            .collect())
+    })
+    .await
+}
+
+/// "Resume playing automatically on start".
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_resume_autoplay(app: AppHandle, on: bool) -> CmdResult<()> {
+    run(app, move |_, st| {
+        st.settings.update(|s| s.resume_autoplay = on, |_| {});
         Ok(())
     })
     .await
@@ -403,8 +779,9 @@ pub async fn set_normalize(app: AppHandle, b: bool) -> CmdResult<()> {
     .await
 }
 
-/// Bans the playing track for good and skips to the next one.
-pub fn ban_current_now(st: &AppState) -> CmdResult<()> {
+/// Bans the playing track for good, takes it out of the playlist and skips to the
+/// next one.
+pub fn ban_current_now(app: &AppHandle, st: &AppState) -> CmdResult<()> {
     let id = lock(&st.now_playing)
         .as_ref()
         .map(|n| n.id)
@@ -414,12 +791,14 @@ pub fn ban_current_now(st: &AppState) -> CmdResult<()> {
         .call(move |c| c.set_banned(id, true))
         .map_err(db_err)?;
     st.player.send(Command::Next);
+    lock(&st.playlist).queue.forget(id);
+    st.playlist_changed(app);
     Ok(())
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn ban_current(app: AppHandle) -> CmdResult<()> {
-    run(app, |_, st| ban_current_now(st)).await
+    run(app, ban_current_now).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -752,6 +1131,44 @@ mod tests {
         assert_eq!(creds.get("10.111.100.2", "music"), None);
         assert_eq!(creds.get("10.111.0.2", "backup"), None);
         assert_eq!(Settings::load(&path).unwrap(), forgot);
+    }
+
+    #[test]
+    fn export_hint_points_at_the_music_folder() {
+        let s = two_servers();
+        assert_eq!(music_folder(&s.primary), "F/MP3/");
+        let bare = ServerConfig {
+            root: "".into(),
+            ..s.primary.clone()
+        };
+        assert_eq!(music_folder(&bare), "F/");
+        let mounted = |dirs: &'static [&'static str]| move |d: &str| dirs.contains(&d);
+        assert_eq!(
+            mounted_music_folder(&s.primary, mounted(&["/Volumes/F", "/Volumes/F/MP3"])),
+            Some("/Volumes/F/MP3".into())
+        );
+        assert_eq!(
+            mounted_music_folder(&s.primary, mounted(&["/Volumes/F"])),
+            Some("/Volumes/F".into())
+        );
+        assert_eq!(mounted_music_folder(&s.primary, mounted(&[])), None);
+    }
+
+    #[test]
+    fn add_at_reads_next_and_end() {
+        assert_eq!(
+            serde_json::from_str::<AddAt>(r#""next""#).unwrap(),
+            AddAt::Next
+        );
+        assert_eq!(
+            serde_json::from_str::<AddAt>(r#""end""#).unwrap(),
+            AddAt::End
+        );
+        let f: QueueFilter =
+            serde_json::from_str(r#"{"text":"x","years":[1990,1999],"unknown_year":true}"#)
+                .unwrap();
+        assert_eq!(f.years, Some((1990, 1999)));
+        assert!(f.genres.is_empty());
     }
 
     #[test]

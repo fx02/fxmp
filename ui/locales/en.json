@@ -4,6 +4,7 @@
   "player.pause": "Pause",
   "player.resume": "Resume",
   "player.next": "Next",
+  "player.previous": "Previous",
   "player.ban": "Never play this track again",
   "player.ban_label": "Ban track",
   "player.ban_confirm": "Sure?",
@@ -156,5 +157,12 @@
   "err.keychain_delete": "Cannot delete the password from the keychain: {error}",
   "err.clear_busy": "The scan did not stop, so the library was not cleared. Try again.",
   "err.clearing": "The library is being cleared.",
-  "err.language": "Unknown language: {code}"
+  "err.language": "Unknown language: {code}",
+  "playlist.all": "All",
+  "playlist.manual": "My playlist",
+  "playlist.filtered": "{name} (filtered)",
+  "settings.resume_autoplay": "Resume playing automatically on start",
+  "err.playlist_changed": "The playlist changed meanwhile. Try again.",
+  "err.filter_empty": "No track matches the filter.",
+  "err.export": "Cannot save the playlist: {error}"
 }

@@ -250,7 +250,7 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match id {
         ID_TOGGLE => st.player.send(Command::TogglePause),
         ID_NEXT => st.player.send(Command::Next),
-        ID_BAN => spawn_action(app, "ban", |_, st| ban_current_now(st)),
+        ID_BAN => spawn_action(app, "ban", ban_current_now),
         ID_SHOW => show_main_window(app),
         ID_QUIT => app.exit(0),
         _ => {
@@ -378,6 +378,7 @@ mod tests {
 
     fn np(artist: &str, title: &str, paused: bool) -> NowPlaying {
         NowPlaying {
+            duration_ms: None,
             id: 1,
             artist: artist.into(),
             title: title.into(),

@@ -7,6 +7,7 @@ mod connection;
 mod credentials;
 mod i18n;
 mod media;
+mod playlist;
 mod provider;
 mod settings;
 mod state;
@@ -92,12 +93,28 @@ fn main() {
             commands::retry_unreadable,
             commands::reset_settings,
             commands::clear_library,
+            commands::previous,
+            commands::get_position,
+            commands::get_playlist,
+            commands::playlist_facets,
+            commands::playlist_jump,
+            commands::playlist_add,
+            commands::playlist_add_album,
+            commands::playlist_remove,
+            commands::playlist_move,
+            commands::playlist_new,
+            commands::playlist_play_filtered,
+            commands::playlist_export,
+            commands::playlist_export_hint,
+            commands::list_album_tracks,
+            commands::set_resume_autoplay,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 if let Some(st) = app.try_state::<state::AppState>() {
+                    st.save_playlist_now();
                     if let Err(e) = st.settings.flush() {
                         log::warn!("cannot save settings on exit: {e}");
                     }
