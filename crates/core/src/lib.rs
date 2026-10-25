@@ -2,6 +2,8 @@ pub mod audio;
 pub mod catalog;
 pub mod failure;
 pub mod genre;
+pub mod m3u;
+pub mod queue;
 pub mod scan;
 pub mod shuffle;
 pub mod source;

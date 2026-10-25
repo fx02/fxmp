@@ -12,6 +12,7 @@ use crate::genre::{
     current_key, genre_key, known_genre, migrate_selection, split_genres, KnownGenre,
     UNKNOWN_DISPLAY, UNKNOWN_KEY,
 };
+use crate::queue::Entry;
 use crate::source::Which;
 use crate::{Result, TrackId};
 
@@ -76,8 +77,46 @@ pub struct AlbumInfo {
 pub struct TrackFilter {
     /// Tracks in any of these genres; empty = all genres.
     pub genre_keys: Vec<String>,
-    /// Only tracks whose year is within `from..=to` (tracks without a year drop out).
+    /// Only tracks whose year is within `from..=to` (tracks without a year drop out
+    /// unless `unknown_year`).
     pub years: Option<(u16, u16)>,
+    /// Also tracks without a year; without `years`, only those.
+    pub unknown_year: bool,
+    /// Artist or title contains this (ASCII case ignored); the file name stands in
+    /// for a missing title. Blank = no text filter.
+    pub text: Option<String>,
+}
+
+/// Genres and years of a set of tracks (see [`Catalog::facets`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Facets {
+    /// By display name, like [`Catalog::genres`]; counts are of the given tracks.
+    pub genres: Vec<GenreCount>,
+    /// Oldest first.
+    pub years: Vec<YearCount>,
+    /// Tracks without a year.
+    pub unknown_year: usize,
+}
+
+/// Where the saved playlist is (see [`crate::queue::QueueState`]); written often.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlaylistCursor {
+    pub cursor: Option<usize>,
+    /// Played tracks, oldest first, the current one included.
+    pub history: Vec<TrackId>,
+    pub history_pos: Option<usize>,
+    /// Where the current track was, in ms.
+    pub position_ms: u64,
+}
+
+/// The saved playlist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedPlaylist {
+    /// What it was made from, as the app wrote it.
+    pub selection: String,
+    pub shuffle: bool,
+    pub order: Vec<Entry>,
+    pub cursor: PlaylistCursor,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,7 +171,50 @@ CREATE TABLE IF NOT EXISTS selection_state(
     selection_key TEXT PRIMARY KEY,
     last_first INTEGER NOT NULL
 );
+-- The playlist (one row): its order as a blob of 8-byte little-endian track ids,
+-- negated for an entry added by hand. A blob, not a row per entry: All is some
+-- 60k entries, and inserting or moving one would renumber them all.
+CREATE TABLE IF NOT EXISTS playlist(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    selection TEXT NOT NULL,
+    shuffle INTEGER NOT NULL,
+    entries BLOB NOT NULL
+);
+-- Where the playlist is (one row, small: written every few seconds while playing).
+CREATE TABLE IF NOT EXISTS playlist_cursor(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    cursor INTEGER,
+    history BLOB NOT NULL,
+    history_pos INTEGER,
+    position_ms INTEGER NOT NULL
+);
 ";
+
+fn ids_to_blob(ids: impl Iterator<Item = i64>) -> Vec<u8> {
+    ids.flat_map(i64::to_le_bytes).collect()
+}
+
+fn blob_to_ids(blob: &[u8]) -> Vec<i64> {
+    blob.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| i64::from_le_bytes(*b))
+        .collect()
+}
+
+/// `text` as a LIKE pattern matching it anywhere; a backslash escapes `%`, `_` and itself.
+fn like_contains(text: &str) -> String {
+    let mut p = String::with_capacity(text.len() + 2);
+    p.push('%');
+    for ch in text.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            p.push('\\');
+        }
+        p.push(ch);
+    }
+    p.push('%');
+    p
+}
 
 /// Columns added to `tracks` after the first version, with their declarations. They
 /// are added (cheaply, `ADD COLUMN`) whenever missing, on every open.
@@ -202,9 +284,22 @@ fn filter_sql(f: &TrackFilter) -> (String, Vec<Value>) {
         ));
         args.extend(f.genre_keys.iter().cloned().map(Value::Text));
     }
-    if let Some((from, to)) = f.years {
-        sql.push_str(" AND t.year BETWEEN ? AND ?");
-        args.extend([Value::Integer(from.into()), Value::Integer(to.into())]);
+    match (f.years, f.unknown_year) {
+        (Some((from, to)), unknown) => {
+            let or_unknown = if unknown { " OR t.year IS NULL" } else { "" };
+            sql.push_str(&format!(" AND (t.year BETWEEN ? AND ?{or_unknown})"));
+            args.extend([Value::Integer(from.into()), Value::Integer(to.into())]);
+        }
+        (None, true) => sql.push_str(" AND t.year IS NULL"),
+        (None, false) => {}
+    }
+    if let Some(text) = f.text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        sql.push_str(
+            " AND (t.artist LIKE ? ESCAPE '\\' OR t.title LIKE ? ESCAPE '\\'
+                   OR (COALESCE(t.title, '') = '' AND t.rel_path LIKE ? ESCAPE '\\'))",
+        );
+        let pattern = like_contains(text);
+        args.extend(std::iter::repeat_n(Value::Text(pattern), 3));
     }
     (sql, args)
 }
@@ -686,7 +781,7 @@ impl Catalog {
     pub fn playable_tracks(&self, genre_keys: &[String]) -> Result<Vec<TrackId>> {
         self.filtered_tracks(&TrackFilter {
             genre_keys: genre_keys.to_vec(),
-            years: None,
+            ..Default::default()
         })
     }
 
@@ -706,7 +801,7 @@ impl Catalog {
     pub fn years(&self, genre_keys: &[String]) -> Result<Vec<YearCount>> {
         let (cond, args) = filter_sql(&TrackFilter {
             genre_keys: genre_keys.to_vec(),
-            years: None,
+            ..Default::default()
         });
         let v = self
             .conn
@@ -722,6 +817,153 @@ impl Catalog {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(v)
+    }
+
+    /// The genres and years of `ids` (each track counted once).
+    pub fn facets(&self, ids: &[TrackId]) -> Result<Facets> {
+        let wanted: HashSet<TrackId> = ids.iter().copied().collect();
+        let mut genres: Vec<GenreCount> = Vec::new();
+        let mut st = self.conn.prepare_cached(
+            "SELECT g.key, g.display, tg.track_id FROM genres g
+             JOIN track_genres tg ON tg.genre_id = g.id
+             ORDER BY g.display COLLATE NOCASE, g.key",
+        )?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            if !wanted.contains(&r.get::<_, TrackId>(2)?) {
+                continue;
+            }
+            let key: String = r.get(0)?;
+            match genres.last_mut() {
+                Some(g) if g.key == key => g.count += 1,
+                _ => genres.push(GenreCount {
+                    key,
+                    display: r.get(1)?,
+                    count: 1,
+                }),
+            }
+        }
+        let mut years: std::collections::BTreeMap<u16, usize> = Default::default();
+        let mut unknown_year = 0;
+        let mut st = self.conn.prepare_cached("SELECT id, year FROM tracks")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            if !wanted.contains(&r.get::<_, TrackId>(0)?) {
+                continue;
+            }
+            match r.get::<_, Option<i64>>(1)? {
+                Some(y) => *years.entry(y as u16).or_default() += 1,
+                None => unknown_year += 1,
+            }
+        }
+        Ok(Facets {
+            genres,
+            years: years
+                .into_iter()
+                .map(|(year, count)| YearCount { year, count })
+                .collect(),
+            unknown_year,
+        })
+    }
+
+    /// The tracks `ids` in that order (repeats included); ids not in the catalog are
+    /// left out.
+    pub fn tracks_by_ids(&self, ids: &[TrackId]) -> Result<Vec<TrackRow>> {
+        let mut found: HashMap<TrackId, TrackRow> = HashMap::with_capacity(ids.len());
+        // In batches, within SQLite's parameter limit.
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT {TRACK_COLS} FROM tracks WHERE id IN ({marks})");
+            let mut st = self.conn.prepare_cached(&sql)?;
+            for row in st.query_map(params_from_iter(chunk), row_to_track)? {
+                let row = row?;
+                found.insert(row.id, row);
+            }
+        }
+        Ok(ids.iter().filter_map(|id| found.get(id).cloned()).collect())
+    }
+
+    /// Saves the playlist's order and what it was made from (the cursor is saved
+    /// separately, see [`Self::save_playlist_cursor`]).
+    pub fn save_playlist_order(
+        &self,
+        selection: &str,
+        shuffle: bool,
+        order: &[Entry],
+    ) -> Result<()> {
+        let blob = ids_to_blob(order.iter().map(|e| if e.manual { -e.id } else { e.id }));
+        self.conn.execute(
+            "INSERT OR REPLACE INTO playlist(id, selection, shuffle, entries) VALUES(1, ?1, ?2, ?3)",
+            params![selection, shuffle, blob],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_playlist_cursor(&self, c: &PlaylistCursor) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO playlist_cursor(id, cursor, history, history_pos, position_ms)
+             VALUES(1, ?1, ?2, ?3, ?4)",
+            params![
+                c.cursor.map(|v| v as i64),
+                ids_to_blob(c.history.iter().copied()),
+                c.history_pos.map(|v| v as i64),
+                c.position_ms as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The saved playlist, if there is one.
+    pub fn load_playlist(&self) -> Result<Option<SavedPlaylist>> {
+        let list = self
+            .conn
+            .query_row(
+                "SELECT selection, shuffle, entries FROM playlist WHERE id=1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, bool>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((selection, shuffle, entries)) = list else {
+            return Ok(None);
+        };
+        let cursor = self
+            .conn
+            .query_row(
+                "SELECT cursor, history, history_pos, position_ms FROM playlist_cursor WHERE id=1",
+                [],
+                |r| {
+                    Ok(PlaylistCursor {
+                        cursor: r.get::<_, Option<i64>>(0)?.map(|v| v as usize),
+                        history: blob_to_ids(&r.get::<_, Vec<u8>>(1)?),
+                        history_pos: r.get::<_, Option<i64>>(2)?.map(|v| v as usize),
+                        position_ms: r.get::<_, i64>(3)?.max(0) as u64,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        let order = blob_to_ids(&entries)
+            .into_iter()
+            .map(|id| {
+                if id < 0 {
+                    Entry::manual(-id)
+                } else {
+                    Entry::new(id)
+                }
+            })
+            .collect();
+        Ok(Some(SavedPlaylist {
+            selection,
+            shuffle,
+            order,
+            cursor,
+        }))
     }
 
     pub fn track(&self, id: TrackId) -> Result<TrackRow> {
@@ -854,7 +1096,8 @@ impl Catalog {
         self.savepoint(|| {
             self.conn.execute_batch(
                 "DELETE FROM track_genres; DELETE FROM genres; DELETE FROM genre_rules;
-                 DELETE FROM selection_state; DELETE FROM tracks;",
+                 DELETE FROM selection_state; DELETE FROM playlist; DELETE FROM playlist_cursor;
+                 DELETE FROM tracks;",
             )?;
             Ok(())
         })?;
@@ -1694,6 +1937,7 @@ mod tests {
                 .filtered_tracks(&TrackFilter {
                     genre_keys: genre_keys.iter().map(|k| k.to_string()).collect(),
                     years,
+                    ..Default::default()
                 })
                 .unwrap();
             v.sort_unstable();
@@ -1704,6 +1948,145 @@ mod tests {
         assert_eq!(ids(&["rock"], Some((1991, 1995))), vec![r91, r95]);
         assert_eq!(ids(&["rock", "jazz"], Some((1991, 1991))), vec![r91, j91]);
         assert_eq!(ids(&["jazz"], Some((1992, 2000))), Vec::<TrackId>::new());
+    }
+
+    #[test]
+    fn filters_by_text_and_unknown_year() {
+        let c = Catalog::open_in_memory().unwrap();
+        let mk = |path: &str, artist: Option<&str>, title: Option<&str>, year: Option<u16>| {
+            let m = TrackMeta {
+                artist: artist.map(str::to_string),
+                title: title.map(str::to_string),
+                raw_genre: Some("Rock".into()),
+                year,
+                ..Default::default()
+            };
+            c.upsert_track(path, 1, 1, &m).unwrap()
+        };
+        let a = mk("x/a.mp3", Some("Metallica"), Some("One"), Some(1988));
+        let b = mk("x/b.mp3", Some("Ritam 100%"), Some("Two_Step"), None);
+        let d = mk("x/Untagged Song.mp3", None, None, Some(2001));
+        c.rebuild_genres().unwrap();
+        let ids = |f: TrackFilter| -> Vec<TrackId> {
+            let mut v = c.filtered_tracks(&f).unwrap();
+            v.sort_unstable();
+            v
+        };
+        let text = |t: &str| TrackFilter {
+            text: Some(t.into()),
+            ..Default::default()
+        };
+        assert_eq!(ids(text("metal")), [a], "artist, any case");
+        assert_eq!(ids(text("one")), [a], "title");
+        assert_eq!(ids(text("100%")), [b], "% is literal");
+        assert_eq!(ids(text("twoxstep")), Vec::<TrackId>::new(), "_ is literal");
+        assert_eq!(ids(text("two_")), [b]);
+        assert_eq!(
+            ids(text("untagged")),
+            [d],
+            "the file name stands in for a title"
+        );
+        assert_eq!(ids(text("  ")), [a, b, d], "blank: no text filter");
+        let years = |years, unknown_year| TrackFilter {
+            years,
+            unknown_year,
+            ..Default::default()
+        };
+        assert_eq!(ids(years(Some((1980, 1990)), false)), [a]);
+        assert_eq!(ids(years(Some((1980, 1990)), true)), [a, b]);
+        assert_eq!(ids(years(None, true)), [b], "only tracks without a year");
+        assert_eq!(ids(years(None, false)), [a, b, d]);
+    }
+
+    #[test]
+    fn facets_count_the_genres_and_years_of_given_tracks() {
+        let c = Catalog::open_in_memory().unwrap();
+        let mk = |path: &str, genre: &str, year: Option<u16>| {
+            let m = TrackMeta {
+                raw_genre: Some(genre.into()),
+                year,
+                ..Default::default()
+            };
+            c.upsert_track(path, 1, 1, &m).unwrap()
+        };
+        let a = mk("a.mp3", "Rock; Jazz", Some(1991));
+        let b = mk("b.mp3", "Rock", None);
+        let _other = mk("c.mp3", "Trance", Some(2000));
+        c.rebuild_genres().unwrap();
+        let f = c.facets(&[a, b, b]).unwrap();
+        let genres: Vec<(String, usize)> =
+            f.genres.iter().map(|g| (g.key.clone(), g.count)).collect();
+        assert_eq!(genres, [("jazz".to_string(), 1), ("rock".to_string(), 2)]);
+        assert_eq!(
+            f.years,
+            [YearCount {
+                year: 1991,
+                count: 1
+            }]
+        );
+        assert_eq!(f.unknown_year, 1);
+    }
+
+    #[test]
+    fn tracks_by_ids_keep_the_asked_order_and_skip_missing() {
+        let c = Catalog::open_in_memory().unwrap();
+        let a = add(&c, "a.mp3", None);
+        let b = add(&c, "b.mp3", None);
+        let rows = c.tracks_by_ids(&[b, 999, a, b]).unwrap();
+        let got: Vec<TrackId> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(got, [b, a, b]);
+        assert_eq!(rows[1].rel_path, "a.mp3");
+    }
+
+    #[test]
+    fn the_playlist_is_saved_and_loaded() {
+        use crate::queue::Entry;
+        let c = Catalog::open_in_memory().unwrap();
+        assert_eq!(c.load_playlist().unwrap(), None);
+        let order: Vec<Entry> = (1..=60_000)
+            .map(|i| {
+                if i % 7 == 0 {
+                    Entry::manual(i)
+                } else {
+                    Entry::new(i)
+                }
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        c.save_playlist_order(r#"{"genres":[]}"#, true, &order)
+            .unwrap();
+        let cursor = PlaylistCursor {
+            cursor: Some(41),
+            history: vec![5, 9, 42],
+            history_pos: Some(2),
+            position_ms: 61_500,
+        };
+        c.save_playlist_cursor(&cursor).unwrap();
+        let saved = c.load_playlist().unwrap().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(saved.selection, r#"{"genres":[]}"#);
+        assert!(saved.shuffle);
+        assert_eq!(saved.order, order);
+        assert_eq!(saved.cursor, cursor);
+
+        // The cursor alone changes often; the order stays.
+        let later = PlaylistCursor {
+            position_ms: 70_000,
+            ..cursor
+        };
+        c.save_playlist_cursor(&later).unwrap();
+        let saved = c.load_playlist().unwrap().unwrap();
+        assert_eq!(saved.cursor.position_ms, 70_000);
+        assert_eq!(saved.order.len(), 60_000);
+
+        // A list without a cursor yet loads with an empty one.
+        c.save_playlist_order("{}", false, &[Entry::new(1)])
+            .unwrap();
+        c.clear().unwrap();
+        assert_eq!(c.load_playlist().unwrap(), None, "cleared with the library");
+        c.save_playlist_order("{}", false, &[]).unwrap();
+        let saved = c.load_playlist().unwrap().unwrap();
+        assert_eq!(saved.cursor, PlaylistCursor::default());
     }
 
     #[test]

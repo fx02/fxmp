@@ -30,14 +30,9 @@ impl<R: Rng> Shuffler<R> {
     }
 
     fn refill(&mut self) {
-        let mut order = self.pool.clone();
-        order.shuffle(&mut self.rng);
-        // The next track to play is the last element; keep it != avoid.
-        let len = order.len();
-        if len > 1 && Some(order[len - 1]) == self.last {
-            let j = self.rng.gen_range(0..len - 1);
-            order.swap(len - 1, j);
-        }
+        // Consumed from the back.
+        let mut order = shuffled_pass(&self.pool, self.last, &mut self.rng);
+        order.reverse();
         self.order = order;
     }
 
@@ -63,6 +58,22 @@ impl<R: Rng> Shuffler<R> {
     pub fn first(&self) -> Option<TrackId> {
         self.first
     }
+}
+
+/// One pass over `pool` in play order: a fresh Fisher-Yates permutation whose first
+/// track is not `avoid_first` (unless the pool holds nothing else).
+pub fn shuffled_pass<R: Rng>(
+    pool: &[TrackId],
+    avoid_first: Option<TrackId>,
+    rng: &mut R,
+) -> Vec<TrackId> {
+    let mut order = pool.to_vec();
+    order.shuffle(rng);
+    if order.len() > 1 && Some(order[0]) == avoid_first {
+        let j = rng.gen_range(1..order.len());
+        order.swap(0, j);
+    }
+    order
 }
 
 pub fn entropy_shuffler(pool: Vec<TrackId>, avoid_first: Option<TrackId>) -> Shuffler<StdRng> {
