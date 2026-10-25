@@ -28,6 +28,8 @@ import {
   sameItems,
   keepExpanded,
   genresSummary,
+  patchPlan,
+  retryDelay,
 } from "./lib.mjs";
 
 const { invoke } = window.__TAURI__.core;
@@ -71,6 +73,7 @@ const state = {
   expanded: new Set(),
   openAlbums: new Set(),
   albumCache: new Map(),
+  trackCache: new Map(),
 };
 
 // ---------- helpers ----------
@@ -389,6 +392,10 @@ const pl = {
   // rows are still right (rows are not rebuilt under a click for nothing).
   stamp: 0,
   drawn: "",
+  // The playlist version the facets were read for ("" = read them again).
+  facetsFor: "",
+  // Failed page fetches in a row (they are retried with a back-off).
+  retries: 0,
 };
 
 function plWindow(total) {
@@ -406,8 +413,8 @@ function rowVisible(row) {
 function showPlaylist() {
   pl.scrollToCurrent = pl.stale || pl.scrollToCurrent;
   pl.stale = false;
+  // The facets are read again once a page shows the playlist changed.
   refreshPlaylist();
-  loadFacets();
 }
 
 /** Fetches the rows in view again (the list or the cursor changed). */
@@ -433,11 +440,9 @@ function playlistMoved() {
 function onPlaylistChanged() {
   if (state.tab !== "playlist") {
     pl.stale = true;
-    pl.facets = null;
     return;
   }
   refreshPlaylistSoon();
-  loadFacetsSoon();
 }
 
 function ensurePages() {
@@ -451,7 +456,16 @@ async function fetchPage(offset) {
   const gen = pl.gen;
   pl.fetched.add(offset);
   const page = await run("get_playlist", { offset, limit: PL_PAGE, filter: pl.filter });
-  if (gen !== pl.gen || !page) return;
+  if (gen !== pl.gen) return;
+  if (!page) {
+    // Asked again after a pause (a few times), unless a refresh comes first.
+    pl.fetched.delete(offset);
+    pl.retries += 1;
+    const wait = retryDelay(pl.retries);
+    if (wait !== null) setTimeout(() => gen === pl.gen && ensurePages(), wait);
+    return;
+  }
+  pl.retries = 0;
   const version = page.version.join(".");
   if (!pl.fresh || version !== pl.version) {
     // First answer since the refresh (or the list changed): start from it.
@@ -463,6 +477,11 @@ async function fetchPage(offset) {
   page.rows.forEach((row, i) => pl.rows.set(offset + i, row));
   pl.stamp += 1;
   pl.meta = page;
+  if (pl.facetsFor !== version) {
+    pl.facetsFor = version;
+    if (pl.facets) loadFacetsSoon();
+    else loadFacets();
+  }
   renderPlaylistHead();
   if (pl.scrollToCurrent) {
     pl.scrollToCurrent = false;
@@ -494,7 +513,7 @@ function renderPlaylistHead() {
   empty.hidden = m.total > 0;
   empty.textContent = m.count ? t("playlist.no_match") : t("playlist.empty");
   $("pl-play-filtered").disabled = !pl.filter || !m.total;
-  $("pl-export").disabled = !m.count;
+  $("pl-export").disabled = !m.total;
 }
 
 function playlistRow(row, pos) {
@@ -581,6 +600,8 @@ function onPlaylistMenu(e) {
 }
 
 // Filters: they narrow what is shown (and exported), never the play order.
+
+const filterTyped = debounce(() => applyFilter(), 250);
 
 async function loadFacets() {
   const facets = await run("playlist_facets");
@@ -681,9 +702,20 @@ async function onNewPlaylist() {
 }
 
 async function onExport() {
+  // What was typed last counts, even within the filter's debounce.
+  filterTyped.flush();
   const hint = await run("playlist_export_hint");
   if (!hint) return;
-  const filtered = pl.filter && pl.meta ? pl.meta.total : null;
+  let filtered = null;
+  if (pl.filter) {
+    const page = await run("get_playlist", { offset: 0, limit: 1, filter: pl.filter });
+    if (!page) return;
+    filtered = page.total;
+    if (!filtered) {
+      toast(t("err.filter_empty"));
+      return;
+    }
+  }
   const answer = await confirmDialog({
     title: t("playlist.export_title"),
     text: t("playlist.export_text", { folder: hint.music_folder }),
@@ -926,27 +958,56 @@ async function onMenuAction(action) {
 
 // ---------- artists ----------
 // Re-renders (a scan reports new genres every few seconds) keep the open artists
-// and albums, the scroll position and the search text; an unchanged list is not
-// re-rendered at all.
+// and albums, the search text and what is in view. They draw from the albums and
+// tracks already loaded; then the open ones are read again and only rows that
+// changed are replaced, so nothing flickers.
 
 const albumKey = (artist, album) => `${artist}\u0000${album}`;
+const rowKey = (x) => JSON.stringify(x);
+
+/**
+ * Runs `change` (a DOM change in the list) keeping the first artist in view where
+ * it was on screen: rows added or removed above it do not move the view.
+ */
+function keepAnchor(change) {
+  const main = document.querySelector("main");
+  const top = main.getBoundingClientRect().top;
+  const artists = () => [...$("artist-list").children].filter((li) => li.classList.contains("artist"));
+  const anchor = artists().find((li) => li.getBoundingClientRect().bottom > top);
+  const name = anchor ? anchor.dataset.artist : null;
+  const before = anchor ? anchor.getBoundingClientRect().top : 0;
+  const scroll = main.scrollTop;
+  change();
+  const now = name === null ? null : artists().find((li) => li.dataset.artist === name);
+  if (now) main.scrollTop += now.getBoundingClientRect().top - before;
+  else main.scrollTop = scroll;
+}
 
 async function loadArtists() {
   if (state.artists && !state.artistsStale) return;
   state.artistsStale = false;
   const artists = await run("list_artists");
   if (!artists) return;
-  if (sameItems(state.artists, artists)) return;
-  state.artists = artists;
-  state.expanded = keepExpanded(state.expanded, artists);
-  renderArtists();
+  if (!sameItems(state.artists, artists)) {
+    state.artists = artists;
+    state.expanded = keepExpanded(state.expanded, artists);
+    keepAnchor(renderArtists);
+  }
+  // The library changed: open artists and albums may have more (or fewer) rows.
+  for (const li of document.querySelectorAll("#artist-list > li.artist.open")) refreshAlbums(li);
 }
 
 const reloadArtists = debounce(loadArtists, 1000);
 
-function renderArtists() {
-  const main = document.querySelector("main");
-  const scroll = main.scrollTop;
+/**
+ * Draws the artist list from what is loaded: open artists keep their drawn
+ * albums and tracks (`reuse`, off after a language change) or are drawn from
+ * the cache.
+ */
+function renderArtists(reuse = true) {
+  const drawn = new Map(
+    reuse ? [...document.querySelectorAll("#artist-list > li.albums-wrap")].map((w) => [w.dataset.artist, w]) : [],
+  );
   const all = state.artists || [];
   const { items, total, truncated } = limitMatches(all, $("artist-filter").value, ARTIST_LIMIT);
   const frag = document.createDocumentFragment();
@@ -956,7 +1017,7 @@ function renderArtists() {
     li.dataset.artist = name;
     frag.append(li);
     const albums = open && state.albumCache.get(name);
-    if (albums) frag.append(albumsWrap(name, albums));
+    if (albums) frag.append(drawn.get(name) || albumsWrap(name, albums));
   }
   $("artist-list").replaceChildren(frag);
   const note = $("artist-note");
@@ -965,14 +1026,14 @@ function renderArtists() {
   else if (truncated)
     note.textContent = t("artists.truncated", { shown: items.length, total });
   note.hidden = Boolean(total) && !truncated;
-  main.scrollTop = scroll;
-  // Open artists not loaded yet (or opened before a reload): fetch their albums.
-  for (const li of document.querySelectorAll("#artist-list li.artist.open")) {
-    if (!state.albumCache.has(li.dataset.artist)) showAlbums(li);
+  // Open artists whose albums are not loaded yet.
+  for (const li of document.querySelectorAll("#artist-list > li.artist.open")) {
+    if (!state.albumCache.has(li.dataset.artist)) refreshAlbums(li);
   }
 }
 
-function albumsWrap(artist, albums) {
+/** An artist's albums; `tracks` (album name -> drawn tracks) are reused. */
+function albumsWrap(artist, albums, tracks = new Map()) {
   const ul = el("ul", { className: "albums" });
   for (const album of albums) {
     const a = el(
@@ -985,10 +1046,9 @@ function albumsWrap(artist, albums) {
     a.dataset.artist = artist;
     a.dataset.album = album.name;
     ul.append(a);
-    const key = albumKey(artist, album.name);
-    if (state.openAlbums.has(key)) {
+    if (state.openAlbums.has(albumKey(artist, album.name))) {
       a.classList.add("open");
-      ul.append(tracksPlaceholder(a));
+      ul.append(tracks.get(album.name) || tracksWrap(a));
     }
   }
   if (!albums.length) ul.append(el("li", { className: "note", textContent: t("albums.none") }));
@@ -997,14 +1057,33 @@ function albumsWrap(artist, albums) {
   return wrap;
 }
 
-async function showAlbums(li) {
+/** Reads an open artist's albums; redraws them only if they changed, then
+ * refreshes the tracks of its open albums. */
+async function refreshAlbums(li) {
   const artist = li.dataset.artist;
   const albums = await run("list_albums", { artist });
   if (!albums || !li.isConnected || !state.expanded.has(artist)) return;
+  const changed = rowKey(albums) !== rowKey(state.albumCache.get(artist));
   state.albumCache.set(artist, albums);
   const next = li.nextElementSibling;
-  if (next && next.classList.contains("albums-wrap")) next.remove();
-  li.after(albumsWrap(artist, albums));
+  const wrap = next && next.classList.contains("albums-wrap") ? next : null;
+  if (changed || !wrap) {
+    // The tracks already drawn under open albums are moved over, not redrawn.
+    const drawn = new Map();
+    for (const tw of wrap ? wrap.querySelectorAll("li.tracks-wrap") : []) {
+      const album = tw.previousElementSibling;
+      if (album && album.dataset.album !== undefined) drawn.set(album.dataset.album, tw);
+    }
+    keepAnchor(() => {
+      const fresh = albumsWrap(artist, albums, drawn);
+      if (wrap) wrap.replaceWith(fresh);
+      else li.after(fresh);
+    });
+  }
+  for (const a of li.nextElementSibling.querySelectorAll("li.album.open")) {
+    const tracks = a.nextElementSibling && a.nextElementSibling.querySelector("ul.album-tracks");
+    if (tracks) loadTracks(artist, a.dataset.album, tracks);
+  }
 }
 
 function toggleAlbums(li) {
@@ -1018,43 +1097,60 @@ function toggleAlbums(li) {
   }
   state.expanded.add(artist);
   li.classList.add("open");
-  // Fresh albums on every open (the library may have changed).
-  state.albumCache.delete(artist);
-  showAlbums(li);
+  const cached = state.albumCache.get(artist);
+  if (cached) li.after(albumsWrap(artist, cached));
+  // Read again on every open (the library may have changed).
+  refreshAlbums(li);
 }
 
-/** The tracks row under an open album, filled when its tracks arrive. */
-function tracksPlaceholder(albumLi) {
-  const ul = el("ul", { className: "album-tracks" });
-  const wrap = el("li", { className: "tracks-wrap" }, ul);
+/** The tracks under an open album: from the cache at once, else when they arrive. */
+function tracksWrap(albumLi) {
   const { artist, album } = albumLi.dataset;
-  run("list_album_tracks", { artist, album }).then((tracks) => {
-    if (!tracks || !wrap.isConnected) return;
-    ul.replaceChildren(
-      ...tracks.map((tr) => {
-        const label = [tr.track_no ? `${tr.track_no}.` : "", trackLabel({ ...tr, artist: tr.artist === artist ? "" : tr.artist })]
-          .filter(Boolean)
-          .join(" ");
-        const li = el(
-          "li",
-          { className: "track" },
-          el("span", { className: "name", textContent: label, title: trackLabel(tr) }),
-          el("span", { className: "dur", textContent: tr.duration_ms ? formatTime(tr.duration_ms) : "" }),
-          el("button", { type: "button", className: "more", textContent: "⋯", title: t("albums.more") }),
-        );
-        trackOf.set(li, tr);
-        return li;
-      }),
-    );
-  });
-  return wrap;
+  const ul = el("ul", { className: "album-tracks" });
+  const cached = state.trackCache.get(albumKey(artist, album));
+  if (cached) patchTracks(ul, cached, artist);
+  else loadTracks(artist, album, ul);
+  return el("li", { className: "tracks-wrap" }, ul);
+}
+
+async function loadTracks(artist, album, ul) {
+  const tracks = await run("list_album_tracks", { artist, album });
+  if (!tracks || !ul.isConnected) return;
+  state.trackCache.set(albumKey(artist, album), tracks);
+  keepAnchor(() => patchTracks(ul, tracks, artist));
+}
+
+/** Makes `ul` show `tracks`, replacing only the rows that changed. */
+function patchTracks(ul, tracks, artist) {
+  const keys = tracks.map(rowKey);
+  const plan = patchPlan([...ul.children].map((li) => li.dataset.key || ""), keys);
+  for (const i of plan.replace) ul.children[i].replaceWith(trackRow(tracks[i], artist));
+  for (let n = 0; n < plan.remove; n += 1) ul.lastElementChild.remove();
+  for (let i = keys.length - plan.add; i < keys.length; i += 1) ul.append(trackRow(tracks[i], artist));
+}
+
+function trackRow(tr, artist) {
+  const label = [tr.track_no ? `${tr.track_no}.` : "", trackLabel({ ...tr, artist: tr.artist === artist ? "" : tr.artist })]
+    .filter(Boolean)
+    .join(" ");
+  const li = el(
+    "li",
+    { className: "track" },
+    el("span", { className: "name", textContent: label, title: trackLabel(tr) }),
+    el("span", { className: "dur", textContent: tr.duration_ms ? formatTime(tr.duration_ms) : "" }),
+    el("button", { type: "button", className: "more", textContent: "⋯", title: t("albums.more") }),
+  );
+  li.dataset.key = rowKey(tr);
+  trackOf.set(li, tr);
+  return li;
 }
 
 /** Track rows (Artists) -> their track. */
 const trackOf = new WeakMap();
 
 function toggleTracks(albumLi) {
-  const key = albumKey(albumLi.dataset.artist, albumLi.dataset.album);
+  const { artist, album } = albumLi.dataset;
+  const key = albumKey(artist, album);
   const next = albumLi.nextElementSibling;
   if (state.openAlbums.has(key)) {
     state.openAlbums.delete(key);
@@ -1064,7 +1160,10 @@ function toggleTracks(albumLi) {
   }
   state.openAlbums.add(key);
   albumLi.classList.add("open");
-  albumLi.after(tracksPlaceholder(albumLi));
+  const wrap = tracksWrap(albumLi);
+  albumLi.after(wrap);
+  // Shown from the cache: read again in case the album changed.
+  if (state.trackCache.has(key)) loadTracks(artist, album, wrap.firstElementChild);
 }
 
 function albumMenu(artist, album) {
@@ -1273,6 +1372,8 @@ async function onClear() {
   state.selected.clear();
   state.artists = null;
   state.artistsStale = true;
+  state.albumCache.clear();
+  state.trackCache.clear();
   state.unreadable = null;
   state.unreadableCount = 0;
   if (state.settings) state.settings.last_selection = [];
@@ -1504,7 +1605,7 @@ function rerender() {
   renderNowPlaying(state.nowPlaying);
   renderStatus(state.status, state.statusChecking);
   renderGenres();
-  if (state.artists) renderArtists();
+  if (state.artists) keepAnchor(() => renderArtists(false));
   renderUnreadableTab();
   if (state.unreadable) renderUnreadable();
   const scan = state.scanText;
@@ -1614,7 +1715,7 @@ function wire() {
   window.addEventListener("blur", closeCtx);
 
   // Playlist
-  $("pl-filter").addEventListener("input", debounce(applyFilter, 250));
+  $("pl-filter").addEventListener("input", filterTyped);
   $("pl-genre-list").addEventListener("change", (e) => {
     const key = e.target.dataset.key;
     if (key === undefined) return;
@@ -1717,6 +1818,8 @@ async function init() {
     listen("scan-done", (e) => renderScanDone(e.payload)),
     listen("genres-changed", () => {
       refreshGenres();
+      // Genre names may have changed (a merge): the playlist's facets are read again.
+      pl.facetsFor = "";
       state.artistsStale = true;
       if (state.tab === "artists") reloadArtists();
     }),

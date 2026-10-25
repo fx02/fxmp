@@ -55,13 +55,27 @@ export function limitMatches(names, query, limit) {
   return { items, total, truncated: total > items.length };
 }
 
-/** Calls `fn` with the latest arguments once calls have stopped for `ms`. */
+/**
+ * Calls `fn` with the latest arguments once calls have stopped for `ms`.
+ * `.flush()` runs a pending call at once.
+ */
 export function debounce(fn, ms) {
   let timer = null;
-  return (...args) => {
+  let pending = null;
+  const run = () => {
+    const args = pending;
     clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), ms);
+    timer = null;
+    pending = null;
+    if (args) fn(...args);
   };
+  const debounced = (...args) => {
+    pending = args;
+    clearTimeout(timer);
+    timer = setTimeout(run, ms);
+  };
+  debounced.flush = run;
+  return debounced;
 }
 
 // ---------- translation ----------
@@ -313,4 +327,25 @@ export function sameItems(a, b) {
 export function keepExpanded(expanded, names) {
   const present = new Set(names);
   return new Set([...expanded].filter((n) => present.has(n)));
+}
+
+/**
+ * How to turn rows with keys `oldKeys` into rows with `newKeys` touching as few as
+ * possible: the positions to replace, how many to add at the end, how many to
+ * remove from the end.
+ */
+export function patchPlan(oldKeys, newKeys) {
+  const common = Math.min(oldKeys.length, newKeys.length);
+  const replace = [];
+  for (let i = 0; i < common; i += 1) if (oldKeys[i] !== newKeys[i]) replace.push(i);
+  return {
+    replace,
+    add: Math.max(0, newKeys.length - oldKeys.length),
+    remove: Math.max(0, oldKeys.length - newKeys.length),
+  };
+}
+
+/** Wait before the `n`th retry of a failed fetch (1-based); null: give up. */
+export function retryDelay(n) {
+  return n >= 1 && n <= 5 ? 500 * 2 ** (n - 1) : null;
 }

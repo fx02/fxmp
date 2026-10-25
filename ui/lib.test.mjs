@@ -34,6 +34,8 @@ import {
   sameItems,
   keepExpanded,
   genresSummary,
+  patchPlan,
+  retryDelay,
 } from "./lib.mjs";
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
@@ -387,4 +389,33 @@ test("genresSummary: all, one name, or a count", () => {
   assert.equal(genresSummary([], genres, en), en("playlist.genres_all"));
   assert.equal(genresSummary(["house"], genres, en), "House");
   assert.equal(genresSummary(["house", "trance"], genres, en), en("playlist.genres_n", { n: 2 }));
+});
+
+test("debounce: flush runs a pending call now, once", async () => {
+  const seen = [];
+  const f = debounce((x) => seen.push(x), 30);
+  f(1);
+  f(2);
+  f.flush();
+  assert.deepEqual(seen, [2]);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(seen, [2], "the timer was cancelled");
+  f.flush();
+  assert.deepEqual(seen, [2], "nothing pending: nothing runs");
+  f(3);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(seen, [2, 3]);
+});
+
+test("patchPlan: only rows that changed are replaced", () => {
+  assert.deepEqual(patchPlan(["a", "b", "c"], ["a", "b", "c"]), { replace: [], add: 0, remove: 0 });
+  assert.deepEqual(patchPlan(["a", "b", "c"], ["a", "x", "c"]), { replace: [1], add: 0, remove: 0 });
+  assert.deepEqual(patchPlan(["a", "b"], ["a", "b", "c", "d"]), { replace: [], add: 2, remove: 0 });
+  assert.deepEqual(patchPlan(["a", "b", "c"], ["a"]), { replace: [], add: 0, remove: 2 });
+  assert.deepEqual(patchPlan([], ["a"]), { replace: [], add: 1, remove: 0 });
+});
+
+test("retryDelay: backs off, then gives up", () => {
+  assert.deepEqual([1, 2, 3, 4, 5].map(retryDelay), [500, 1000, 2000, 4000, 8000]);
+  assert.equal(retryDelay(6), null);
 });
