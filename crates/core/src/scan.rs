@@ -1152,6 +1152,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // folder permissions
     fn an_unreadable_folder_keeps_its_tracks_bans_and_loudness() {
         use std::os::unix::fs::PermissionsExt;
         let dir = two_folders();

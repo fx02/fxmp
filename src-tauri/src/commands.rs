@@ -834,7 +834,8 @@ pub fn next_now(st: &AppState) {
 }
 
 /// Pause (media key Pause/Stop): also takes back a Play pressed while the resume
-/// waits.
+/// waits. Media keys are wired on macOS only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn pause_now(st: &AppState) {
     lock(&st.resume).press(Press::Pause);
     st.player.send(Command::Pause);

@@ -209,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // folder permissions
     fn local_walk_skips_and_reports_an_unreadable_subfolder() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
