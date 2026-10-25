@@ -417,7 +417,16 @@ impl Servers {
 /// A library's source.
 pub enum LibraryKind {
     Smb(Servers),
-    Local { root: PathBuf, source: LocalSource },
+    Local {
+        root: PathBuf,
+        source: LocalSource,
+    },
+    /// A library for tests whose check runs `probe` (reads an empty folder).
+    #[cfg(test)]
+    Fake {
+        probe: Box<dyn Fn() -> ConnStatus + Send + Sync>,
+        source: LocalSource,
+    },
 }
 
 /// A library in use: its id, name and source.
@@ -543,6 +552,8 @@ impl LibraryConn {
         match &self.kind {
             LibraryKind::Smb(s) => &s.failover,
             LibraryKind::Local { source, .. } => source,
+            #[cfg(test)]
+            LibraryKind::Fake { source, .. } => source,
         }
     }
 
@@ -557,6 +568,8 @@ impl LibraryConn {
         match &self.kind {
             LibraryKind::Smb(s) => s.probe(),
             LibraryKind::Local { root, .. } => folder_status(root),
+            #[cfg(test)]
+            LibraryKind::Fake { probe, .. } => probe(),
         }
     }
 
@@ -564,24 +577,28 @@ impl LibraryConn {
     pub fn active_server(&self) -> Option<Which> {
         match &self.kind {
             LibraryKind::Smb(s) => Some(s.failover.active()),
-            LibraryKind::Local { .. } => None,
-        }
-    }
-
-    /// A local folder that cannot be read right now (checked now, not from the
-    /// last status: a disk unplugged a moment ago counts). SMB trouble comes as
-    /// network errors, which never count against a track anyway.
-    pub fn offline_now(&self) -> bool {
-        match &self.kind {
-            LibraryKind::Smb(_) => false,
-            LibraryKind::Local { root, .. } => !folder_status(root).reachable(),
+            _ => None,
         }
     }
 
     pub fn servers(&self) -> Option<&Servers> {
         match &self.kind {
             LibraryKind::Smb(s) => Some(s),
-            LibraryKind::Local { .. } => None,
+            _ => None,
+        }
+    }
+
+    /// A library whose check runs `probe` (tests).
+    #[cfg(test)]
+    pub fn fake(id: LibraryId, probe: impl Fn() -> ConnStatus + Send + Sync + 'static) -> Self {
+        Self {
+            id,
+            name: String::new(),
+            kind: LibraryKind::Fake {
+                probe: Box::new(probe),
+                source: LocalSource::new(std::env::temp_dir().join("smp-fake-library")),
+            },
+            check: Arc::default(),
         }
     }
 }
@@ -642,6 +659,14 @@ impl Libraries {
 
     pub fn get(&self, id: LibraryId) -> Option<&Arc<LibraryConn>> {
         self.list.iter().find(|l| l.id == id)
+    }
+
+    /// These libraries (tests).
+    #[cfg(test)]
+    pub fn from_conns(list: Vec<LibraryConn>) -> Self {
+        Self {
+            list: list.into_iter().map(Arc::new).collect(),
+        }
     }
 
     #[cfg(test)]
@@ -1080,10 +1105,8 @@ mod tests {
         let disk = dir.path().join("Volumes/USB disk");
         let lib = LibraryConn::local(3, "USB".into(), &disk.display().to_string());
         assert_eq!(lib.probe(), ConnStatus::Missing, "not plugged in");
-        assert!(lib.offline_now());
         std::fs::create_dir_all(&disk).unwrap();
         assert_eq!(lib.probe(), ConnStatus::Ok, "plugged in");
-        assert!(!lib.offline_now());
         // A file where the folder should be is no music folder either.
         let file = dir.path().join("file");
         std::fs::write(&file, "x").unwrap();

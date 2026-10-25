@@ -27,8 +27,12 @@ pub trait LibraryHealth: Send + Sync {
     /// The server an SMB library is reading from, if known (recorded with a failure).
     fn active_server(&self, library: LibraryId) -> Option<Which>;
     /// The library cannot be read now (a disk unplugged, a server down): a failure
-    /// of one of its tracks is not the file's fault.
+    /// of one of its tracks is not the file's fault. Called on the audio engine
+    /// thread, so it must answer at once (no file system or network access).
     fn offline(&self, library: LibraryId) -> bool;
+    /// A track of `library` failed as if its file were bad while the library
+    /// counted as online: have the library checked soon (without waiting).
+    fn recheck(&self, _library: LibraryId) {}
     /// Some library can be read now.
     fn any_online(&self) -> bool;
 }
@@ -159,6 +163,10 @@ impl TrackProvider for CatalogProvider {
             Some(lib) if !failure.code.is_transient() && self.ctx.libraries.offline(lib) => {
                 log::info!("track {id} failed while library {lib} is offline: not counted");
                 Failure::new(FailCode::Unreachable, &failure.message)
+            }
+            Some(lib) if !failure.code.is_transient() => {
+                self.ctx.libraries.recheck(lib);
+                failure.clone()
             }
             _ => failure.clone(),
         };
@@ -296,6 +304,7 @@ mod tests {
     #[derive(Default)]
     struct FakeLibraries {
         lib2_offline: std::sync::atomic::AtomicBool,
+        rechecks: Mutex<Vec<smp_core::LibraryId>>,
     }
 
     impl LibraryHealth for FakeLibraries {
@@ -304,6 +313,9 @@ mod tests {
         }
         fn offline(&self, library: smp_core::LibraryId) -> bool {
             library == 2 && self.lib2_offline.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn recheck(&self, library: smp_core::LibraryId) {
+            lock(&self.rechecks).push(library);
         }
         fn any_online(&self) -> bool {
             true
@@ -450,6 +462,7 @@ mod tests {
             lock(&list).queue.order().iter().any(|e| e.id == on_disk),
             "kept in the playlist"
         );
+        assert!(lock(&health.rechecks).is_empty(), "known to be offline");
         // Plugged in again: a real failure counts.
         health
             .lib2_offline
@@ -457,6 +470,13 @@ mod tests {
         p.on_failed(on_disk, &gone);
         // Library 1 is fine: its failures count as ever.
         p.on_failed(on_nas, &gone);
+        assert_eq!(
+            *lock(&health.rechecks),
+            [2, 1],
+            "each failure asks for a check"
+        );
+        p.on_failed(on_nas, &Failure::new(FailCode::Timeout, "slow"));
+        assert_eq!(lock(&health.rechecks).len(), 2, "not for network trouble");
         fx.flush();
         let u = fx.query.unreadable().unwrap();
         assert_eq!(u.len(), 2);

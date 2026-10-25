@@ -509,6 +509,7 @@ impl AppState {
             libraries: Arc::new(LiveLibraries {
                 source: self.source.clone(),
                 status: self.status.clone(),
+                wake: Mutex::new(lock(&self.wake_monitor).clone()),
             }),
         }
     }
@@ -564,6 +565,8 @@ pub fn resume_decision(status: &StatusPayload, library: Option<LibraryId>) -> (C
 struct LiveLibraries {
     source: Arc<AppSource>,
     status: Arc<Mutex<Option<StatusPayload>>>,
+    /// Asks the connection monitor for a check now.
+    wake: Mutex<Sender<()>>,
 }
 
 impl LibraryHealth for LiveLibraries {
@@ -571,17 +574,19 @@ impl LibraryHealth for LiveLibraries {
         self.source.libraries()?.get(library)?.active_server()
     }
 
-    /// A local folder is checked now; an SMB library is offline while its last
-    /// status says so (a missing share folder on the server reads as "not found").
+    /// From the monitor's last status only: this runs on the audio engine
+    /// thread, where listing a folder on a hung network mount would stop the
+    /// music. A disk unplugged a moment ago is seen at the monitor's next check
+    /// (see [`LibraryHealth::recheck`]).
     fn offline(&self, library: LibraryId) -> bool {
-        let Some(libs) = self.source.libraries() else {
-            return false;
-        };
-        let Some(lib) = libs.get(library) else {
-            return false;
-        };
-        let last = lock(&self.status).as_ref().and_then(|s| s.of(library));
-        lib.offline_now() || last.is_some_and(|s| !s.reachable())
+        lock(&self.status)
+            .as_ref()
+            .and_then(|s| s.of(library))
+            .is_some_and(|s| !s.reachable())
+    }
+    fn recheck(&self, library: LibraryId) {
+        log::debug!("library {library}: a track failed, checking the libraries");
+        let _ = lock(&self.wake).send(());
     }
     fn any_online(&self) -> bool {
         lock(&self.status)
@@ -1708,5 +1713,65 @@ mod tests {
         assert!(done.ok);
         assert_eq!(done.total, 3);
         assert_eq!(done.looks_empty, [lib(2)]);
+    }
+
+    /// A library whose check never answers (a hung network mount).
+    fn hanging_library(id: LibraryId) -> (Libraries, Arc<AtomicBool>, mpsc::Sender<()>) {
+        let probed = Arc::new(AtomicBool::new(false));
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let p = probed.clone();
+        let conn = crate::connection::LibraryConn::fake(id, move || {
+            p.store(true, Ordering::SeqCst);
+            let _ = lock(&wait).recv();
+            ConnStatus::Missing
+        });
+        (Libraries::from_conns(vec![conn]), probed, release)
+    }
+
+    fn status_with(id: LibraryId, status: ConnStatus) -> Option<StatusPayload> {
+        StatusPayload::new(vec![crate::connection::LibraryStatus {
+            id,
+            name: String::new(),
+            status,
+        }])
+    }
+
+    #[test]
+    fn offline_comes_from_the_last_status_and_never_checks_the_library() {
+        let (libs, probed, release) = hanging_library(2);
+        let source = Arc::new(AppSource::default());
+        source.set(Some(libs));
+        let status = Arc::new(Mutex::new(status_with(2, ConnStatus::Ok)));
+        let (wake, woken) = mpsc::channel();
+        let live = Arc::new(LiveLibraries {
+            source,
+            status: status.clone(),
+            wake: Mutex::new(wake),
+        });
+        let (tx, rx) = mpsc::channel();
+        let l = live.clone();
+        std::thread::spawn(move || {
+            let answers = (l.offline(2), l.offline(9));
+            let _ = tx.send(answers);
+        });
+        let answers = rx.recv_timeout(Duration::from_secs(2));
+        let _ = release.send(());
+        assert_eq!(
+            answers,
+            Ok((false, false)),
+            "answered at once, from the status"
+        );
+        *lock(&status) = status_with(2, ConnStatus::Missing);
+        assert!(live.offline(2));
+        assert!(
+            !probed.load(Ordering::SeqCst),
+            "the library was never checked"
+        );
+        // A failure that may mean a disk unplugged a moment ago asks the monitor
+        // for a fresh check instead.
+        assert!(woken.try_recv().is_err());
+        live.recheck(2);
+        assert!(woken.try_recv().is_ok());
     }
 }
