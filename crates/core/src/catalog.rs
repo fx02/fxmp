@@ -107,6 +107,8 @@ pub struct PlaylistCursor {
     pub history_pos: Option<usize>,
     /// Where the current track was, in ms.
     pub position_ms: u64,
+    /// The current track is to be continued (false once the playlist has ended).
+    pub resume: bool,
 }
 
 /// The saved playlist.
@@ -186,7 +188,8 @@ CREATE TABLE IF NOT EXISTS playlist_cursor(
     cursor INTEGER,
     history BLOB NOT NULL,
     history_pos INTEGER,
-    position_ms INTEGER NOT NULL
+    position_ms INTEGER NOT NULL,
+    resume INTEGER NOT NULL DEFAULT 1
 );
 ";
 
@@ -901,13 +904,15 @@ impl Catalog {
 
     pub fn save_playlist_cursor(&self, c: &PlaylistCursor) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO playlist_cursor(id, cursor, history, history_pos, position_ms)
-             VALUES(1, ?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO playlist_cursor(id, cursor, history, history_pos,
+                                                    position_ms, resume)
+             VALUES(1, ?1, ?2, ?3, ?4, ?5)",
             params![
                 c.cursor.map(|v| v as i64),
                 ids_to_blob(c.history.iter().copied()),
                 c.history_pos.map(|v| v as i64),
-                c.position_ms as i64
+                c.position_ms as i64,
+                c.resume
             ],
         )?;
         Ok(())
@@ -935,7 +940,8 @@ impl Catalog {
         let cursor = self
             .conn
             .query_row(
-                "SELECT cursor, history, history_pos, position_ms FROM playlist_cursor WHERE id=1",
+                "SELECT cursor, history, history_pos, position_ms, resume
+                 FROM playlist_cursor WHERE id=1",
                 [],
                 |r| {
                     Ok(PlaylistCursor {
@@ -943,6 +949,7 @@ impl Catalog {
                         history: blob_to_ids(&r.get::<_, Vec<u8>>(1)?),
                         history_pos: r.get::<_, Option<i64>>(2)?.map(|v| v as usize),
                         position_ms: r.get::<_, i64>(3)?.max(0) as u64,
+                        resume: r.get(4)?,
                     })
                 },
             )
@@ -2060,6 +2067,7 @@ mod tests {
             history: vec![5, 9, 42],
             history_pos: Some(2),
             position_ms: 61_500,
+            resume: true,
         };
         c.save_playlist_cursor(&cursor).unwrap();
         let saved = c.load_playlist().unwrap().unwrap();
@@ -2072,11 +2080,13 @@ mod tests {
         // The cursor alone changes often; the order stays.
         let later = PlaylistCursor {
             position_ms: 70_000,
+            resume: false,
             ..cursor
         };
         c.save_playlist_cursor(&later).unwrap();
         let saved = c.load_playlist().unwrap().unwrap();
         assert_eq!(saved.cursor.position_ms, 70_000);
+        assert!(!saved.cursor.resume);
         assert_eq!(saved.order.len(), 60_000);
 
         // A list without a cursor yet loads with an empty one.

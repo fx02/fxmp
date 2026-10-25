@@ -377,29 +377,36 @@ impl<R: Rng> Queue<R> {
     /// `id` is gone for good (banned, deleted, failed): it leaves the order, the
     /// next pass and the history.
     pub fn forget(&mut self, id: TrackId) {
-        let mut removed = false;
-        let mut i = 0;
-        while i < self.order.len() {
-            if self.order[i].id == id {
-                self.order.remove(i);
-                removed = true;
-                if let Some(c) = self.cursor.filter(|&c| i <= c) {
-                    self.cursor = c.checked_sub(1);
-                }
-            } else {
-                i += 1;
+        self.forget_where(|t| t == id);
+    }
+
+    /// [`Self::forget`] for every track `gone` says. The current track stays the
+    /// current one (it may still be playing), but is not played again from here.
+    pub fn forget_where(&mut self, gone: impl Fn(TrackId) -> bool) {
+        let before = self.order.len();
+        let mut kept = 0;
+        let mut cursor = None;
+        for (i, e) in std::mem::take(&mut self.order).into_iter().enumerate() {
+            if self.cursor.is_some_and(|c| i <= c) && !gone(e.id) {
+                cursor = Some(kept);
+            }
+            if !gone(e.id) {
+                self.order.push(e);
+                kept += 1;
             }
         }
-        if let Some(pass) = self.next_pass.as_mut() {
-            pass.retain(|e| e.id != id);
+        if self.cursor.is_some() {
+            self.cursor = cursor;
         }
-        let current = self.current();
-        if current == Some(id) && self.target == Some(Target::Restart) {
+        if let Some(pass) = self.next_pass.as_mut() {
+            pass.retain(|e| !gone(e.id));
+        }
+        if self.current().is_some_and(&gone) && self.target == Some(Target::Restart) {
             self.target = None;
         }
         let mut i = 0;
         while i < self.history.len() {
-            if self.history[i] == id && Some(i) != self.history_pos {
+            if gone(self.history[i]) && Some(i) != self.history_pos {
                 self.history.remove(i);
                 if let Some(p) = self.history_pos.filter(|&p| i < p) {
                     self.history_pos = Some(p - 1);
@@ -411,7 +418,7 @@ impl<R: Rng> Queue<R> {
         if self.target == Some(Target::Back) && !self.can_go_back() {
             self.target = None;
         }
-        if removed {
+        if self.order.len() != before {
             self.changed();
         }
     }
@@ -704,6 +711,22 @@ mod tests {
         assert_eq!(q.current_index(), Some(0));
         q.forget(3);
         assert_eq!(play(&mut q), Some(4));
+    }
+
+    #[test]
+    fn many_tracks_can_be_forgotten_at_once() {
+        let mut q = Queue::fixed(&(1..=10).collect::<Vec<_>>(), rng());
+        for _ in 0..4 {
+            play(&mut q);
+        }
+        q.go_back();
+        q.forget_where(|id| id % 2 == 1);
+        assert_eq!(ids(q.order()), [2, 4, 6, 8, 10]);
+        assert_eq!(q.current_index(), Some(1), "still on 4");
+        assert_eq!(q.successor(), Some(2), "back to 2, 3 is gone");
+        play(&mut q);
+        assert_eq!(play(&mut q), Some(4));
+        assert_eq!(play(&mut q), Some(6));
     }
 
     #[test]
