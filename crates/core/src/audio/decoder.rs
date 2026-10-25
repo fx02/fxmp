@@ -594,6 +594,50 @@ mod tests {
         }
     }
 
+    /// The per-track DSP path at release speed (decode, resample 44.1 → 48 kHz,
+    /// loudness meter, gain, ceiling): `cargo test --release -p smp-core
+    /// dsp_throughput -- --ignored --nocapture`. Prints the median of 5 runs.
+    #[test]
+    #[ignore = "benchmark; run in release"]
+    fn dsp_throughput() {
+        use crate::audio::dsp::{apply_ceiling, db_to_lin, LoudnessMeter};
+        let files = [
+            ("fixtures-audio", "tone1500.flac"),
+            ("fixtures-audio", "step.mp3"),
+        ];
+        let mut runs = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let mut frames = 0u64;
+            while started.elapsed() < std::time::Duration::from_secs(2) {
+                for (dir, name) in files {
+                    let mut d = open(dir, name, 48_000).unwrap();
+                    let mut meter = LoudnessMeter::new(48_000);
+                    let gain = db_to_lin(4.0);
+                    let mut buf = vec![0.0f32; 4096];
+                    loop {
+                        let n = d.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        meter.push(&buf[..n]);
+                        buf[..n].iter_mut().for_each(|s| *s *= gain);
+                        apply_ceiling(&mut buf[..n]);
+                        frames += n as u64 / 2;
+                    }
+                    std::hint::black_box(meter.finish());
+                }
+            }
+            let audio_secs = frames as f64 / 48_000.0;
+            runs.push(audio_secs / started.elapsed().as_secs_f64());
+        }
+        runs.sort_by(f64::total_cmp);
+        println!(
+            "DSP throughput: {:.0}x realtime (median of {runs:.0?})",
+            runs[2]
+        );
+    }
+
     fn rms(s: &[f32]) -> f32 {
         (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt()
     }
