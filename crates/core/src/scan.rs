@@ -38,6 +38,9 @@ pub struct ScanReport {
     /// Listed by the backup server (the primary was down): nothing was removed,
     /// since the backup may lag behind; removals wait for a scan from the primary.
     pub from_backup: bool,
+    /// The listing found no file although the library has tracks (an empty
+    /// mount point where a disk used to be, say): nothing was removed.
+    pub looks_empty: bool,
 }
 
 /// Throttles progress callbacks to one per `PROGRESS_INTERVAL`.
@@ -130,10 +133,22 @@ pub fn scan_with(
     if walk.from_backup {
         log::warn!("scan: listed by the backup server; nothing is removed this time");
     }
+    let looks_empty = entries.is_empty()
+        && !cancel.load(Ordering::Relaxed)
+        && catalog
+            .library_track_counts()?
+            .get(&library)
+            .copied()
+            .unwrap_or(0)
+            > 0;
+    if looks_empty {
+        log::warn!("scan: library {library} lists no file but has tracks; nothing is removed");
+    }
     let report = ScanReport {
         total: entries.len(),
         skipped_dirs: walk.skipped_dirs,
         from_backup: walk.from_backup,
+        looks_empty,
         ..Default::default()
     };
     if cancel.load(Ordering::Relaxed) {
@@ -226,8 +241,9 @@ fn sync_catalog(
         (rep.cb)(&rep.state);
         return Ok(report);
     }
-    // A backup's listing removes nothing: the whole library counts as unseen-but-kept.
-    let keep_under = if report.from_backup {
+    // A backup's listing, or an empty one of a library with tracks, removes
+    // nothing: the whole library counts as unseen-but-kept.
+    let keep_under = if report.from_backup || report.looks_empty {
         vec![String::new()]
     } else {
         report.skipped_dirs.clone()
@@ -321,6 +337,12 @@ fn read_parallel(
                 for r in batch.drain(..) {
                     let e = files[r.index];
                     let failed = r.meta.is_err();
+                    // A file failing because its disk went away is not the file's
+                    // fault: the scan of this library stops, keeping it as it was.
+                    if matches!(&r.meta, Err(f) if !f.code.is_transient()) && !source.available() {
+                        log::warn!("scan: library {library} went away mid-scan; stopping");
+                        return Err(Error::Source(crate::source::SourceError::Unreachable));
+                    }
                     match &r.meta {
                         Ok(meta) => c.upsert_track(library, &e.rel_path, e.size, e.mtime, meta)?,
                         Err(f) => {
@@ -1300,6 +1322,85 @@ mod tests {
             genres(&cat),
             [("chillout".to_string(), 1), ("trance".to_string(), 1)]
         );
+    }
+
+    #[test]
+    fn an_empty_listing_of_a_library_with_tracks_removes_nothing() {
+        let disk = library_dir(&["Jazz/a.mp3", "Rock/b.mp3"]);
+        let mut cat = Catalog::open_in_memory().unwrap();
+        scan_lib(2, &LocalSource::new(disk.path()), &mut cat).unwrap();
+        cat.set_banned(cat.playable_tracks(&[]).unwrap()[0], true)
+            .unwrap();
+        // A stale, empty mount point where the disk used to be: it lists fine.
+        let empty = tempfile::tempdir().unwrap();
+        let r = scan_lib(2, &LocalSource::new(empty.path()), &mut cat).unwrap();
+        assert!(r.looks_empty);
+        assert_eq!(r.removed, 0);
+        assert_eq!(cat.library_track_counts().unwrap()[&2], 2);
+        assert_eq!(cat.banned().unwrap().len(), 1, "the ban is kept");
+        assert_eq!(cat.absent_count(), 0);
+        // A library with no tracks yet that lists nothing is just empty.
+        let r = scan_lib(3, &LocalSource::new(empty.path()), &mut cat).unwrap();
+        assert!(!r.looks_empty);
+    }
+
+    /// A disk pulled out mid-scan: every file it still has to read is "not
+    /// found", and the source says it is no longer there.
+    struct Unplugged {
+        files: Vec<FileEntry>,
+        there: AtomicBool,
+    }
+
+    impl MusicSource for Unplugged {
+        fn walk(
+            &self,
+            on_entry: &mut dyn FnMut(FileEntry),
+        ) -> std::result::Result<WalkReport, SourceError> {
+            self.files.iter().cloned().for_each(on_entry);
+            // Pulled right after the listing.
+            self.there.store(false, Ordering::SeqCst);
+            Ok(WalkReport::default())
+        }
+        fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+            Err(SourceError::NotFound)
+        }
+        fn available(&self) -> bool {
+            self.there.load(Ordering::SeqCst)
+        }
+        fn describe(&self) -> String {
+            "unplugged".into()
+        }
+    }
+
+    #[test]
+    fn a_disk_pulled_mid_scan_stops_its_scan_without_failures() {
+        let disk = library_dir(&["Jazz/a.mp3", "Rock/b.mp3"]);
+        let mut cat = Catalog::open_in_memory().unwrap();
+        scan_lib(2, &LocalSource::new(disk.path()), &mut cat).unwrap();
+        // The files changed on the disk (so they are read again), then it is pulled.
+        let src = Unplugged {
+            files: ["Jazz/a.mp3", "Rock/b.mp3", "Pop/new.mp3"]
+                .iter()
+                .map(|p| FileEntry {
+                    rel_path: p.to_string(),
+                    size: 5,
+                    mtime: 5,
+                })
+                .collect(),
+            there: AtomicBool::new(true),
+        };
+        let r = scan_lib(2, &src, &mut cat);
+        assert!(
+            matches!(r, Err(Error::Source(SourceError::Unreachable))),
+            "{r:?}"
+        );
+        assert!(cat.unreadable().unwrap().is_empty(), "no not_found flood");
+        assert_eq!(
+            cat.library_track_counts().unwrap()[&2],
+            2,
+            "kept, nothing added"
+        );
+        assert_eq!(cat.absent_count(), 0);
     }
 
     #[test]

@@ -127,6 +127,11 @@ impl MusicSource for LocalSource {
     fn describe(&self) -> String {
         self.root.display().to_string()
     }
+
+    /// The music folder can still be listed.
+    fn available(&self) -> bool {
+        fs::read_dir(&self.root).is_ok()
+    }
 }
 
 #[cfg(test)]

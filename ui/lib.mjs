@@ -161,6 +161,7 @@ export function scanDoneText(d, t) {
   const names = (libs) => libs.map((l) => libraryName(l, t)).join(", ");
   if (d.offline && d.offline.length) parts.push(t("scan.offline", { names: names(d.offline) }));
   if (d.from_backup && d.from_backup.length) parts.push(t("scan.from_backup", { names: names(d.from_backup) }));
+  if (d.looks_empty && d.looks_empty.length) parts.push(t("scan.looks_empty", { names: names(d.looks_empty) }));
   return parts.join(" ");
 }
 

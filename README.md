@@ -86,11 +86,23 @@ server's address), an **On** switch and (except the main one) **Remove**:
   be listed from its backup server (the main one was down) only gets new and
   changed files: nothing is removed until a refresh from the main server
   ("Scanned from the backup server, nothing removed: …"), since the backup may
-  lag behind.
+  lag behind. A library whose folder lists no file at all although it has
+  tracks (an empty mount point left behind, say) removes nothing either ("The
+  folder looks empty, nothing removed: …"). A disk pulled out during a refresh
+  stops that library's refresh: its files are not listed as unreadable.
+- A local folder under `/Volumes/<name>` counts as there only while
+  `/Volumes/<name>` is a mounted disk: an empty folder left there after an
+  unclean eject (the disk then mounts as `<name> 1`) shows as "Music folder not
+  found. Is the disk connected?" and is not scanned.
 - The status dot shows the worst state of the libraries in use; its tooltip
   lists each one ("USB: Music folder not found. Is the disk connected?"). A
   library that is down is checked again every 15 s, so a disk plugged back in
   (or a VPN coming up) recovers on its own.
+- On start, the saved playlist resumes once the library of its current track
+  answers. If that library is offline while another one answers, it does not
+  wait: the track is not resumed where it stopped, and the playlist goes on
+  with what can be played.
+- A removed library's id is never given to a new library.
 - Each track plays from its own library. While a library is offline its
   tracks fail as unreachable and are passed over, but they are not counted
   towards the 3 failures that leave a track out of the shuffle (an unplugged
@@ -104,7 +116,9 @@ server's address), an **On** switch and (except the main one) **Remove**:
 - The catalog keeps tracks by library and path. Updating to this version moves
   every existing track to the main server's library in place: bans, loudness,
   years, failures, genre merges, the shuffle history and the saved playlist all
-  stay, and nothing is scanned again.
+  stay, and nothing is scanned again. Should that update fail, it is tried
+  again at the next start (not on every refresh), and until then only the main
+  server's library is refreshed.
 - An exported playlist (`.m3u8`) lists each track's path relative to its own
   library's root, so a playlist mixing libraries only resolves for the tracks
   of the library whose folder it is saved in.

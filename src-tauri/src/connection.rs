@@ -122,14 +122,58 @@ pub fn status_of(
     }
 }
 
-/// A local music folder's status: it must be a folder that can be listed.
+/// Where macOS mounts disks and network volumes.
+const VOLUMES: &str = "/Volumes";
+
+/// A local music folder's status: it must be a folder that can be listed, and
+/// one on a disk under `/Volumes` must be on that disk (see [`unmounted_volume`]).
 pub fn folder_status(path: &std::path::Path) -> ConnStatus {
+    folder_status_in(path, std::path::Path::new(VOLUMES))
+}
+
+/// [`folder_status`] with the folder disks are mounted in.
+pub fn folder_status_in(path: &std::path::Path, volumes: &std::path::Path) -> ConnStatus {
+    if unmounted_volume(path, volumes) {
+        log::debug!("music folder {}: its disk is not mounted", path.display());
+        return ConnStatus::Missing;
+    }
     match std::fs::read_dir(path) {
         Ok(_) => ConnStatus::Ok,
         Err(e) => {
             log::debug!("music folder {}: {e}", path.display());
             ConnStatus::Missing
         }
+    }
+}
+
+/// `path` is on `volumes/<name>`, and that is a plain folder on the same device
+/// as `volumes` rather than a mounted disk: an empty folder left after an unclean
+/// eject (the disk then mounts as `<name> 1`), which must not count as the disk.
+/// A link there (the boot disk's own entry) is not such a folder.
+pub fn unmounted_volume(path: &std::path::Path, volumes: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(rest) = path.strip_prefix(volumes) else {
+            return false;
+        };
+        let Some(name) = rest.components().next() else {
+            return false;
+        };
+        let mount = volumes.join(name);
+        let (Ok(md), Ok(parent)) = (
+            std::fs::symlink_metadata(&mount),
+            std::fs::metadata(volumes),
+        ) else {
+            // Not there at all: listing the folder says so.
+            return false;
+        };
+        !md.file_type().is_symlink() && md.dev() == parent.dev()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, volumes);
+        false
     }
 }
 
@@ -465,6 +509,54 @@ impl LibraryConn {
     }
 }
 
+/// Longest wait for a library's check; one that has not answered by then counts
+/// as unreachable (its check goes on in the background).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A library check.
+pub type Probe = Box<dyn FnOnce() -> ConnStatus + Send>;
+
+/// Runs the checks each on its own thread, so a dead server's connect timeout
+/// does not hold up the others (a disk plugged back in is seen at once). Waits
+/// at most `timeout` in all; a check not done by then is
+/// [`ConnStatus::Unreachable`]. In the given order.
+pub fn probe_all(probes: Vec<(LibraryId, String, Probe)>, timeout: Duration) -> Vec<LibraryStatus> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut statuses: Vec<LibraryStatus> = Vec::with_capacity(probes.len());
+    for (index, (id, name, probe)) in probes.into_iter().enumerate() {
+        statuses.push(LibraryStatus {
+            id,
+            name,
+            status: ConnStatus::Unreachable,
+        });
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("library-check".into())
+            .spawn(move || {
+                let _ = tx.send((index, probe()));
+            });
+        if let Err(e) = spawned {
+            log::warn!("cannot check library {id}: {e}");
+        }
+    }
+    drop(tx);
+    let deadline = Instant::now() + timeout;
+    let mut pending = statuses.len();
+    while pending > 0 {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((index, status)) => {
+                statuses[index].status = status;
+                pending -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+    if pending > 0 {
+        log::warn!("{pending} library check(s) did not answer within {timeout:?}");
+    }
+    statuses
+}
+
 /// The libraries in use: switched on and set up, in the settings' order.
 pub struct Libraries {
     list: Vec<Arc<LibraryConn>>,
@@ -502,18 +594,18 @@ impl Libraries {
         self.list.is_empty()
     }
 
-    /// Checks every library (one after another).
+    /// Checks every library at once (see [`probe_all`]).
     pub fn probe(&self) -> Option<StatusPayload> {
-        StatusPayload::new(
-            self.list
-                .iter()
-                .map(|l| LibraryStatus {
-                    id: l.id,
-                    name: l.name.clone(),
-                    status: l.probe(),
-                })
-                .collect(),
-        )
+        let probes = self
+            .list
+            .iter()
+            .map(|l| {
+                let lib = l.clone();
+                let probe: Probe = Box::new(move || lib.probe());
+                (l.id, l.name.clone(), probe)
+            })
+            .collect();
+        StatusPayload::new(probe_all(probes, PROBE_TIMEOUT))
     }
 }
 
@@ -941,6 +1033,69 @@ mod tests {
         assert_eq!(
             crate::i18n::tr("en", ConnStatus::Missing.text_key()),
             "Music folder not found. Is the disk connected?"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_on_a_volume_that_is_not_mounted_is_missing() {
+        // A plain folder where a disk would be mounted (left after an unclean
+        // eject): same device as the volumes folder, so the disk is not there.
+        let volumes = tempfile::tempdir().unwrap();
+        let stale = volumes.path().join("USB/Music");
+        std::fs::create_dir_all(&stale).unwrap();
+        assert!(unmounted_volume(&stale, volumes.path()));
+        assert_eq!(
+            folder_status_in(&stale, volumes.path()),
+            ConnStatus::Missing
+        );
+        // A real mount point: /dev is a file system of its own under /.
+        assert!(!unmounted_volume(
+            std::path::Path::new("/dev"),
+            std::path::Path::new("/")
+        ));
+        // A folder not under the volumes folder is only checked for being listable.
+        let home = tempfile::tempdir().unwrap();
+        assert!(!unmounted_volume(home.path(), volumes.path()));
+        assert_eq!(
+            folder_status_in(home.path(), volumes.path()),
+            ConnStatus::Ok
+        );
+        // A link in the volumes folder (the boot disk's own entry) is not a stale folder.
+        std::os::unix::fs::symlink(home.path(), volumes.path().join("Boot")).unwrap();
+        assert!(!unmounted_volume(
+            &volumes.path().join("Boot"),
+            volumes.path()
+        ));
+    }
+
+    #[test]
+    fn a_slow_library_does_not_hold_up_the_others() {
+        let slow: Probe = Box::new(|| {
+            std::thread::sleep(Duration::from_secs(3));
+            ConnStatus::Ok
+        });
+        let probes: Vec<(LibraryId, String, Probe)> = vec![
+            (1, "NAS".into(), slow),
+            (2, "USB".into(), Box::new(|| ConnStatus::Missing)),
+            (3, String::new(), Box::new(|| ConnStatus::Ok)),
+        ];
+        let started = Instant::now();
+        let got = probe_all(probes, Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let got: Vec<(LibraryId, ConnStatus)> = got.iter().map(|l| (l.id, l.status)).collect();
+        assert_eq!(
+            got,
+            [
+                (1, ConnStatus::Unreachable),
+                (2, ConnStatus::Missing),
+                (3, ConnStatus::Ok)
+            ],
+            "in order; the one that did not answer in time is unreachable"
         );
     }
 

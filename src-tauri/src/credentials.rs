@@ -122,6 +122,64 @@ pub fn migrate_legacy(creds: &dyn CredentialStore, settings: &Settings) -> usize
     moved
 }
 
+/// A store that remembers every read (also of nothing) for as long as it lives:
+/// used for one start's reads, so an entry macOS asked the user about, and was
+/// refused, is not asked for again by the next read of the same start (the move
+/// of the old entries, then the first library's fallback to them).
+pub struct Remembered<'a> {
+    inner: &'a dyn CredentialStore,
+    read: std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+}
+
+impl<'a> Remembered<'a> {
+    pub fn new(inner: &'a dyn CredentialStore) -> Self {
+        Self {
+            inner,
+            read: Default::default(),
+        }
+    }
+
+    fn remember(&self, account: &str, value: Option<String>) {
+        self.read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(account.to_string(), value);
+    }
+}
+
+impl CredentialStore for Remembered<'_> {
+    fn get(&self, account: &str) -> Option<String> {
+        let known = self
+            .read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account)
+            .cloned();
+        if let Some(value) = known {
+            return value;
+        }
+        let value = self.inner.get(account);
+        self.remember(account, value.clone());
+        value
+    }
+
+    fn set(&self, account: &str, password: &str) -> Result<(), String> {
+        self.inner.set(account, password)?;
+        // Not remembered as set: the move reads it back from the keychain itself.
+        self.read
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(account);
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        self.inner.delete(account)?;
+        self.remember(account, None);
+        Ok(())
+    }
+}
+
 /// The OS keychain via `keyring`, under keychain service `service`.
 pub struct Keychain {
     pub service: &'static str,
@@ -332,5 +390,53 @@ mod tests {
         m.put(2, "10.111.100.2", "music", "two");
         delete_server_password(&m, 1, &s.primary).unwrap();
         assert_eq!(m.accounts(), ["library-2/10.111.100.2/music"]);
+    }
+
+    /// A keychain that asks the user for the old entry, who says no: every read
+    /// of it is a prompt (counted) and gives nothing.
+    #[derive(Default)]
+    struct Refusing {
+        prompts: std::sync::atomic::AtomicUsize,
+    }
+    impl CredentialStore for Refusing {
+        fn get(&self, account: &str) -> Option<String> {
+            if account == "10.111.100.2/music" {
+                self.prompts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            None
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn one_start_asks_for_an_old_entry_once() {
+        let keychain = Refusing::default();
+        let s = two_servers();
+        let start = Remembered::new(&keychain);
+        assert_eq!(migrate_legacy(&start, &s), 0);
+        assert_eq!(server_password(&start, 1, &s.primary), None);
+        assert_eq!(server_password(&start, 1, &s.primary), None);
+        assert_eq!(
+            keychain.prompts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "asked once, not again for the fallback"
+        );
+        // Writes go through and are remembered.
+        let m = MemoryStore::default();
+        let start = Remembered::new(&m);
+        set_server_password(&start, 2, &s.primary, "pw").unwrap();
+        assert_eq!(
+            server_password(&start, 2, &s.primary).as_deref(),
+            Some("pw")
+        );
+        delete_server_password(&start, 2, &s.primary).unwrap();
+        assert_eq!(server_password(&start, 2, &s.primary), None);
+        assert!(m.accounts().is_empty());
     }
 }

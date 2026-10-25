@@ -495,6 +495,14 @@ test("scan texts name the library when several are scanned", () => {
     "Library refreshed: 2 files. New or changed: 0, unreadable: 0, removed: 0. Not reachable, their tracks were kept: USB, Main server.",
   );
   assert.equal(
+    scanDoneText({ ...done, looks_empty: [{ id: 2, name: "USB" }] }, en),
+    "Library refreshed: 2 files. New or changed: 0, unreadable: 0, removed: 0. The folder looks empty, nothing removed: USB.",
+  );
+  assert.equal(
+    scanDoneText({ ...done, looks_empty: [{ id: 2, name: "USB" }] }, hr),
+    "Katalog osvježen: 2 datoteke. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0. Mapa izgleda prazno, ništa nije uklonjeno: USB.",
+  );
+  assert.equal(
     scanDoneText({ ...done, from_backup: [{ id: 1, name: "" }] }, hr),
     "Katalog osvježen: 2 datoteke. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0. Skenirano s rezervnog servera, ništa nije uklonjeno: Glavni server.",
   );

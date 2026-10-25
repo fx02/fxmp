@@ -349,11 +349,38 @@ pub fn save_library_settings(
         source,
     };
     let changed = old.as_ref().is_none_or(|o| o.source != saved.source);
+    new.take_library_id(saved.id);
     match new.libraries.iter_mut().find(|l| l.id == saved.id) {
         Some(slot) => *slot = saved.clone(),
         None => new.libraries.push(saved.clone()),
     }
     Ok((new, saved, changed))
+}
+
+/// Saves library `saved` (formerly `before`): its typed passwords (`typed`:
+/// primary, secondary) go to the keychain, then `save` writes the settings, and
+/// only once that worked are the passwords of servers it no longer has deleted
+/// (a failed save leaves the old server with its password).
+pub fn store_library<T>(
+    creds: &dyn CredentialStore,
+    before: Option<&Library>,
+    saved: &Library,
+    typed: (Option<&str>, Option<&str>),
+    save: impl FnOnce() -> CmdResult<T>,
+) -> CmdResult<T> {
+    if let Some((primary, secondary)) = smb_servers(&saved.source) {
+        if let Some(pw) = typed.0 {
+            credentials::set_server_password(creds, saved.id, primary, pw)?;
+        }
+        if let (Some(server), Some(pw)) = (secondary, typed.1) {
+            credentials::set_server_password(creds, saved.id, server, pw)?;
+        }
+    }
+    let result = save()?;
+    if let Some(before) = before {
+        forget_passwords(creds, saved.id, &before.source, Some(&saved.source))?;
+    }
+    Ok(result)
 }
 
 /// Whether any library's source differs between `old` and `new` (or one came or
@@ -558,33 +585,28 @@ pub async fn save_library(
     run(app, move |app, st| {
         let primary_password = primary_password.filter(|p| !p.is_empty());
         let secondary_password = secondary_password.filter(|p| !p.is_empty());
-        let old = st.settings.get();
+        let mut old = st.settings.get();
+        // Ids with tracks in the catalog (a library the settings lost) are taken too.
+        let in_catalog = lock(&st.query).library_track_counts().map_err(db_err)?;
+        for id in in_catalog.into_keys() {
+            old.take_library_id(id);
+        }
         let (new, saved, changed) = save_library_settings(
             &old,
             library,
             (primary_password.is_some(), secondary_password.is_some()),
         )?;
-        if let Some((primary, secondary)) = smb_servers(&saved.source) {
-            let creds = st.creds.as_ref();
-            if let Some(pw) = &primary_password {
-                credentials::set_server_password(creds, saved.id, primary, pw)?;
-            }
-            if let (Some(server), Some(pw)) = (secondary, &secondary_password) {
-                credentials::set_server_password(creds, saved.id, server, pw)?;
-            }
-        }
-        if let Some(before) = old.library(saved.id) {
-            forget_passwords(
-                st.creds.as_ref(),
-                saved.id,
-                &before.source,
-                Some(&saved.source),
-            )?;
-        }
-        let new = st
-            .settings
-            .replace_and_save(new, |_, _| {})
-            .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
+        let new = store_library(
+            st.creds.as_ref(),
+            old.library(saved.id).as_ref(),
+            &saved,
+            (primary_password.as_deref(), secondary_password.as_deref()),
+            || {
+                st.settings
+                    .replace_and_save(new, |_, _| {})
+                    .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))
+            },
+        )?;
         if changed {
             state::cancel_scan(st, Some(&i18n::t("scan.cancelled_settings")));
         }
@@ -1618,17 +1640,14 @@ pub async fn reset_settings(app: AppHandle, forget_servers: bool) -> CmdResult<S
         log::info!("settings reset to defaults (servers forgotten: {forget_servers})");
         if forget_servers {
             // The other libraries went with the servers: so do their tracks.
+            // (The scan is stopped first, so it cannot write them back.)
             let gone: Vec<LibraryId> = lock(&st.query)
                 .library_track_counts()
                 .map_err(db_err)?
                 .into_keys()
                 .filter(|id| new.library(*id).is_none())
                 .collect();
-            for id in gone {
-                if let Err(e) = st.writer.call(move |c| c.remove_library(id)) {
-                    log::warn!("tracks of library {id} not deleted: {e}");
-                }
-            }
+            state::delete_library_tracks(st, &gone)?;
             if let Err(e) = state::prune_playlist(app, st) {
                 log::warn!("playlist after the reset: {e}");
             }
@@ -1798,8 +1817,10 @@ mod tests {
             forgot,
             Settings {
                 language: "hr".into(),
+                last_library_id: 2,
                 ..Settings::default()
-            }
+            },
+            "library ids are not given out again"
         );
         assert!(creds.accounts().is_empty(), "{:?}", creds.accounts());
         assert_eq!(Settings::load(&path).unwrap(), forgot);
@@ -2175,5 +2196,42 @@ mod tests {
             err(library(1, local("/x"))),
             i18n::tr("en", "err.no_library")
         );
+    }
+
+    #[test]
+    fn an_old_server_keeps_its_password_until_the_settings_are_saved() {
+        let creds = MemoryStore::default();
+        let smb = |host: &str| LibrarySource::Smb {
+            primary: ServerConfig {
+                host: host.into(),
+                username: "u".into(),
+                ..ServerConfig::default()
+            },
+            secondary: None,
+        };
+        let before = library(2, smb("old"));
+        creds.put(2, "old", "u", "old-pw");
+        let after = library(2, smb("new"));
+        let failed: CmdResult<()> = store_library(
+            &creds,
+            Some(&before),
+            &after,
+            (Some("new-pw"), None),
+            || Err("disk full".into()),
+        );
+        assert!(failed.is_err());
+        assert!(
+            creds.accounts().contains(&"library-2/old/u".to_string()),
+            "the saved settings still name the old server: its password stays"
+        );
+        store_library(
+            &creds,
+            Some(&before),
+            &after,
+            (Some("new-pw"), None),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(creds.accounts(), ["library-2/new/u"]);
     }
 }

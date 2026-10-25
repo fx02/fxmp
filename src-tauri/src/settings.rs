@@ -104,6 +104,8 @@ pub struct Settings {
     /// Further libraries (ids above [`DEFAULT_LIBRARY`]), in the order shown.
     #[serde(deserialize_with = "lenient_libraries")]
     pub libraries: Vec<Library>,
+    /// The highest library id ever given out (see [`Settings::next_library_id`]).
+    pub last_library_id: LibraryId,
     /// Linear, 0..1.
     pub volume: f32,
     /// Output device name; `None` = system default.
@@ -133,6 +135,7 @@ impl Default for Settings {
             default_library_name: String::new(),
             default_library_enabled: true,
             libraries: Vec::new(),
+            last_library_id: DEFAULT_LIBRARY,
             volume: 0.7,
             device: None,
             crossfade_enabled: true,
@@ -192,15 +195,21 @@ impl Settings {
             .collect()
     }
 
-    /// The id for a new library (never one in use).
+    /// The id for a new library: never one given out before (a removed
+    /// library's leftovers, in the catalog or the keychain, are never adopted).
     pub fn next_library_id(&self) -> LibraryId {
         self.libraries
             .iter()
             .map(|l| l.id)
+            .chain([self.last_library_id, DEFAULT_LIBRARY])
             .max()
             .unwrap_or(DEFAULT_LIBRARY)
-            .max(DEFAULT_LIBRARY)
             + 1
+    }
+
+    /// Records `id` as given out (or found in the catalog): later ids are above it.
+    pub fn take_library_id(&mut self, id: LibraryId) {
+        self.last_library_id = self.last_library_id.max(id);
     }
 
     /// "Reset settings to defaults": every setting back to its default except the
@@ -208,6 +217,8 @@ impl Settings {
     pub fn reset(&self, forget_servers: bool) -> Self {
         let defaults = Settings {
             language: self.language.clone(),
+            // Ids are never given out twice, whatever is reset.
+            last_library_id: self.next_library_id() - 1,
             ..Settings::default()
         };
         if forget_servers {
@@ -407,6 +418,7 @@ mod tests {
             default_library_name: String::new(),
             default_library_enabled: true,
             libraries: Vec::new(),
+            last_library_id: DEFAULT_LIBRARY,
             volume: 0.2,
             device: Some("USB DAC".into()),
             crossfade_enabled: false,
@@ -640,5 +652,27 @@ mod tests {
         let forgot = s.reset(true);
         assert!(forgot.libraries.is_empty());
         assert_eq!(forgot.all_libraries().len(), 1);
+    }
+
+    #[test]
+    fn library_ids_are_never_used_twice() {
+        let mut s = Settings {
+            libraries: vec![local(2, "/a"), local(3, "/b")],
+            ..Settings::default()
+        };
+        assert_eq!(s.next_library_id(), 4);
+        s.take_library_id(4);
+        s.libraries.retain(|l| l.id < 3);
+        assert_eq!(s.next_library_id(), 5, "3 and 4 were given out");
+        // Rows of a library the settings lost (in the catalog) are not adopted.
+        s.take_library_id(9);
+        assert_eq!(s.next_library_id(), 10);
+        s.take_library_id(2);
+        assert_eq!(s.next_library_id(), 10, "never goes back");
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.next_library_id(), 10);
+        assert_eq!(s.reset(true).next_library_id(), 10, "kept by a reset");
+        let old: Settings = serde_json::from_str(r#"{"volume": 0.5}"#).unwrap();
+        assert_eq!(old.next_library_id(), 2);
     }
 }

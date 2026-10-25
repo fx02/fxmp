@@ -87,4 +87,11 @@ pub trait MusicSource: Send + Sync {
         self.open(rel_path)
     }
     fn describe(&self) -> String;
+    /// Whether the source is there right now (a local disk still plugged in). A
+    /// scan asks this after a file failed, so a source that went away mid-scan
+    /// is not taken as files gone bad. Network sources report trouble as
+    /// network errors instead and say yes.
+    fn available(&self) -> bool {
+        true
+    }
 }

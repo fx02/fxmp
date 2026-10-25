@@ -290,6 +290,21 @@ const MIGRATIONS: &[Migration] = &[
     }),
 ];
 
+/// Catalog files (and the version) whose migration step failed in this run: the
+/// other opens of this run do not try it again (migration 5 copies every track);
+/// the next start does.
+static FAILED_MIGRATIONS: std::sync::Mutex<Vec<(String, i64)>> = std::sync::Mutex::new(Vec::new());
+
+fn failed_migrations() -> std::sync::MutexGuard<'static, Vec<(String, i64)>> {
+    FAILED_MIGRATIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// As at a new start: failed migrations are tried again.
+#[cfg(test)]
+pub(crate) fn forget_failed_migrations() {
+    failed_migrations().clear();
+}
+
 /// `upsert_track` keeps a stored failure only when the file did not change and the
 /// failure was in decoding the audio, which a successful tag read does not disprove.
 const KEEP_ERROR: &str = "size=excluded.size AND mtime=excluded.mtime \
@@ -459,7 +474,21 @@ impl Catalog {
             }
         }
         let _on = ForeignKeysOn(&self.conn);
+        // The file, for remembering a failed step (none for an in-memory catalog).
+        let file = self
+            .conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
         for (to, what, step) in MIGRATIONS.iter().filter(|(to, ..)| *to > version) {
+            if let Some(f) = &file {
+                if failed_migrations().iter().any(|(p, v)| p == f && v == to) {
+                    log::info!(
+                        "catalog: migration to v{to} failed earlier in this run; next start"
+                    );
+                    return;
+                }
+            }
             let started = std::time::Instant::now();
             let done = self.savepoint(|| {
                 step(self)?;
@@ -477,6 +506,9 @@ impl Catalog {
                     log::error!(
                         "catalog: migration to v{to} ({what}) failed, retried next start: {e}"
                     );
+                    if let Some(f) = file {
+                        failed_migrations().push((f, *to));
+                    }
                     return;
                 }
             }
@@ -810,6 +842,19 @@ impl Catalog {
             [library],
         )?;
         Ok(())
+    }
+
+    /// Whether tracks of any library can be stored: false while migration 5 is
+    /// still to be done (a path is then unique across all libraries, so only the
+    /// first library may be scanned).
+    pub fn libraries_ready(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('tracks') WHERE origin='u'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|n| n == 0)
     }
 
     /// Switches libraries on and off: exactly `ids` are off (their tracks are kept
@@ -2920,6 +2965,10 @@ mod tests {
         }
         let c = Catalog::open(&db).unwrap();
         assert_eq!(user_version(&c), 4, "retried next start");
+        assert!(
+            !c.libraries_ready(),
+            "only the first library can be scanned"
+        );
         assert_eq!(library_of(&c, 1), DEFAULT_LIBRARY, "the column is there");
         assert_eq!(c.track_genres(1).unwrap(), vec!["Rock"], "rolled back");
         c.upsert_track(DEFAULT_LIBRARY, "new.mp3", 1, 1, &meta(None))
@@ -2929,6 +2978,16 @@ mod tests {
         c.abort_scan(DEFAULT_LIBRARY).unwrap();
         assert_eq!(c.banned().unwrap().len(), 1);
         assert!(c.load_playlist().unwrap().is_some());
+        // Not tried again by the other opens of this run (each would copy every
+        // track), even once it would work: the next start tries again.
+        c.conn.execute_batch("DROP TABLE tracks_v5").unwrap();
+        drop(c);
+        let again = Catalog::open(&db).unwrap();
+        assert_eq!(user_version(&again), 4);
+        forget_failed_migrations();
+        let next_start = Catalog::open(&db).unwrap();
+        assert_eq!(user_version(&next_start), CATALOG_VERSION);
+        assert!(next_start.libraries_ready());
     }
 
     #[test]

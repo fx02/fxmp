@@ -131,6 +131,9 @@ struct ScanDonePayload {
     offline: Vec<LibraryProblem>,
     /// SMB libraries listed by their backup server: nothing of theirs was removed.
     from_backup: Vec<LibraryRef>,
+    /// Libraries whose folder listed no file although they have tracks (an empty
+    /// mount point, say): nothing of theirs was removed.
+    looks_empty: Vec<LibraryRef>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -350,8 +353,11 @@ impl AppState {
                 .spawn(move || {
                     let st = handle.state::<AppState>();
                     let settings = st.settings.get();
-                    credentials::migrate_legacy(st.creds.as_ref(), &settings);
-                    let libraries = Libraries::from_settings(&settings, st.creds.as_ref());
+                    // One start's reads are remembered: an old entry the user
+                    // refused is not asked for twice.
+                    let start = credentials::Remembered::new(st.creds.as_ref());
+                    credentials::migrate_legacy(&start, &settings);
+                    let libraries = Libraries::from_settings(&settings, &start);
                     if !st.source.set_if_unset(libraries) {
                         return; // Settings were saved meanwhile.
                     }
@@ -412,7 +418,9 @@ impl AppState {
     /// On start, once the library of the track to resume answers (`status`): loads
     /// the saved playlist's current track (or the next one) where it stopped,
     /// paused unless "Resume playing automatically on start" is on or Play was
-    /// pressed meanwhile.
+    /// pressed meanwhile. If that library is offline while another one answers,
+    /// it does not wait: the track is no longer resumed where it stopped, and the
+    /// playlist goes on (an offline track is passed over, not counted as failed).
     pub fn resume_playlist(&self, status: &StatusPayload) {
         let due_track = {
             let mut l = lock(&self.playlist);
@@ -421,7 +429,7 @@ impl AppState {
         let library = due_track
             .and_then(|id| lock(&self.query).track(id).ok())
             .map(|r| r.library_id);
-        let status = resume_status(status, library);
+        let (status, drop_target) = resume_decision(status, library);
         resume_with(
             &self.resume,
             &self.engine,
@@ -429,6 +437,10 @@ impl AppState {
             |pressed| {
                 let due = {
                     let mut l = lock(&self.playlist);
+                    if drop_target {
+                        log::info!("the track to resume is in a library that is offline");
+                        l.resume_at = None;
+                    }
                     !l.ended && l.queue.successor().is_some()
                 };
                 if !due {
@@ -523,20 +535,25 @@ pub fn libraries_off(settings: &Settings, catalog: &Catalog) -> Vec<LibraryId> {
     off
 }
 
-/// The status the resume waits for: that of the library of the track to resume
-/// (`library`), or, when that library is unknown or not in use, the best status
-/// of any (the resume then finds out for itself).
-pub fn resume_status(status: &StatusPayload, library: Option<LibraryId>) -> ConnStatus {
-    library
-        .and_then(|l| status.of(l))
-        .or_else(|| {
-            status
-                .libraries
-                .iter()
-                .map(|l| l.status)
-                .find(|s| s.reachable())
-        })
-        .unwrap_or(status.status)
+/// What the resume waits for, and whether it drops its target: the status of the
+/// library of the track to resume (`library`) when that one answers; otherwise
+/// that of any library that answers, dropping the target if it was in an offline
+/// library (Play is never silent while something can play); with none answering,
+/// the worst status (it waits).
+pub fn resume_decision(status: &StatusPayload, library: Option<LibraryId>) -> (ConnStatus, bool) {
+    let own = library.and_then(|l| status.of(l));
+    if let Some(s) = own.filter(|s| s.reachable()) {
+        return (s, false);
+    }
+    let any = status
+        .libraries
+        .iter()
+        .map(|l| l.status)
+        .find(|s| s.reachable());
+    match any {
+        Some(s) => (s, own.is_some()),
+        None => (status.status, false),
+    }
 }
 
 /// The libraries as the app knows them while playing.
@@ -933,7 +950,10 @@ fn add_up_scans(lang: &str, scans: Vec<LibraryScan>) -> ScanDonePayload {
                 done.removed += r.removed;
                 done.skipped_dirs += r.skipped_dirs.len();
                 if r.from_backup {
-                    done.from_backup.push(library);
+                    done.from_backup.push(library.clone());
+                }
+                if r.looks_empty {
+                    done.looks_empty.push(library);
                 }
             }
             Err(e) => done.offline.push(LibraryProblem {
@@ -947,6 +967,21 @@ fn add_up_scans(lang: &str, scans: Vec<LibraryScan>) -> ScanDonePayload {
         done.error = done.offline.first().map(|p| p.error.clone());
     }
     done
+}
+
+/// Why `lib` is not scanned now, if it is not: a local folder that is not there
+/// (its disk not mounted, see `connection::folder_status`), or any library but
+/// the first while the catalog is not `ready` for libraries.
+fn not_scannable(lib: &crate::connection::LibraryConn, ready: bool) -> Option<String> {
+    if !ready && lib.id != smp_core::DEFAULT_LIBRARY {
+        return Some(i18n::t("err.catalog_pending"));
+    }
+    match lib.kind {
+        crate::connection::LibraryKind::Local { .. } if !lib.probe().reachable() => {
+            Some(i18n::t(ConnStatus::Missing.text_key()))
+        }
+        _ => None,
+    }
 }
 
 /// "Refresh library": scans every library in use, one after another. One that
@@ -964,6 +999,8 @@ fn run_scan(app: &AppHandle) {
         .map(|l| l.iter().cloned().collect())
         .unwrap_or_default();
     let count = libraries.len();
+    // Before the catalog's update for libraries, a path may be in one library only.
+    let ready = lock(&st.query).libraries_ready();
     let mut last_genres = Instant::now();
     let mut scans: Vec<LibraryScan> = Vec::new();
     for (index, lib) in libraries.iter().enumerate() {
@@ -989,6 +1026,11 @@ fn run_scan(app: &AppHandle) {
             }
         };
         progress(&ScanProgress::default());
+        if let Some(reason) = not_scannable(lib, ready) {
+            log::warn!("library {} not scanned: {reason}", lib.id);
+            scans.push((library, Err(smp_core::Error::Other(reason))));
+            continue;
+        }
         let result = Catalog::open(&st.catalog_path).and_then(|mut catalog| {
             scan_with(
                 lib.id,
@@ -1148,6 +1190,29 @@ pub fn prune_playlist(app: &AppHandle, st: &AppState) -> smp_core::Result<()> {
         st.player.send(Command::Requeue);
     }
     st.playlist_changed(app);
+    Ok(())
+}
+
+/// Deletes the tracks of libraries `ids` (no longer in the settings), stopping a
+/// scan first and keeping new ones out meanwhile, so none writes them back.
+pub fn delete_library_tracks(st: &AppState, ids: &[LibraryId]) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let reason = i18n::t("scan.cancelled_settings");
+    let _slot = take_scan_slot(
+        &st.scanning,
+        || {
+            cancel_scan(st, Some(&reason));
+        },
+        CLEAR_SCAN_WAIT,
+    )
+    .ok_or_else(|| i18n::t("err.remove_busy"))?;
+    for &id in ids {
+        if let Err(e) = st.writer.call(move |c| c.remove_library(id)) {
+            log::warn!("tracks of library {id} not deleted (they stay hidden): {e}");
+        }
+    }
     Ok(())
 }
 
@@ -1500,23 +1565,31 @@ mod tests {
     }
 
     #[test]
-    fn the_resume_waits_for_the_library_of_its_track() {
-        let s = statuses(&[(1, ConnStatus::Unreachable), (2, ConnStatus::Ok)]);
-        assert_eq!(
-            resume_status(&s, Some(1)),
-            ConnStatus::Unreachable,
-            "VPN not up yet"
-        );
-        assert_eq!(
-            resume_status(&s, Some(2)),
-            ConnStatus::Ok,
-            "the disk is there"
-        );
+    fn the_resume_goes_ahead_without_its_track_when_only_its_library_is_down() {
+        let both = statuses(&[(1, ConnStatus::Ok), (2, ConnStatus::Ok)]);
+        assert_eq!(resume_decision(&both, Some(2)), (ConnStatus::Ok, false));
+        // The disk with the resume track is unplugged, the server is up: Play is
+        // not silent. The resume goes ahead, drops its target, and the playlist
+        // goes on with what can be played (the unplugged track is passed over).
+        let disk_out = statuses(&[(1, ConnStatus::Ok), (2, ConnStatus::Missing)]);
+        assert_eq!(resume_decision(&disk_out, Some(2)), (ConnStatus::Ok, true));
+        assert_eq!(resume_decision(&disk_out, Some(1)), (ConnStatus::Ok, false));
         // Its library not in use (switched off) or unknown: any library that answers.
-        assert_eq!(resume_status(&s, Some(7)), ConnStatus::Ok);
-        assert_eq!(resume_status(&s, None), ConnStatus::Ok);
+        assert_eq!(resume_decision(&disk_out, Some(7)), (ConnStatus::Ok, false));
+        assert_eq!(resume_decision(&disk_out, None), (ConnStatus::Ok, false));
+        // Nothing answers: it waits, and the status shows why.
         let down = statuses(&[(1, ConnStatus::Unreachable), (2, ConnStatus::Missing)]);
-        assert_eq!(resume_status(&down, None), ConnStatus::Unreachable);
+        assert_eq!(
+            resume_decision(&down, Some(2)),
+            (ConnStatus::Unreachable, false)
+        );
+        assert!(ResumeGate::waiting().due(ConnStatus::Unreachable).is_none());
+        // The secondary counts as up.
+        let backup = statuses(&[(1, ConnStatus::Secondary), (2, ConnStatus::Missing)]);
+        assert_eq!(
+            resume_decision(&backup, Some(2)),
+            (ConnStatus::Secondary, true)
+        );
     }
 
     #[test]
@@ -1542,5 +1615,57 @@ mod tests {
         };
         // 9 is in the catalog but no longer in the settings: hidden, not deleted.
         assert_eq!(libraries_off(&settings, &c), [1, 3, 9]);
+    }
+
+    #[test]
+    fn libraries_that_cannot_be_scanned_now_are_skipped_with_a_reason() {
+        use crate::connection::LibraryConn;
+        let dir = tempfile::tempdir().unwrap();
+        let there = LibraryConn::local(2, String::new(), &dir.path().display().to_string());
+        let gone = LibraryConn::local(3, String::new(), "/no/such/disk");
+        assert_eq!(not_scannable(&there, true), None);
+        assert_eq!(
+            not_scannable(&gone, true),
+            Some(i18n::t("conn.missing")),
+            "not touched, its tracks kept"
+        );
+        // The catalog's update for libraries still to come: only the first library.
+        assert_eq!(
+            not_scannable(&there, false),
+            Some(i18n::t("err.catalog_pending"))
+        );
+        let main = crate::connection::LibraryConn::from_library(
+            &Settings {
+                primary: crate::settings::ServerConfig {
+                    username: "u".into(),
+                    ..Default::default()
+                },
+                ..Settings::default()
+            }
+            .all_libraries()[0],
+            &crate::credentials::MemoryStore::default(),
+        )
+        .unwrap();
+        assert_eq!(not_scannable(&main, false), None);
+    }
+
+    #[test]
+    fn a_refresh_reports_libraries_that_looked_empty() {
+        let lib = |id| LibraryRef {
+            id,
+            name: String::new(),
+        };
+        let empty = smp_core::scan::ScanReport {
+            looks_empty: true,
+            ..Default::default()
+        };
+        let fine = smp_core::scan::ScanReport {
+            total: 3,
+            ..Default::default()
+        };
+        let done = add_up_scans("en", vec![(lib(2), Ok(empty)), (lib(1), Ok(fine))]);
+        assert!(done.ok);
+        assert_eq!(done.total, 3);
+        assert_eq!(done.looks_empty, [lib(2)]);
     }
 }
