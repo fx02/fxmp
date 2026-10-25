@@ -239,6 +239,7 @@
   "settings.about": "About",
   "about.version": "Version {version}",
   "about.build": "Build {commit}, {date}",
+  "about.vibe": "Vibe coded with Claude",
   "about.github": "Source code on GitHub",
   "about.copy_version": "Copy version",
   "about.version_hint": "The version is also at the bottom of the menu bar icon's menu.",

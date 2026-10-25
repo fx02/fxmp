@@ -247,6 +247,7 @@
   "settings.about": "O aplikaciji",
   "about.version": "Verzija {version}",
   "about.build": "Verzija koda {commit}, {date}",
+  "about.vibe": "Vibe coded with Claude",
   "about.github": "Izvorni kod na GitHubu",
   "about.copy_version": "Kopiraj verziju",
   "about.version_hint": "Verzija je i na dnu izbornika ikone u traci izbornika.",

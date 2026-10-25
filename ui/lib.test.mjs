@@ -196,6 +196,14 @@ test("every translation key used by the UI and the Rust code exists", () => {
   for (const key of used) assert.ok(key in LOCALES.en, `missing key ${key}`);
 });
 
+test("About and the README say it was vibe coded with Claude", () => {
+  assert.equal(LOCALES.en["about.vibe"], "Vibe coded with Claude");
+  assert.equal(LOCALES.hr["about.vibe"], "Vibe coded with Claude");
+  assert.match(read("./index.html"), /data-i18n="about\.vibe"/);
+  const top = read("../README.md").split("\n").slice(0, 5);
+  assert.ok(top.includes("Vibe coded with Claude"), top.join("\n"));
+});
+
 test("pluralCategory: en one/other, hr one/few/other with 11-14 as other", () => {
   assert.equal(pluralCategory("en", 1), "one");
   assert.deepEqual([0, 2, 11, 21].map((n) => pluralCategory("en", n)), Array(4).fill("other"));

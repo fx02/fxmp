@@ -1,6 +1,6 @@
 # SMB music player
 
-Vibe coded with Claude.
+Vibe coded with Claude
 
 A macOS-first Tauri 2 player that plays music straight from an SMB share
 (MP3, FLAC, OGG Vorbis). Design: `docs/superpowers/specs/2026-10-24-smb-music-player-design.md`.
