@@ -65,8 +65,40 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
   Right-click (or ⋯) on a genre: "Merge into…" lists the genres that have
   tracks; typing in its search field also finds the other known genres.
   Merging a genre also moves the subgenres filed under it.
+- **Playlist** tab: what plays, in play order. Clicking a genre (or "All", or
+  several genres) fills it with that selection's shuffle; an album fills it in
+  album order. The current track is highlighted, the tracks already played in
+  this pass are dimmed, and each row shows "Artist – Title (Year)" and the
+  length. Click a row to play it now: the playlist goes on from there in the
+  same order (nothing is reshuffled). ↑ / ↓ move a track, × removes it.
+  - Filters (text, genres, a year range and "Unknown year") only narrow what is
+    shown; "Play filtered" starts a new shuffled playlist of just those tracks.
+  - Tracks added by hand (marked +) play once per pass: when a shuffle starts
+    its next pass, they are not in it. "New empty playlist" starts a hand-made
+    list (the playing track plays on).
+  - **Export…** saves the playlist (or, with "Export only filtered (N)", just the
+    filtered rows) as an `.m3u8` file (UTF-8 Extended M3U, which Winamp,
+    foobar2000, VLC, Music/iTunes, Kodi, Android players and most others read).
+    The paths in it are relative to the music folder, so save the file in the
+    root of the music folder on the share (e.g. `F/MP3/`); when the share is
+    mounted under `/Volumes/<share>`, the save dialog starts there.
+  - The playlist, the current track and where it stopped survive a restart: the
+    app starts paused there, and Play continues from that spot. Settings →
+    "Resume playing automatically on start" starts playing instead.
 - **Artists** tab: search for an artist, click it to list the albums (with the
-  year of their earliest track), click an album to play it in order.
+  year of their earliest track), click an album to play it in order. ▾ on an
+  album lists its tracks; + on an album (or right-click) adds it to the
+  playlist ("Play next" or "Add to end"); right-click or click a track for the
+  same, one track at a time. Open artists and albums stay open while the
+  library refreshes.
+- **Right-click on a track** (Playlist, Artists, Unreadable, or the now-playing
+  bar) opens the app's menu: "Copy “Artist – Title”" (with the year when it is
+  known, e.g. `Metallica – Enter Sandman (1991)`), "Look up on" Last.fm,
+  MusicBrainz, Discogs, Wikipedia, YouTube or Genius, "Look up artist", and
+  where they apply "Play next", "Add to end", "Remove from playlist", "Never
+  play again" and "Copy path". Only the artist and title are sent to the site.
+  Clicking the title in the now-playing bar looks it up on the default service
+  (Settings → "Default lookup service", Last.fm unless changed).
 - The year is shown with the track wherever it appears: "Artist – Title (1991)"
   in the window, the menu bar menu and its tooltip. A track without a year in
   its tags shows none. The year comes from the date/year tag (the first
@@ -92,13 +124,19 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
   reported ("N folders could not be read; their tracks were kept"): its tracks
   stay in the library as they were (bans, loudness), instead of being removed.
   A refresh that fails or is cancelled leaves the library as it was.
-- Window controls: ⏯ pause, ⏭ next, 🚫 "never play this track again" (asks for
-  confirmation: click again within 3 s), and a volume slider. Banned tracks come
+- Now-playing bar: "Artist – Title (Year)", the elapsed and total time
+  (`m:ss / m:ss`, `h:mm:ss` for an hour or longer; only the elapsed time when
+  the length is unknown) with a thin progress bar. ⏮ previous (more than 3 s
+  into a track it starts the track again), ⏯ pause, ⏭ next, 🚫 "never play this
+  track again" (asks for confirmation: click again within 3 s), and a volume
+  slider. Banned tracks come
   back with the **Restore** button in Settings.
 - **Settings → Language**: English (default) or Hrvatski; it switches at once,
   the menu bar menu included.
 - **Settings → Playback**: output device, crossfade on/off and its length
-  (1–10 s), and "Normalize volume".
+  (1–10 s), "Normalize volume", "Resume playing automatically on start" (off by
+  default, so a start at login does not start music unasked) and "Default
+  lookup service".
 - **Settings → Danger zone** (each asks for confirmation first):
   - **Reset settings to defaults**: volume, crossfade, output device,
     normalization, notifications, start at login (the login item is removed)
@@ -213,6 +251,18 @@ These cannot be checked automatically (they need listening or clicking):
       menu bar label and tooltip, albums) and bans are still there.
 - [ ] Unreadable tab: "Copy path" and "Copy all" put the text on the clipboard;
       "Retry" removes a row; the count updates after a failed track.
+- [ ] Playlist tab with a real "All" playlist: scrolling stays smooth, the current
+      track is highlighted, clicking a row plays it, filters and "Play filtered" work.
+- [ ] Quit while a track plays halfway, start again: the track and the time are
+      shown paused; Play continues from there (and with "Resume playing
+      automatically on start" on, it plays by itself with a short fade-in).
+- [ ] ⏮ and the Previous media key: after 3 s the track starts again, before
+      that the previous track plays.
+- [ ] Export an `.m3u8` into the music folder root and open it in VLC (or
+      another player): the songs play.
+- [ ] Right-click "Look up on …" and a click on the now-playing title open the
+      browser on the right site; "Copy" puts "Artist – Title (Year)" on the clipboard.
+- [ ] During a library refresh, an open artist in the Artists tab stays open.
 - [ ] Reset settings (with and without "Also forget servers and passwords") and
       Clear library behave as described, and the empty library offers "Refresh library".
 

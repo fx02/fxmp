@@ -13,10 +13,15 @@
 
 <header class="now">
   <div class="now-text">
-    <div id="np-label" class="np-label" title="">—</div>
+    <button id="np-label" class="np-label" type="button" title="">—</button>
     <span id="np-genre" class="chip" hidden></span>
   </div>
+  <div id="np-progress" class="np-progress" hidden>
+    <div class="np-bar"><div id="np-fill" class="np-fill"></div></div>
+    <span id="np-time" class="np-time"></span>
+  </div>
   <div class="now-controls">
+    <button id="btn-prev" class="icon" data-i18n-title="player.previous" data-i18n-aria-label="player.previous">⏮</button>
     <button id="btn-pause" class="icon" data-i18n-title="player.pause_resume" data-i18n-aria-label="player.pause_resume">⏯</button>
     <button id="btn-next" class="icon" data-i18n-title="player.next" data-i18n-aria-label="player.next">⏭</button>
     <button id="btn-ban" class="icon ban" data-i18n-title="player.ban" data-i18n-aria-label="player.ban_label">🚫</button>
@@ -31,6 +36,7 @@
 
 <nav class="tabs" role="tablist">
   <button class="tab" data-tab="genres" role="tab" data-i18n="tabs.genres"></button>
+  <button class="tab" data-tab="playlist" role="tab" data-i18n="tabs.playlist"></button>
   <button class="tab" data-tab="artists" role="tab" data-i18n="tabs.artists"></button>
   <button class="tab" data-tab="unreadable" role="tab" id="tab-btn-unreadable"></button>
   <button class="tab" data-tab="settings" role="tab" data-i18n="tabs.settings"></button>
@@ -47,6 +53,35 @@
     <ul id="genre-list" class="list"></ul>
     <p id="genre-empty" class="note" hidden></p>
     <button id="btn-empty-scan" hidden data-i18n="settings.refresh"></button>
+  </section>
+
+  <section id="tab-playlist" class="panel" hidden>
+    <div class="toolbar">
+      <input id="pl-filter" type="search" data-i18n-placeholder="playlist.filter" data-i18n-aria-label="playlist.filter" autocomplete="off" spellcheck="false">
+      <button id="pl-current" class="icon" data-i18n-title="playlist.show_current" data-i18n-aria-label="playlist.show_current">◎</button>
+    </div>
+    <div class="pl-filters">
+      <details id="pl-genres" class="dropdown">
+        <summary id="pl-genres-label"></summary>
+        <div id="pl-genre-list" class="dropdown-list"></div>
+      </details>
+      <select id="pl-year-from" data-i18n-aria-label="playlist.year_from"></select>
+      <span class="dash">–</span>
+      <select id="pl-year-to" data-i18n-aria-label="playlist.year_to"></select>
+      <label class="check"><input id="pl-unknown-year" type="checkbox"> <span data-i18n="playlist.unknown_year"></span></label>
+    </div>
+    <div class="pl-head">
+      <span id="pl-title" class="pl-title"></span>
+      <span id="pl-count" class="pl-count"></span>
+    </div>
+    <div class="pl-actions">
+      <button id="pl-play-filtered" data-i18n="playlist.play_filtered" disabled></button>
+      <button id="pl-export" data-i18n="playlist.export"></button>
+      <button id="pl-new" data-i18n="playlist.new"></button>
+    </div>
+    <p class="note" data-i18n="playlist.manual_hint"></p>
+    <div id="pl-list" class="pl-list" role="list"></div>
+    <p id="pl-empty" class="note" hidden></p>
   </section>
 
   <section id="tab-artists" class="panel" hidden>
@@ -121,6 +156,10 @@
       <span id="crossfade-label"></span>
     </label>
     <label class="check"><input id="normalize" type="checkbox"> <span data-i18n="settings.normalize"></span></label>
+    <label class="check"><input id="resume-autoplay" type="checkbox"> <span data-i18n="settings.resume_autoplay"></span></label>
+    <label class="field"><span data-i18n="settings.lookup_service"></span>
+      <select id="lookup-service"></select>
+    </label>
 
     <h3 data-i18n="settings.library"></h3>
     <div class="row">
@@ -144,6 +183,8 @@
 <div id="menu" class="menu" hidden>
   <button data-action="merge" data-i18n="genres.merge_into"></button>
 </div>
+
+<div id="ctx" class="menu ctx" role="menu" hidden></div>
 
 <div id="dialog" class="overlay" hidden>
   <form id="dialog-form" class="dialog">

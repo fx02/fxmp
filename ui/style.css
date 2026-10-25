@@ -99,7 +99,20 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* A button (click = look up), drawn as text. */
+  border: none;
+  background: none;
+  padding: 0;
+  text-align: left;
+  border-radius: 0;
 }
+button.np-label:hover:not(:disabled) { background: none; color: var(--accent); }
+button.np-label:disabled { opacity: 1; }
+
+.np-progress { display: flex; align-items: center; gap: 8px; }
+.np-bar { flex: 1; height: 3px; border-radius: 2px; background: var(--border); overflow: hidden; }
+.np-fill { height: 100%; width: 0; background: var(--accent); }
+.np-time { flex: none; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .chip {
   flex: none;
   max-width: 40%;
@@ -286,3 +299,93 @@ button.danger-solid:hover:not(:disabled) { filter: brightness(1.08); background:
 .list li.albums-wrap { display: block; padding: 0; min-height: 0; }
 .list li.albums-wrap:hover { background: none; }
 .dialog .check input { width: auto; }
+
+/* Playlist */
+.pl-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 6px; }
+.pl-filters .check { margin: 0; }
+.pl-filters .dash { color: var(--muted); }
+.pl-head { display: flex; align-items: baseline; gap: 8px; margin: 4px 2px; min-width: 0; }
+.pl-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.pl-count { flex: none; color: var(--muted); font-size: 12px; }
+.pl-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0; }
+.pl-list { position: relative; }
+.pl-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  border-radius: var(--radius);
+}
+.pl-row:hover { background: var(--hover); }
+.pl-row .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pl-row.played { opacity: 0.5; }
+.pl-row.current { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.pl-row .badge { flex: none; color: var(--accent); font-weight: 700; }
+.pl-row .dur, .album-tracks .dur { flex: none; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.row-actions { flex: none; display: flex; gap: 2px; visibility: hidden; }
+.pl-row:hover .row-actions { visibility: visible; }
+.row-actions button { border: none; background: none; padding: 0 5px; color: var(--muted); }
+.row-actions button:hover:not(:disabled) { color: var(--text); }
+
+/* Genre filter dropdown */
+.dropdown { position: relative; }
+.dropdown summary {
+  list-style: none;
+  max-width: 160px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dropdown summary::-webkit-details-marker { display: none; }
+.dropdown summary::after { content: " ▾"; color: var(--muted); }
+.dropdown-list {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 2px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 220px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+}
+.dropdown-list label { display: flex; align-items: center; gap: 6px; padding: 2px 4px; border-radius: var(--radius); }
+.dropdown-list label:hover { background: var(--hover); }
+.dropdown-list .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dropdown-list .count { color: var(--muted); font-size: 12px; }
+
+/* Context menu */
+.ctx { max-width: 280px; }
+.ctx button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx button.indent { padding-left: 24px; }
+.ctx hr { border: none; border-top: 1px solid var(--border); margin: 4px 2px; }
+.ctx .submenu { display: flex; flex-direction: column; }
+
+/* Artists: album actions and tracks */
+.albums li.album .tracks, .albums li.album .add, .album-tracks .more {
+  border: none;
+  background: none;
+  padding: 0 6px;
+  color: var(--muted);
+  visibility: hidden;
+}
+.albums li.album:hover .tracks, .albums li.album:hover .add, .albums li.album.open .tracks,
+.album-tracks li:hover .more { visibility: visible; }
+.list li.tracks-wrap { display: block; padding: 0; min-height: 0; }
+.list li.tracks-wrap:hover { background: none; }
+.album-tracks { list-style: none; margin: 0 0 4px; padding: 0 0 0 16px; }
+.album-tracks li { padding: 2px 6px; min-height: 24px; font-size: 12px; }
+.albums li.album.open > .name { font-weight: 600; }

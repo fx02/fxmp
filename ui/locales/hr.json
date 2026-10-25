@@ -170,5 +170,69 @@
   "err.export": "Ne mogu spremiti popis: {error}",
   "playlist.export_title": "Izvoz popisa",
   "err.lookup_nothing": "Nema se što potražiti.",
-  "err.open_browser": "Ne mogu otvoriti preglednik: {error}"
+  "err.open_browser": "Ne mogu otvoriti preglednik: {error}",
+  "tabs.playlist": "Playlista",
+  "player.lookup_hint": "Klikni za traženje na {service}",
+  "player.no_length": "Trajanje nepoznato",
+  "playlist.filter": "Filtriraj po izvođaču ili naslovu",
+  "playlist.show_current": "Prikaži trenutnu pjesmu",
+  "playlist.genres_all": "Svi žanrovi",
+  "playlist.genres_n": {
+    "one": "{n} žanr",
+    "few": "{n} žanra",
+    "other": "{n} žanrova"
+  },
+  "playlist.year_from": "Od godine",
+  "playlist.year_to": "Do godine",
+  "playlist.unknown_year": "Nepoznata godina",
+  "playlist.count": {
+    "one": "{n} pjesma",
+    "few": "{n} pjesme",
+    "other": "{n} pjesama"
+  },
+  "playlist.count_filtered": {
+    "one": "{shown} od {n} pjesme",
+    "few": "{shown} od {n} pjesme",
+    "other": "{shown} od {n} pjesama"
+  },
+  "playlist.play_filtered": "Sviraj filtrirano",
+  "playlist.export": "Izvezi…",
+  "playlist.new": "Novi prazni popis",
+  "playlist.new_title": "Započeti novi prazni popis?",
+  "playlist.new_text": "Trenutni popis se zamjenjuje; pjesma koja svira nastavlja. Zatim dodaj pjesme iz Izvođača: desni klik na pjesmu ili + na albumu.",
+  "playlist.new_button": "Novi popis",
+  "playlist.manual_hint": "Ručno dodane pjesme (+) sviraju jednom po prolazu: kad shuffle krene u novi prolaz, njih u njemu nema.",
+  "playlist.manual_row": "Dodano ručno: svira jednom po prolazu",
+  "playlist.empty": "Popis je prazan. Klikni žanr ili dodaj pjesme iz Izvođača.",
+  "playlist.no_match": "Nijedna pjesma na popisu ne odgovara filtru.",
+  "playlist.move_up": "Pomakni gore",
+  "playlist.move_down": "Pomakni dolje",
+  "playlist.remove": "Ukloni s popisa",
+  "playlist.added": {
+    "one": "Na popis je dodana {n} pjesma.",
+    "few": "Na popis su dodane {n} pjesme.",
+    "other": "Na popis je dodano {n} pjesama."
+  },
+  "playlist.export_text": "Datoteka navodi pjesme s putanjama u odnosu na glazbenu mapu, pa je spremi u korijen glazbene mape ({folder}); playeri tada pronalaze pjesme.",
+  "playlist.export_only_filtered": "Izvezi samo filtrirano ({n})",
+  "playlist.export_save": "Spremi…",
+  "playlist.exported": {
+    "one": "Spremljena {n} pjesma u {path}",
+    "few": "Spremljene {n} pjesme u {path}",
+    "other": "Spremljeno {n} pjesama u {path}"
+  },
+  "menu.copy_song": "Kopiraj „Izvođač – Naslov”",
+  "menu.copied": "Kopirano: {text}",
+  "menu.lookup_on": "Potraži na",
+  "menu.lookup_artist": "Potraži izvođača",
+  "menu.play_next": "Sviraj sljedeće",
+  "menu.add_to_end": "Dodaj na kraj",
+  "menu.play_album": "Sviraj album",
+  "menu.ban": "Nikad više ne sviraj",
+  "menu.ban_title": "Nikad više ne svirati „{track}”?",
+  "menu.ban_text": "Od sada se preskače. Postavke → Zabranjene pjesme je vraćaju.",
+  "menu.copy_path": "Kopiraj putanju",
+  "albums.tracks": "Prikaži pjesme",
+  "albums.more": "Dodaj na popis…",
+  "settings.lookup_service": "Zadana usluga za traženje"
 }

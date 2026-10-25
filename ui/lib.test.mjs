@@ -24,6 +24,16 @@ import {
   unreadableTabLabel,
   copyAllText,
   formatWhen,
+  formatTime,
+  positionText,
+  progressFraction,
+  queueFilter,
+  exportFileName,
+  windowRange,
+  pageOffsets,
+  sameItems,
+  keepExpanded,
+  genresSummary,
 } from "./lib.mjs";
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
@@ -168,7 +178,7 @@ test("locales: plural forms match the language's categories, placeholders match 
 });
 
 test("every translation key used by the UI and the Rust code exists", () => {
-  const KEY = /["'`]((?:language|player|conn|tabs|genres|merge|common|artists|albums|settings|scan|tray|err|unreadable)\.[a-z_]+)["'`]/g;
+  const KEY = /["'`]((?:language|player|conn|tabs|genres|merge|common|artists|albums|settings|scan|tray|err|unreadable|playlist|menu)\.[a-z_]+)["'`]/g;
   const sources = [read("./app.js"), read("./lib.mjs"), read("./index.html")];
   const rustDir = new URL("../src-tauri/src/", import.meta.url);
   for (const f of readdirSync(rustDir).filter((f) => f.endsWith(".rs"))) sources.push(read(`../src-tauri/src/${f}`));
@@ -300,4 +310,81 @@ test("passwordRequired when the keychain account (host/username) or share is new
   assert.equal(passwordRequired(saved, { ...saved, share: "G" }), true);
   assert.equal(passwordRequired(null, saved), true, "server not saved before");
   assert.equal(passwordRequired({ ...saved, username: "" }, saved), true, "never configured");
+});
+
+test("formatTime: m:ss, h:mm:ss for an hour or more", () => {
+  assert.equal(formatTime(0), "0:00");
+  assert.equal(formatTime(5_999), "0:05");
+  assert.equal(formatTime(65_000), "1:05");
+  assert.equal(formatTime(599_000), "9:59");
+  assert.equal(formatTime(3_600_000), "1:00:00");
+  assert.equal(formatTime(3_725_000), "1:02:05");
+  assert.equal(formatTime(65_000, true), "0:01:05", "hours shown to match a long total");
+  assert.equal(formatTime(-5), "0:00");
+  assert.equal(formatTime(null), "0:00");
+});
+
+test("positionText: elapsed / total, only elapsed when the length is unknown", () => {
+  assert.equal(positionText(83_000, 296_000), "1:23 / 4:56");
+  assert.equal(positionText(83_000, null), "1:23");
+  assert.equal(positionText(83_000, 0), "1:23");
+  assert.equal(positionText(65_000, 3_725_000), "0:01:05 / 1:02:05");
+  assert.equal(positionText(300_000, 296_000), "4:56 / 4:56", "never past the end");
+});
+
+test("progressFraction: 0..1, null when the length is unknown", () => {
+  assert.equal(progressFraction(0, 200_000), 0);
+  assert.equal(progressFraction(50_000, 200_000), 0.25);
+  assert.equal(progressFraction(300_000, 200_000), 1);
+  assert.equal(progressFraction(10, null), null);
+  assert.equal(progressFraction(10, 0), null);
+});
+
+test("queueFilter: only what is set, years as a sorted range", () => {
+  assert.equal(queueFilter({ text: "  ", genres: [], from: null, to: null, unknownYear: false }), null);
+  assert.deepEqual(queueFilter({ text: " abba ", genres: [] }), { text: "abba" });
+  assert.deepEqual(queueFilter({ genres: ["trance", "house"] }), { genres: ["trance", "house"] });
+  assert.deepEqual(queueFilter({ from: 1990, to: 1999 }), { years: [1990, 1999] });
+  assert.deepEqual(queueFilter({ from: 1999, to: 1990 }), { years: [1990, 1999] });
+  assert.deepEqual(queueFilter({ from: 1990 }), { years: [1990, 9999] });
+  assert.deepEqual(queueFilter({ to: 1985 }), { years: [0, 1985] });
+  assert.deepEqual(queueFilter({ unknownYear: true }), { unknown_year: true });
+  assert.deepEqual(queueFilter({ from: 2000, unknownYear: true }), { years: [2000, 9999], unknown_year: true });
+});
+
+test("exportFileName: name, local date, .m3u8", () => {
+  const d = new Date(2026, 9, 5, 23, 59);
+  assert.equal(exportFileName("Trance + Chillout", d), "Trance + Chillout 2026-10-05.m3u8");
+  assert.equal(exportFileName("", d), "Playlist 2026-10-05.m3u8");
+});
+
+test("windowRange: the rows in view plus a margin, within the list", () => {
+  // List starts 100 px below the top of a 300 px view, rows of 30 px.
+  assert.deepEqual(windowRange(100, 300, 30, 1000, 5), { start: 0, end: 12 });
+  // Scrolled: the list's top is 3000 px above the view.
+  assert.deepEqual(windowRange(-3000, 300, 30, 1000, 5), { start: 95, end: 115 });
+  assert.deepEqual(windowRange(-29_900, 300, 30, 1000, 5), { start: 991, end: 1000 });
+  assert.deepEqual(windowRange(0, 300, 30, 0, 5), { start: 0, end: 0 });
+});
+
+test("pageOffsets: the pages covering a range", () => {
+  assert.deepEqual(pageOffsets(0, 12, 200), [0]);
+  assert.deepEqual(pageOffsets(190, 215, 200), [0, 200]);
+  assert.deepEqual(pageOffsets(400, 400, 200), []);
+});
+
+test("artists: an unchanged list is left alone, open artists stay open", () => {
+  assert.ok(sameItems(["A", "B"], ["A", "B"]));
+  assert.ok(!sameItems(["A", "B"], ["A", "C"]));
+  assert.ok(!sameItems(["A"], ["A", "B"]));
+  assert.ok(!sameItems(null, ["A"]));
+  const open = new Set(["Abba", "Gone", ""]);
+  assert.deepEqual([...keepExpanded(open, ["", "Abba", "Queen"])].sort(), ["", "Abba"]);
+});
+
+test("genresSummary: all, one name, or a count", () => {
+  const genres = [{ key: "trance", display: "Trance" }, { key: "house", display: "House" }];
+  assert.equal(genresSummary([], genres, en), en("playlist.genres_all"));
+  assert.equal(genresSummary(["house"], genres, en), "House");
+  assert.equal(genresSummary(["house", "trance"], genres, en), en("playlist.genres_n", { n: 2 }));
 });

@@ -167,5 +167,64 @@
   "err.export": "Cannot save the playlist: {error}",
   "playlist.export_title": "Export playlist",
   "err.lookup_nothing": "There is nothing to look up.",
-  "err.open_browser": "Cannot open the browser: {error}"
+  "err.open_browser": "Cannot open the browser: {error}",
+  "tabs.playlist": "Playlist",
+  "player.lookup_hint": "Click to look up on {service}",
+  "player.no_length": "Length unknown",
+  "playlist.filter": "Filter by artist or title",
+  "playlist.show_current": "Show the current track",
+  "playlist.genres_all": "All genres",
+  "playlist.genres_n": {
+    "one": "{n} genre",
+    "other": "{n} genres"
+  },
+  "playlist.year_from": "From year",
+  "playlist.year_to": "To year",
+  "playlist.unknown_year": "Unknown year",
+  "playlist.count": {
+    "one": "{n} track",
+    "other": "{n} tracks"
+  },
+  "playlist.count_filtered": {
+    "one": "{shown} of {n} track",
+    "other": "{shown} of {n} tracks"
+  },
+  "playlist.play_filtered": "Play filtered",
+  "playlist.export": "Export…",
+  "playlist.new": "New empty playlist",
+  "playlist.new_title": "Start a new empty playlist?",
+  "playlist.new_text": "The current playlist is replaced; the playing track plays on. Then add tracks from Artists: right-click a track, or use + on an album.",
+  "playlist.new_button": "New playlist",
+  "playlist.manual_hint": "Tracks added by hand (+) play once per pass: when a shuffle starts its next pass, they are not in it.",
+  "playlist.manual_row": "Added by hand: plays once per pass",
+  "playlist.empty": "The playlist is empty. Click a genre, or add tracks from Artists.",
+  "playlist.no_match": "No track in the playlist matches the filter.",
+  "playlist.move_up": "Move up",
+  "playlist.move_down": "Move down",
+  "playlist.remove": "Remove from playlist",
+  "playlist.added": {
+    "one": "Added {n} track to the playlist.",
+    "other": "Added {n} tracks to the playlist."
+  },
+  "playlist.export_text": "The file lists the songs with paths relative to the music folder, so save it in the root of the music folder ({folder}); players then find the songs.",
+  "playlist.export_only_filtered": "Export only filtered ({n})",
+  "playlist.export_save": "Save…",
+  "playlist.exported": {
+    "one": "Saved {n} track to {path}",
+    "other": "Saved {n} tracks to {path}"
+  },
+  "menu.copy_song": "Copy “Artist – Title”",
+  "menu.copied": "Copied: {text}",
+  "menu.lookup_on": "Look up on",
+  "menu.lookup_artist": "Look up artist",
+  "menu.play_next": "Play next",
+  "menu.add_to_end": "Add to end",
+  "menu.play_album": "Play album",
+  "menu.ban": "Never play again",
+  "menu.ban_title": "Never play “{track}” again?",
+  "menu.ban_text": "It is skipped from now on. Settings → Banned tracks brings it back.",
+  "menu.copy_path": "Copy path",
+  "albums.tracks": "Show the tracks",
+  "albums.more": "Add to playlist…",
+  "settings.lookup_service": "Default lookup service"
 }
