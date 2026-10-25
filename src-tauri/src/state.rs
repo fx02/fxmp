@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager};
 
 use crate::connection::{monitor, AppSource, ConnStatus, Servers, StatusPayload};
 use crate::credentials::{CredentialStore, Keychain};
+use crate::devdata;
 use crate::i18n;
 use crate::playlist::{self, SharedPlaylist};
 use crate::provider::{BannedSet, CatalogProvider, Playback};
@@ -166,8 +167,20 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl AppState {
     /// Opens settings, catalog and player and starts the background threads.
     pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-        let settings_path = app.path().app_config_dir()?.join(settings::FILE_NAME);
-        let data_dir = app.path().app_data_dir()?;
+        let dev_dir = devdata::current();
+        let (config_dir, data_dir) = match &dev_dir {
+            Some(dir) => {
+                log::warn!(
+                    "debug build: data in {} ({}), passwords under keychain service {}",
+                    dir.display(),
+                    devdata::ENV,
+                    devdata::DEV_SERVICE
+                );
+                (dir.clone(), dir.clone())
+            }
+            None => (app.path().app_config_dir()?, app.path().app_data_dir()?),
+        };
+        let settings_path = config_dir.join(settings::FILE_NAME);
         std::fs::create_dir_all(&data_dir)?;
         let catalog_path = data_dir.join("catalog.db");
 
@@ -195,7 +208,9 @@ impl AppState {
         };
         let playback_db = Catalog::open(&catalog_path)?;
         let writer = CatalogWriter::spawn(Catalog::open(&catalog_path)?)?;
-        let creds: Arc<dyn CredentialStore> = Arc::new(Keychain);
+        let creds: Arc<dyn CredentialStore> = Arc::new(Keychain {
+            service: devdata::keychain_service(dev_dir.is_some()),
+        });
 
         // Servers are set once their passwords are read (see below).
         let source = Arc::new(AppSource::default());

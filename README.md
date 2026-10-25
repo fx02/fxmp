@@ -168,6 +168,18 @@ cargo test -p smb-music-player live_ -- --ignored
 ```
 
 Live tests (`cargo test -- --ignored`) only read from the server; nothing is written.
+
+**Running a development build next to the installed app.** A debug build reads
+`SMP_DATA_DIR`: when it is set, settings, the library and the playlist live in
+that folder, passwords go to the keychain service `smb-music-player-dev`
+instead of `smb-music-player`, and the build does not hand over to (or block) a
+running installed app. Nothing of the installed app is read or written.
+Release builds ignore the variable.
+
+```sh
+SMP_DATA_DIR=$(mktemp -d) cargo run -p smb-music-player
+# afterwards: rm -rf that folder; security delete-generic-password -s smb-music-player-dev
+```
 CI (`.github/workflows/build.yml`, on push to `main` and manually) runs the tests
 and builds the macOS `.dmg` and the Windows `.msi`/`.exe` as artifacts.
 

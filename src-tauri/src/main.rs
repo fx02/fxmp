@@ -5,6 +5,7 @@ mod autostart;
 mod commands;
 mod connection;
 mod credentials;
+mod devdata;
 mod i18n;
 mod media;
 mod playlist;
@@ -22,13 +23,18 @@ const LOG_FILTER: &str = "info,smb=warn,smb_music_player=info";
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(LOG_FILTER)).init();
-    tauri::Builder::default()
-        // First, so a second launch exits before anything else starts.
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+    let mut builder = tauri::Builder::default();
+    // First, so a second launch exits before anything else starts. A debug build
+    // with its own data folder runs beside the installed app instead of handing
+    // over to it.
+    if devdata::current().is_none() {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if !autostart::is_autostart_launch(&args) {
                 tray::show_main_window(app);
             }
-        }))
+        }));
+    }
+    builder
         .plugin(tauri_plugin_notification::init())
         .plugin(autostart::plugin())
         .setup(|app| {

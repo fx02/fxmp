@@ -1,5 +1,6 @@
 //! SMB passwords in the OS keychain (service `smb-music-player`, account
-//! `{host}/{username}`). Passwords are never written to files or logs.
+//! `{host}/{username}`). Passwords are never written to files or logs. A debug
+//! build with `SMP_DATA_DIR` set uses another service (see `devdata`).
 
 pub const SERVICE: &str = "smb-music-player";
 
@@ -15,26 +16,28 @@ pub trait CredentialStore: Send + Sync {
     fn delete(&self, host: &str, username: &str) -> Result<(), String>;
 }
 
-/// The OS keychain via `keyring`.
-pub struct Keychain;
+/// The OS keychain via `keyring`, under keychain service `service`.
+pub struct Keychain {
+    pub service: &'static str,
+}
 
 impl CredentialStore for Keychain {
     fn get(&self, host: &str, username: &str) -> Option<String> {
-        get(host, username)
+        get(self.service, host, username)
     }
 
     fn set(&self, host: &str, username: &str, password: &str) -> Result<(), String> {
-        set(host, username, password)
+        set(self.service, host, username, password)
     }
 
     fn delete(&self, host: &str, username: &str) -> Result<(), String> {
-        delete(host, username)
+        delete(self.service, host, username)
     }
 }
 
 /// The stored password, or `None` if there is none (or the keychain cannot be read).
-pub fn get(host: &str, username: &str) -> Option<String> {
-    let entry = match keyring::Entry::new(SERVICE, &account(host, username)) {
+fn get(service: &str, host: &str, username: &str) -> Option<String> {
+    let entry = match keyring::Entry::new(service, &account(host, username)) {
         Ok(e) => e,
         Err(e) => {
             log::warn!("keychain entry for {host}: {e}");
@@ -51,15 +54,15 @@ pub fn get(host: &str, username: &str) -> Option<String> {
     }
 }
 
-pub fn set(host: &str, username: &str, password: &str) -> Result<(), String> {
-    keyring::Entry::new(SERVICE, &account(host, username))
+fn set(service: &str, host: &str, username: &str, password: &str) -> Result<(), String> {
+    keyring::Entry::new(service, &account(host, username))
         .and_then(|e| e.set_password(password))
         .map_err(|e| crate::i18n::tf("err.keychain", &[("error", &e.to_string())]))
 }
 
-pub fn delete(host: &str, username: &str) -> Result<(), String> {
+fn delete(service: &str, host: &str, username: &str) -> Result<(), String> {
     let result =
-        keyring::Entry::new(SERVICE, &account(host, username)).and_then(|e| e.delete_credential());
+        keyring::Entry::new(service, &account(host, username)).and_then(|e| e.delete_credential());
     match result {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(crate::i18n::tf(
