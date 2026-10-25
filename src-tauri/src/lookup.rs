@@ -116,14 +116,17 @@ pub fn artist_url(service: Service, artist: &str) -> String {
     }
 }
 
-/// Whether `url` is `https://` on one of [`ALLOWED_HOSTS`] (exactly: no port, no
-/// user info, no other subdomain).
+/// Whether `url`, parsed as a browser would, is `https` on one of
+/// [`ALLOWED_HOSTS`] exactly, with no user info and no explicit port.
 pub fn is_allowed(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
+    let Ok(u) = tauri::Url::parse(url) else {
         return false;
     };
-    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    ALLOWED_HOSTS.contains(&host)
+    u.scheme() == "https"
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.port().is_none()
+        && u.host_str().is_some_and(|h| ALLOWED_HOSTS.contains(&h))
 }
 
 /// "Artist – Title (1991)" (no year when unknown): what "Copy" puts on the
@@ -285,6 +288,19 @@ mod tests {
             assert!(!is_allowed(bad), "{bad}");
         }
         assert!(is_allowed("https://genius.com"));
+        for bad in [
+            "https://evil.com\\.www.last.fm/",
+            "https://www.last.fm%2Fevil.com/",
+            "https://:pw@www.last.fm/x",
+            "https://www.last.fm:1/x",
+            "not a url",
+        ] {
+            assert!(!is_allowed(bad), "{bad}");
+        }
+        // Parsed like a browser does: the same host in other letters is that host,
+        // and a backslash ends the host (it is a path separator in https URLs).
+        assert!(is_allowed("https://www.last.fm\\@evil.com/"));
+        assert!(is_allowed("https://WWW.Last.FM/search?q=x"));
     }
 
     #[test]

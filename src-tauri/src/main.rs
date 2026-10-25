@@ -113,7 +113,6 @@ fn main() {
             commands::playlist_move,
             commands::playlist_new,
             commands::playlist_play_filtered,
-            commands::playlist_export,
             commands::playlist_export_hint,
             commands::list_album_tracks,
             commands::set_resume_autoplay,

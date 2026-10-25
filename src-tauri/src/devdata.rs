@@ -3,6 +3,7 @@
 //! developer build never reads or writes the installed app's data. Release builds
 //! ignore the variable.
 
+#[cfg_attr(not(debug_assertions), allow(unused_imports))]
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -16,6 +17,7 @@ pub const DEV_SERVICE: &str = "smb-music-player-dev";
 
 /// The folder to use instead of the app's own: only in a debug build and only for
 /// a non-empty `value`.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub fn data_dir_override(debug: bool, value: Option<OsString>) -> Option<PathBuf> {
     if !debug {
         return None;
@@ -32,11 +34,18 @@ pub fn keychain_service(overridden: bool) -> &'static str {
     }
 }
 
-/// The override of this process (read once).
+/// The override of this process (read once). A release build does not even read
+/// the variable.
+#[cfg(debug_assertions)]
 pub fn current() -> Option<PathBuf> {
     static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| data_dir_override(cfg!(debug_assertions), std::env::var_os(ENV)))
+    DIR.get_or_init(|| data_dir_override(true, std::env::var_os(ENV)))
         .clone()
+}
+
+#[cfg(not(debug_assertions))]
+pub fn current() -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]

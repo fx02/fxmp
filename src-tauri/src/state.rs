@@ -147,9 +147,9 @@ pub struct AppState {
     /// The restored playlist waiting for the share, and Play presses meanwhile.
     /// Held while the resume, or a press, decides and sends its command.
     pub resume: Mutex<ResumeGate>,
-    /// The engine's current track (playing, paused or cued): set by every start,
-    /// also of a track the catalog no longer has; cleared when it goes idle.
-    pub engine_track: Mutex<Option<TrackId>>,
+    /// What the engine has (see [`Engine`]): loading from a sent Play/Cue, then
+    /// the started track (also one the catalog no longer has) until it goes idle.
+    pub engine: Mutex<Engine>,
     launched_at: Instant,
     scanning: AtomicBool,
     /// "Clear library" holds the scan slot: shown as such, not as a scan.
@@ -250,7 +250,7 @@ impl AppState {
             save_playlist: Mutex::new(save_tx),
             playlist_saved_at: Mutex::new(Instant::now()),
             resume: Mutex::new(ResumeGate::waiting()),
-            engine_track: Mutex::new(None),
+            engine: Mutex::new(Engine::Empty),
             launched_at: Instant::now(),
             scanning: AtomicBool::new(false),
             clearing: AtomicBool::new(false),
@@ -365,9 +365,9 @@ impl AppState {
     /// Plays the playlist from what is due now (fading out what plays), as the user
     /// asked; a held-back resume is dropped.
     pub fn play_playlist(&self) {
-        let mut gate = lock(&self.resume);
-        gate.cancel();
-        self.player.send(Command::Play(self.provider()));
+        start_with(&self.resume, &self.engine, || {
+            self.player.send(Command::Play(self.provider()))
+        });
     }
 
     /// The playlist changed: tells the UI and saves it.
@@ -380,30 +380,32 @@ impl AppState {
     /// current track (or the next one) where it stopped, paused unless "Resume
     /// playing automatically on start" is on or Play was pressed meanwhile.
     pub fn resume_playlist(&self, status: ConnStatus) {
-        // Held until the command is sent: a press either comes before (and is
-        // taken along) or after (and finds the track loaded or loading).
-        let mut gate = lock(&self.resume);
-        let Some(pressed) = gate.due(status) else {
-            return;
-        };
-        let due = {
-            let mut l = lock(&self.playlist);
-            !l.ended && l.queue.successor().is_some()
-        };
-        if !due {
-            return;
-        }
-        let late = resume_is_late(self.launched_at, Instant::now());
-        let command = resume_command(&self.settings.get(), self.provider(), late, pressed);
-        log::info!(
-            "playlist restored, {}",
-            if matches!(command, Command::Cue(_)) {
-                "paused"
-            } else {
-                "playing"
-            }
+        resume_with(
+            &self.resume,
+            &self.engine,
+            status,
+            |pressed| {
+                let due = {
+                    let mut l = lock(&self.playlist);
+                    !l.ended && l.queue.successor().is_some()
+                };
+                if !due {
+                    return None;
+                }
+                let late = resume_is_late(self.launched_at, Instant::now());
+                let command = resume_command(&self.settings.get(), self.provider(), late, pressed);
+                log::info!(
+                    "playlist restored, {}",
+                    if matches!(command, Command::Cue(_)) {
+                        "paused"
+                    } else {
+                        "playing"
+                    }
+                );
+                Some(command)
+            },
+            |command| self.player.send(command),
         );
-        self.player.send(command);
     }
 
     pub fn wake_monitor(&self) {
@@ -537,14 +539,77 @@ impl ResumeGate {
     }
 }
 
-/// The engine's current track after event `ev`: a start sets it (whatever the
-/// catalog knows), going idle clears it.
-pub fn engine_track_after(current: Option<TrackId>, ev: &Event) -> Option<TrackId> {
+/// What the engine has, as far as Play/Pause cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// Nothing loaded (at start, or idle).
+    #[default]
+    Empty,
+    /// A Play or Cue was sent and its track has not started yet.
+    Loading,
+    /// This track started (playing, paused or cued).
+    Track(TrackId),
+}
+
+impl Engine {
+    /// Whether Play/Pause goes to the player (rather than starting the playlist).
+    pub fn loaded(self) -> bool {
+        self != Engine::Empty
+    }
+
+    /// A Play or Cue was sent: loading until a track starts.
+    pub fn sent(self) -> Self {
+        Engine::Loading
+    }
+}
+
+/// The engine after event `ev`: a start sets the track (whatever the catalog
+/// knows), going idle clears it, and a failure while loading ends the loading (a
+/// prepared next track failing leaves the playing one).
+pub fn engine_after(current: Engine, ev: &Event) -> Engine {
     match ev {
-        Event::TrackStarted { id } => Some(*id),
-        Event::Idle => None,
+        Event::TrackStarted { id } => Engine::Track(*id),
+        Event::Idle => Engine::Empty,
+        Event::TrackSkipped { .. } if current == Engine::Loading => Engine::Empty,
         _ => current,
     }
+}
+
+/// Starts playing (`send`, a Play) as the user asked: a waiting resume is dropped
+/// and the engine counts as loading. Sent while the resume gate is held.
+pub fn start_with(gate: &Mutex<ResumeGate>, engine: &Mutex<Engine>, send: impl FnOnce()) {
+    let mut gate = lock(gate);
+    gate.cancel();
+    {
+        let mut e = lock(engine);
+        *e = e.sent();
+    }
+    send();
+}
+
+/// The held-back resume, once the share answers (`status`): `make` gets whether
+/// Play was pressed meanwhile and gives the command (none if nothing is due),
+/// which is sent while the gate is still held, so a press either comes before
+/// (and is taken along) or after (and finds the track loading).
+pub fn resume_with(
+    gate: &Mutex<ResumeGate>,
+    engine: &Mutex<Engine>,
+    status: ConnStatus,
+    make: impl FnOnce(bool) -> Option<Command>,
+    send: impl FnOnce(Command),
+) {
+    let mut gate = lock(gate);
+    let Some(pressed) = gate.due(status) else {
+        return;
+    };
+    let Some(command) = make(pressed) else {
+        return;
+    };
+    {
+        let mut e = lock(engine);
+        *e = e.sent();
+    }
+    send(command);
 }
 
 fn send_mix_settings(player: &Player, s: &Settings) {
@@ -607,8 +672,8 @@ pub fn on_now_playing(app: &AppHandle, f: impl Fn(Option<NowPlaying>) + Send + '
 fn on_player_event(app: &AppHandle, ev: Event) {
     let st = app.state::<AppState>();
     {
-        let mut engine = lock(&st.engine_track);
-        *engine = engine_track_after(*engine, &ev);
+        let mut engine = lock(&st.engine);
+        *engine = engine_after(*engine, &ev);
     }
     match ev {
         Event::TrackStarted { id } => {
@@ -978,39 +1043,85 @@ mod tests {
     }
 
     #[test]
-    fn a_press_racing_the_resume_is_never_lost() {
-        for _ in 0..500 {
-            let gate = Mutex::new(ResumeGate::waiting());
-            let (resumed_with_press, press_went_on) = std::thread::scope(|s| {
-                let resume = s.spawn(|| lock(&gate).due(ConnStatus::Ok));
-                let press = s.spawn(|| !lock(&gate).press(Press::Play));
-                (resume.join().unwrap(), press.join().unwrap())
-            });
-            // Either the resume took the press (and plays), or the press came after
-            // the resume and goes to the player itself: exactly one of them.
-            assert!(
-                (resumed_with_press == Some(true)) != press_went_on,
-                "{resumed_with_press:?} / {press_went_on}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_engine_track_follows_starts_and_idle_not_the_catalog() {
-        let started = engine_track_after(None, &Event::TrackStarted { id: 7 });
-        assert_eq!(started, Some(7), "also for a track the catalog lost");
+    fn the_engine_is_loaded_from_the_send_until_a_start_or_a_failure() {
+        let skipped = || Event::TrackSkipped {
+            id: 3,
+            reason: "x".into(),
+        };
+        assert!(!Engine::Empty.loaded());
+        let sent = Engine::Empty.sent();
+        assert_eq!(sent, Engine::Loading);
+        assert!(sent.loaded(), "a press while it loads pauses, not reopens");
+        let started = engine_after(sent, &Event::TrackStarted { id: 7 });
+        assert_eq!(
+            started,
+            Engine::Track(7),
+            "also for a track the catalog lost"
+        );
         let pos = Event::Position {
             id: 7,
             ms: 10,
             duration_ms: None,
         };
-        assert_eq!(engine_track_after(started, &pos), Some(7));
-        assert_eq!(engine_track_after(started, &Event::Paused(true)), Some(7));
+        assert_eq!(engine_after(started, &pos), Engine::Track(7));
         assert_eq!(
-            engine_track_after(Some(7), &Event::TrackStarted { id: 9 }),
-            Some(9)
+            engine_after(started, &Event::Paused(true)),
+            Engine::Track(7)
         );
-        assert_eq!(engine_track_after(Some(9), &Event::Idle), None);
+        assert_eq!(
+            engine_after(started, &skipped()),
+            Engine::Track(7),
+            "a prepared next track failing leaves the playing one"
+        );
+        assert_eq!(engine_after(Engine::Loading, &skipped()), Engine::Empty);
+        assert_eq!(engine_after(started, &Event::Idle), Engine::Empty);
+        assert_eq!(engine_after(Engine::Loading, &Event::Idle), Engine::Empty);
+        assert_eq!(Engine::Track(7).sent(), Engine::Loading);
+    }
+
+    #[test]
+    fn the_resume_and_a_start_send_while_holding_the_gate() {
+        let gate = Mutex::new(ResumeGate::waiting());
+        let engine = Mutex::new(Engine::Empty);
+        let mut sent = 0;
+        resume_with(
+            &gate,
+            &engine,
+            ConnStatus::Ok,
+            |pressed| {
+                assert!(!pressed);
+                Some(Command::Cue(Box::new(Nothing)))
+            },
+            |_| {
+                assert!(gate.try_lock().is_err(), "sent under the gate");
+                sent += 1;
+            },
+        );
+        assert_eq!(sent, 1);
+        assert_eq!(*lock(&engine), Engine::Loading);
+        assert_eq!(*lock(&gate), ResumeGate::default());
+        // Only once.
+        resume_with(
+            &gate,
+            &engine,
+            ConnStatus::Ok,
+            |_| unreachable!(),
+            |_| unreachable!(),
+        );
+        let gate = Mutex::new(ResumeGate::waiting());
+        let engine = Mutex::new(Engine::Empty);
+        start_with(&gate, &engine, || {
+            assert!(gate.try_lock().is_err(), "sent under the gate");
+            sent += 1;
+        });
+        assert_eq!(sent, 2);
+        assert!(!lock(&gate).pending, "a start drops the waiting resume");
+        assert_eq!(*lock(&engine), Engine::Loading);
+        // Nothing due: nothing sent, nothing loading.
+        let gate = Mutex::new(ResumeGate::waiting());
+        let engine = Mutex::new(Engine::Empty);
+        resume_with(&gate, &engine, ConnStatus::Ok, |_| None, |_| unreachable!());
+        assert_eq!(*lock(&engine), Engine::Empty);
     }
 
     /// A scan of a slow source on its own thread, keeping `scanning` the way

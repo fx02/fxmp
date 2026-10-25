@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use smp_core::audio::output::list_output_devices;
@@ -21,7 +22,8 @@ use crate::lookup;
 use crate::playlist::{self, PlaylistFacets, PlaylistPage, PreviousAction, QueueFilter, Selection};
 use crate::settings::{ServerConfig, Settings, SettingsStore};
 use crate::state::{
-    self, apply_player_settings, lock, AppState, NowPlaying, PositionPayload, Press, ScanStatus,
+    self, apply_player_settings, lock, AppState, Engine, NowPlaying, PositionPayload, Press,
+    ResumeGate, ScanStatus,
 };
 use crate::tray;
 
@@ -363,21 +365,41 @@ pub fn play_action(loaded: bool, pending: bool, has_next: bool) -> PlayAction {
 
 /// Play/Pause (`TogglePause`) or Play (`Resume`) from the UI, tray or media keys;
 /// pressing Play is never silent while there is something to play. "Loaded" is
-/// what the engine reports (a started track until it goes idle), not what the
-/// window shows.
+/// what the engine reports (from a sent Play/Cue until it goes idle), not what
+/// the window shows.
 pub fn play_pause_now(st: &AppState, command: Command) {
+    press_play_pause(
+        &st.resume,
+        &st.engine,
+        || lock(&st.playlist).queue.successor().is_some(),
+        command,
+        |c| st.player.send(c),
+        || st.play_playlist(),
+    );
+}
+
+/// [`play_pause_now`] with its parts passed in: decided, and sent to the player
+/// (`send`), while the resume gate is held, so the resume cannot slip in between.
+/// `start_playlist` runs after the gate is let go (it takes it itself).
+pub fn press_play_pause(
+    gate: &Mutex<ResumeGate>,
+    engine: &Mutex<Engine>,
+    has_next: impl FnOnce() -> bool,
+    command: Command,
+    send: impl FnOnce(Command),
+    start_playlist: impl FnOnce(),
+) {
     let press = match command {
         Command::Resume => Press::Play,
         Command::Pause => Press::Pause,
         _ => Press::Toggle,
     };
-    // Held while deciding and sending, so the resume cannot slip in between.
-    let mut gate = lock(&st.resume);
-    let loaded = lock(&st.engine_track).is_some();
+    let mut gate = lock(gate);
+    let loaded = lock(engine).loaded();
     let pending = gate.pending;
-    let has_next = !loaded && lock(&st.playlist).queue.successor().is_some();
+    let has_next = !loaded && has_next();
     match play_action(loaded, pending, has_next) {
-        PlayAction::Player => st.player.send(command),
+        PlayAction::Player => send(command),
         PlayAction::RememberForResume => {
             gate.press(press);
             log::info!(
@@ -387,7 +409,7 @@ pub fn play_pause_now(st: &AppState, command: Command) {
         }
         PlayAction::StartPlaylist => {
             drop(gate);
-            st.play_playlist();
+            start_playlist();
         }
     }
 }
@@ -688,23 +710,9 @@ pub struct Exported {
     pub path: String,
 }
 
-/// Saves the playlist (what `filter` leaves of it) as an `.m3u8` file at `path`;
-/// returns how many tracks it holds.
-#[tauri::command(rename_all = "snake_case")]
-pub async fn playlist_export(
-    app: AppHandle,
-    path: String,
-    filter: Option<QueueFilter>,
-) -> CmdResult<usize> {
-    run(app, move |_, st| {
-        export_to(st, PathBuf::from(path), filter.as_ref()).map(|e| e.count)
-    })
-    .await
-}
-
 /// Asks where to save the playlist (the system's save dialog, suggesting
 /// `file_name` in the mounted music folder when there is one), then saves it as
-/// in [`playlist_export`]. `None` when the dialog was cancelled.
+/// in [`export_to`]. `None` when the dialog was cancelled.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn playlist_export_save(
     app: AppHandle,
@@ -1352,6 +1360,106 @@ mod tests {
         assert_eq!(play_action(false, false, true), StartPlaylist);
         // Nothing to play at all: the player is asked anyway (it may re-try).
         assert_eq!(play_action(false, false, false), Player);
+    }
+
+    use crate::connection::ConnStatus as Status;
+    use crate::state::{resume_with, start_with};
+
+    struct NoTracks;
+    impl smp_core::audio::player::TrackProvider for NoTracks {
+        fn next_track(&mut self) -> Option<smp_core::audio::player::PlayItem> {
+            None
+        }
+        fn on_failed(&mut self, _: TrackId, _: &smp_core::failure::Failure) {}
+        fn on_played(&mut self, _: TrackId, _: Option<f32>) {}
+    }
+
+    fn kind(c: &Command) -> &'static str {
+        match c {
+            Command::Play(_) => "play",
+            Command::Cue(_) => "cue",
+            Command::TogglePause => "toggle",
+            Command::Pause => "pause",
+            Command::Resume => "resume",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn a_press_while_a_track_loads_goes_to_the_player() {
+        let gate = Mutex::new(ResumeGate::default());
+        let engine = Mutex::new(Engine::Empty);
+        start_with(&gate, &engine, || {});
+        let out = std::cell::RefCell::new(Vec::new());
+        press_play_pause(
+            &gate,
+            &engine,
+            || true,
+            Command::TogglePause,
+            |c| {
+                assert!(gate.try_lock().is_err(), "sent under the gate");
+                out.borrow_mut().push(kind(&c));
+            },
+            || out.borrow_mut().push("start"),
+        );
+        assert_eq!(
+            *out.borrow(),
+            ["toggle"],
+            "pauses the loading track, does not reopen it"
+        );
+        // Nothing loaded, something due: the playlist starts.
+        let engine = Mutex::new(Engine::Empty);
+        let out = std::cell::RefCell::new(Vec::new());
+        press_play_pause(
+            &gate,
+            &engine,
+            || true,
+            Command::TogglePause,
+            |c| out.borrow_mut().push(kind(&c)),
+            || out.borrow_mut().push("start"),
+        );
+        assert_eq!(*out.borrow(), ["start"]);
+    }
+
+    #[test]
+    fn a_press_racing_the_resume_is_never_lost() {
+        for _ in 0..500 {
+            let gate = Mutex::new(ResumeGate::waiting());
+            let engine = Mutex::new(Engine::Empty);
+            let log = Mutex::new(Vec::new());
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    resume_with(
+                        &gate,
+                        &engine,
+                        Status::Ok,
+                        |pressed| {
+                            Some(if pressed {
+                                Command::Play(Box::new(NoTracks))
+                            } else {
+                                Command::Cue(Box::new(NoTracks))
+                            })
+                        },
+                        |c| log.lock().unwrap().push(kind(&c)),
+                    );
+                });
+                s.spawn(|| {
+                    press_play_pause(
+                        &gate,
+                        &engine,
+                        || true,
+                        Command::Resume,
+                        |c| log.lock().unwrap().push(kind(&c)),
+                        || start_with(&gate, &engine, || log.lock().unwrap().push("start")),
+                    );
+                });
+            });
+            let log = log.into_inner().unwrap();
+            // The press is taken by the resume (it plays), or it comes after the
+            // cue and goes to the player (which starts the cued track): never a
+            // cue as the last word.
+            assert!(log == ["play"] || log == ["cue", "resume"], "{log:?}");
+        }
     }
 
     #[test]
