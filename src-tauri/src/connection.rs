@@ -1,36 +1,41 @@
-//! Connection to the music servers: status, lazily connected SMB sources and the
-//! replaceable source the player and scanner read from.
+//! Connection to the music libraries: status, lazily connected SMB sources, local
+//! folders, and the replaceable source the player and scanner read from.
 //!
-//! Everything here blocks on the network and must run on plain threads, never on an
-//! async runtime thread.
+//! Everything here blocks on the network or the disk and must run on plain
+//! threads, never on an async runtime thread.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use smp_core::source::{
-    FailoverSource, FileEntry, MusicSource, ReadSeek, SmbConfig, SmbSource, SourceError, WalkReport,
+    FailoverSource, FileEntry, LocalSource, MusicSource, ReadSeek, SmbConfig, SmbSource,
+    SourceError, WalkReport, Which,
 };
+use smp_core::{LibraryId, DEFAULT_LIBRARY};
 
-use crate::credentials::CredentialStore;
+use crate::credentials::{server_password, CredentialStore};
 use crate::i18n;
-use crate::settings::{ServerConfig, Settings};
+use crate::settings::{Library, LibrarySource, ServerConfig, Settings};
 
-/// How often an unreachable server is retried.
+/// How often an unreachable server or a missing folder is checked again.
 pub const RETRY: Duration = Duration::from_secs(15);
 
-/// Connection state shown in the UI (`connection-status` event).
+/// Connection state of a library, shown in the UI (`connection-status` event).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnStatus {
-    /// Primary server reachable.
+    /// Primary server reachable, or the local folder readable.
     Ok,
     /// Primary down, playing from the secondary.
     Secondary,
     Unreachable,
     /// Wrong username or password.
     Auth,
+    /// A local folder that is not there or cannot be read (a disk not plugged in).
+    Missing,
 }
 
 impl ConnStatus {
@@ -41,19 +46,62 @@ impl ConnStatus {
             ConnStatus::Secondary => "conn.secondary",
             ConnStatus::Unreachable => "conn.unreachable",
             ConnStatus::Auth => "conn.auth",
+            ConnStatus::Missing => "conn.missing",
+        }
+    }
+
+    /// The music can be read (perhaps from the backup server).
+    pub fn reachable(self) -> bool {
+        matches!(self, ConnStatus::Ok | ConnStatus::Secondary)
+    }
+
+    /// How bad it is, for the summary of several libraries.
+    fn severity(self) -> u8 {
+        match self {
+            ConnStatus::Ok => 0,
+            ConnStatus::Secondary => 1,
+            ConnStatus::Missing => 2,
+            ConnStatus::Unreachable => 3,
+            ConnStatus::Auth => 4,
         }
     }
 }
 
-/// Payload of the `connection-status` event. The UI words the status in its language.
-#[derive(Debug, Clone, Serialize)]
-pub struct StatusPayload {
+/// The worst of the statuses (`None` for none): what the status dot shows.
+pub fn worst(statuses: &[ConnStatus]) -> Option<ConnStatus> {
+    statuses.iter().copied().max_by_key(|s| s.severity())
+}
+
+/// One library's status.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LibraryStatus {
+    pub id: LibraryId,
+    /// As set (blank: the UI shows a default name).
+    pub name: String,
     pub status: ConnStatus,
 }
 
-impl From<ConnStatus> for StatusPayload {
-    fn from(status: ConnStatus) -> Self {
-        Self { status }
+/// Payload of the `connection-status` event: the worst status (the dot) and each
+/// library's (its tooltip). The UI words them in its language.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatusPayload {
+    pub status: ConnStatus,
+    pub libraries: Vec<LibraryStatus>,
+}
+
+impl StatusPayload {
+    /// `None` without libraries.
+    pub fn new(libraries: Vec<LibraryStatus>) -> Option<Self> {
+        let statuses: Vec<ConnStatus> = libraries.iter().map(|l| l.status).collect();
+        Some(Self {
+            status: worst(&statuses)?,
+            libraries,
+        })
+    }
+
+    /// The status of library `id`, if it is in use.
+    pub fn of(&self, id: LibraryId) -> Option<ConnStatus> {
+        self.libraries.iter().find(|l| l.id == id).map(|l| l.status)
     }
 }
 
@@ -71,6 +119,17 @@ pub fn status_of(
             Some(Err(SourceError::Auth)) => ConnStatus::Auth,
             _ => ConnStatus::Unreachable,
         },
+    }
+}
+
+/// A local music folder's status: it must be a folder that can be listed.
+pub fn folder_status(path: &std::path::Path) -> ConnStatus {
+    match std::fs::read_dir(path) {
+        Ok(_) => ConnStatus::Ok,
+        Err(e) => {
+            log::debug!("music folder {}: {e}", path.display());
+            ConnStatus::Missing
+        }
     }
 }
 
@@ -102,28 +161,34 @@ pub fn test_server(cfg: SmbConfig) -> Result<(), SourceError> {
     smb_connect(cfg).map(drop)
 }
 
-/// What "Test connection" checks for `which` ("primary"/"secondary"): the form's unsaved
-/// `server` when given, else the saved one; the form's `password` when non-empty,
-/// else the keychain's for that host and user.
+/// What "Test connection" checks for server `which` ("primary"/"secondary") of
+/// library `library`: the form's unsaved `server` when given, else the saved one;
+/// the form's `password` when non-empty, else the keychain's for that library,
+/// host and user.
 pub fn test_target(
     settings: &Settings,
     creds: &dyn CredentialStore,
+    library: LibraryId,
     which: &str,
     server: Option<ServerConfig>,
     password: Option<String>,
 ) -> Result<SmbConfig, String> {
-    let server = match (which, server) {
-        ("primary" | "secondary", Some(s)) => s,
-        ("primary", None) => settings.primary.clone(),
-        ("secondary", None) => settings
-            .secondary
-            .clone()
-            .ok_or_else(|| i18n::t("err.no_backup"))?,
-        (other, _) => return Err(i18n::tf("err.unknown_server", &[("name", other)])),
+    let saved = match settings.library(library).map(|l| l.source) {
+        Some(LibrarySource::Smb { primary, secondary }) => Some((primary, secondary)),
+        _ => None,
+    };
+    let server = match (which, server, saved) {
+        ("primary" | "secondary", Some(s), _) => s,
+        ("primary", None, Some((primary, _))) => primary,
+        ("secondary", None, Some((_, secondary))) => {
+            secondary.ok_or_else(|| i18n::t("err.no_backup"))?
+        }
+        ("primary" | "secondary", None, None) => return Err(i18n::t("err.no_server")),
+        (other, ..) => return Err(i18n::tf("err.unknown_server", &[("name", other)])),
     };
     let password = password
         .filter(|p| !p.is_empty())
-        .or_else(|| creds.get(server.host.trim(), server.username.trim()))
+        .or_else(|| server_password(creds, library, &server))
         .unwrap_or_default();
     Ok(smb_config(&server, password))
 }
@@ -258,7 +323,8 @@ impl MusicSource for LazySmb {
     }
 }
 
-/// The configured servers: primary, optional secondary, and the failover pair over them.
+/// One SMB library's servers: primary, optional secondary, and the failover pair
+/// over them.
 pub struct Servers {
     pub primary: LazySmb,
     pub secondary: Option<LazySmb>,
@@ -266,16 +332,20 @@ pub struct Servers {
 }
 
 impl Servers {
-    /// Builds the servers from settings, with passwords from `creds`. Does not connect.
-    pub fn from_settings(settings: &Settings, creds: &dyn CredentialStore) -> Self {
+    /// Builds the servers of library `library`, with passwords from `creds`. Does
+    /// not connect.
+    pub fn new(
+        library: LibraryId,
+        primary: &ServerConfig,
+        secondary: Option<&ServerConfig>,
+        creds: &dyn CredentialStore,
+    ) -> Self {
         let lazy = |s: &ServerConfig| {
-            let password = creds
-                .get(s.host.trim(), s.username.trim())
-                .unwrap_or_default();
+            let password = server_password(creds, library, s).unwrap_or_default();
             LazySmb::new(smb_config(s, password))
         };
-        let primary = lazy(&settings.primary);
-        let secondary = settings.secondary.as_ref().map(lazy);
+        let primary = lazy(primary);
+        let secondary = secondary.map(lazy);
         let failover = FailoverSource::new(
             Box::new(primary.clone()),
             secondary
@@ -300,73 +370,248 @@ impl Servers {
     }
 }
 
-/// The source the player and scanner use; replaced when the settings change.
+/// A library's source.
+pub enum LibraryKind {
+    Smb(Servers),
+    Local { root: PathBuf, source: LocalSource },
+}
+
+/// A library in use: its id, name and source.
+pub struct LibraryConn {
+    pub id: LibraryId,
+    pub name: String,
+    pub kind: LibraryKind,
+}
+
+impl LibraryConn {
+    /// A local-folder library (no password, no keychain).
+    pub fn local(id: LibraryId, name: String, path: &str) -> Self {
+        let root = PathBuf::from(path.trim());
+        Self {
+            id,
+            name,
+            kind: LibraryKind::Local {
+                source: LocalSource::new(root.clone()),
+                root,
+            },
+        }
+    }
+
+    /// The library as set in `library`, if it is set up: an SMB server with a
+    /// user, or a folder. Only an SMB library reads `creds`.
+    pub fn from_library(library: &Library, creds: &dyn CredentialStore) -> Option<Self> {
+        match &library.source {
+            LibrarySource::Smb { primary, secondary } => {
+                if primary.username.trim().is_empty() {
+                    return None;
+                }
+                Some(Self {
+                    id: library.id,
+                    name: library.name.clone(),
+                    kind: LibraryKind::Smb(Servers::new(
+                        library.id,
+                        primary,
+                        secondary.as_ref(),
+                        creds,
+                    )),
+                })
+            }
+            LibrarySource::Local { path } if !path.trim().is_empty() => {
+                Some(Self::local(library.id, library.name.clone(), path))
+            }
+            LibrarySource::Local { .. } => None,
+        }
+    }
+
+    /// What the scanner and the player read.
+    pub fn source(&self) -> &dyn MusicSource {
+        match &self.kind {
+            LibraryKind::Smb(s) => &s.failover,
+            LibraryKind::Local { source, .. } => source,
+        }
+    }
+
+    /// Checks the library now.
+    pub fn probe(&self) -> ConnStatus {
+        match &self.kind {
+            LibraryKind::Smb(s) => s.probe(),
+            LibraryKind::Local { root, .. } => folder_status(root),
+        }
+    }
+
+    /// The server that served the last read (an SMB library's).
+    pub fn active_server(&self) -> Option<Which> {
+        match &self.kind {
+            LibraryKind::Smb(s) => Some(s.failover.active()),
+            LibraryKind::Local { .. } => None,
+        }
+    }
+
+    /// A local folder that cannot be read right now (checked now, not from the
+    /// last status: a disk unplugged a moment ago counts). SMB trouble comes as
+    /// network errors, which never count against a track anyway.
+    pub fn offline_now(&self) -> bool {
+        match &self.kind {
+            LibraryKind::Smb(_) => false,
+            LibraryKind::Local { root, .. } => !folder_status(root).reachable(),
+        }
+    }
+
+    pub fn servers(&self) -> Option<&Servers> {
+        match &self.kind {
+            LibraryKind::Smb(s) => Some(s),
+            LibraryKind::Local { .. } => None,
+        }
+    }
+}
+
+/// The libraries in use: switched on and set up, in the settings' order.
+pub struct Libraries {
+    list: Vec<Arc<LibraryConn>>,
+}
+
+impl Libraries {
+    /// Builds the libraries from settings; only SMB ones read their passwords from
+    /// `creds`. Does not connect.
+    pub fn from_settings(settings: &Settings, creds: &dyn CredentialStore) -> Self {
+        Self {
+            list: settings
+                .all_libraries()
+                .iter()
+                .filter(|l| l.enabled)
+                .filter_map(|l| LibraryConn::from_library(l, creds))
+                .map(Arc::new)
+                .collect(),
+        }
+    }
+
+    pub fn get(&self, id: LibraryId) -> Option<&Arc<LibraryConn>> {
+        self.list.iter().find(|l| l.id == id)
+    }
+
+    #[cfg(test)]
+    pub fn ids(&self) -> Vec<LibraryId> {
+        self.list.iter().map(|l| l.id).collect()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<LibraryConn>> {
+        self.list.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// Checks every library (one after another).
+    pub fn probe(&self) -> Option<StatusPayload> {
+        StatusPayload::new(
+            self.list
+                .iter()
+                .map(|l| LibraryStatus {
+                    id: l.id,
+                    name: l.name.clone(),
+                    status: l.probe(),
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The source the player reads from (each track through its library) and the
+/// libraries the scanner walks; replaced when the settings change.
 #[derive(Default)]
 pub struct AppSource {
-    servers: RwLock<Option<Arc<Servers>>>,
+    libraries: RwLock<Option<Arc<Libraries>>>,
 }
 
 impl AppSource {
-    pub fn set(&self, servers: Option<Servers>) {
-        *self.servers.write().unwrap_or_else(|e| e.into_inner()) = servers.map(Arc::new);
+    /// `None` (or no library in use): nothing is set up.
+    pub fn set(&self, libraries: Option<Libraries>) {
+        *self.libraries.write().unwrap_or_else(|e| e.into_inner()) =
+            libraries.filter(|l| !l.is_empty()).map(Arc::new);
     }
 
-    /// Sets `servers` unless some are already set (settings saved meanwhile are
+    /// Sets `libraries` unless some are already set (settings saved meanwhile are
     /// newer). Returns whether they were taken.
-    pub fn set_if_unset(&self, servers: Servers) -> bool {
-        let mut slot = self.servers.write().unwrap_or_else(|e| e.into_inner());
+    pub fn set_if_unset(&self, libraries: Libraries) -> bool {
+        let mut slot = self.libraries.write().unwrap_or_else(|e| e.into_inner());
         if slot.is_some() {
             return false;
         }
-        *slot = Some(Arc::new(servers));
+        *slot = Some(Arc::new(libraries)).filter(|l| !l.is_empty());
         true
     }
 
-    pub fn servers(&self) -> Option<Arc<Servers>> {
-        self.servers
+    pub fn libraries(&self) -> Option<Arc<Libraries>> {
+        self.libraries
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
-    fn current(&self) -> Result<Arc<Servers>, SourceError> {
-        self.servers().ok_or(SourceError::Unreachable)
+    fn library(&self, id: LibraryId) -> Result<Arc<LibraryConn>, SourceError> {
+        self.libraries()
+            .and_then(|l| l.get(id).cloned())
+            .ok_or(SourceError::Unreachable)
     }
 }
 
 impl MusicSource for AppSource {
+    /// The first library's (the scanner walks each library itself).
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
-        self.current()?.failover.walk(on_entry)
+        self.library(DEFAULT_LIBRARY)?.source().walk(on_entry)
     }
 
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
-        self.current()?.failover.open(rel_path)
+        self.open_in(DEFAULT_LIBRARY, rel_path)
+    }
+
+    /// Through the track's library; a library not in use (switched off meanwhile,
+    /// removed) is unreachable.
+    fn open_in(
+        &self,
+        library: LibraryId,
+        rel_path: &str,
+    ) -> Result<Box<dyn ReadSeek>, SourceError> {
+        self.library(library)?.source().open(rel_path)
     }
 
     fn describe(&self) -> String {
-        self.servers()
-            .map(|s| s.failover.describe())
-            .unwrap_or_else(|| "(not configured)".into())
+        match self.libraries() {
+            Some(l) => l
+                .iter()
+                .map(|l| l.source().describe())
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => "(not configured)".into(),
+        }
     }
 }
 
-/// Keeps the connection status current. Probes when woken (settings saved, a track
-/// failed, playback moved to the secondary) and, while the primary is down, every
-/// [`RETRY`]. A wrong password is not retried until the settings change, so the
-/// account is not locked out. Every status from a wake is reported; timed retries
-/// report only changes. Returns when all wake senders are gone.
-pub fn monitor(source: Arc<AppSource>, wake: Receiver<()>, mut report: impl FnMut(ConnStatus)) {
-    let mut last: Option<ConnStatus> = None;
+/// Keeps the libraries' status current. Probes every library in use when woken
+/// (settings saved, a track failed, playback moved to the secondary) and, while one
+/// is down or on its backup, every [`RETRY`] (a disk plugged back in is seen within
+/// that). A wrong password is not retried until the settings change, so the account
+/// is not locked out. Every status from a wake is reported; timed retries report
+/// only changes. Returns when all wake senders are gone.
+pub fn monitor(source: Arc<AppSource>, wake: Receiver<()>, mut report: impl FnMut(&StatusPayload)) {
+    let mut last: Option<StatusPayload> = None;
     let mut woken = true;
     loop {
-        if let Some(servers) = source.servers() {
-            let status = servers.probe();
-            if woken || last != Some(status) {
-                report(status);
+        last = match source.libraries().and_then(|l| l.probe()) {
+            Some(status) => {
+                if woken || last.as_ref() != Some(&status) {
+                    report(&status);
+                }
+                Some(status)
             }
-            last = Some(status);
-        }
-        let retry = matches!(last, Some(ConnStatus::Unreachable | ConnStatus::Secondary));
+            None => None,
+        };
+        let retry = last.as_ref().is_some_and(|p| {
+            p.libraries
+                .iter()
+                .any(|l| !matches!(l.status, ConnStatus::Ok | ConnStatus::Auth))
+        });
         let got = if retry {
             wake.recv_timeout(RETRY)
         } else {
@@ -387,6 +632,12 @@ mod tests {
     use super::*;
     use crate::credentials::MemoryStore;
 
+    fn primary_host(src: &AppSource) -> String {
+        let libs = src.libraries().unwrap();
+        let lib = libs.get(DEFAULT_LIBRARY).unwrap();
+        lib.servers().unwrap().primary.host().to_string()
+    }
+
     #[test]
     fn set_if_unset_never_replaces_newer_servers() {
         let creds = MemoryStore::default();
@@ -400,12 +651,12 @@ mod tests {
         };
         let src = AppSource::default();
         // Startup credentials arrive first: taken.
-        assert!(src.set_if_unset(Servers::from_settings(&host("a"), &creds)));
-        assert_eq!(src.servers().unwrap().primary.host(), "a");
+        assert!(src.set_if_unset(Libraries::from_settings(&host("a"), &creds)));
+        assert_eq!(primary_host(&src), "a");
         // Settings were saved meanwhile: the late startup value is dropped.
-        src.set(Some(Servers::from_settings(&host("b"), &creds)));
-        assert!(!src.set_if_unset(Servers::from_settings(&host("a"), &creds)));
-        assert_eq!(src.servers().unwrap().primary.host(), "b");
+        src.set(Some(Libraries::from_settings(&host("b"), &creds)));
+        assert!(!src.set_if_unset(Libraries::from_settings(&host("a"), &creds)));
+        assert_eq!(primary_host(&src), "b");
     }
 
     #[test]
@@ -490,7 +741,7 @@ mod tests {
     #[test]
     fn test_target_uses_form_values_or_saved_settings() {
         let creds = MemoryStore::default();
-        creds.set("10.111.100.2", "music", "saved-pw").unwrap();
+        creds.put(1, "10.111.100.2", "music", "saved-pw");
         let settings = Settings {
             primary: ServerConfig {
                 username: "music".into(),
@@ -500,12 +751,12 @@ mod tests {
         };
 
         // Saved settings, keychain password.
-        let t = test_target(&settings, &creds, "primary", None, None).unwrap();
+        let t = test_target(&settings, &creds, 1, "primary", None, None).unwrap();
         assert_eq!(
             (t.host.as_str(), t.password.as_str()),
             ("10.111.100.2", "saved-pw")
         );
-        let t = test_target(&settings, &creds, "primary", None, Some(String::new())).unwrap();
+        let t = test_target(&settings, &creds, 1, "primary", None, Some(String::new())).unwrap();
         assert_eq!(
             t.password, "saved-pw",
             "an empty form password keeps the stored one"
@@ -522,6 +773,7 @@ mod tests {
         let t = test_target(
             &settings,
             &creds,
+            1,
             "secondary",
             Some(form.clone()),
             Some("typed".into()),
@@ -532,17 +784,25 @@ mod tests {
             (t.username.as_str(), t.password.as_str()),
             ("backup", "typed")
         );
-        let t = test_target(&settings, &creds, "secondary", Some(form), None).unwrap();
+        let t = test_target(&settings, &creds, 1, "secondary", Some(form), None).unwrap();
         assert_eq!(t.password, "", "nothing stored for that host/user");
 
-        assert!(test_target(&settings, &creds, "secondary", None, None).is_err());
-        assert!(test_target(&settings, &creds, "other", None, None).is_err());
+        assert!(test_target(&settings, &creds, 1, "secondary", None, None).is_err());
+        assert!(test_target(&settings, &creds, 1, "other", None, None).is_err());
     }
 
     #[test]
     fn status_payload_carries_the_status_code_and_texts_are_translated() {
-        let json = serde_json::to_string(&StatusPayload::from(ConnStatus::Unreachable)).unwrap();
-        assert_eq!(json, r#"{"status":"unreachable"}"#);
+        let one = StatusPayload::new(vec![LibraryStatus {
+            id: 1,
+            name: String::new(),
+            status: ConnStatus::Unreachable,
+        }]);
+        let json = serde_json::to_string(&one).unwrap();
+        assert_eq!(
+            json,
+            r#"{"status":"unreachable","libraries":[{"id":1,"name":"","status":"unreachable"}]}"#
+        );
         let text = |s: ConnStatus, lang| crate::i18n::tr(lang, s.text_key());
         assert_eq!(text(ConnStatus::Ok, "en"), "Connected");
         assert_eq!(
@@ -559,8 +819,8 @@ mod tests {
     #[test]
     fn servers_use_keychain_password_per_server() {
         let creds = MemoryStore::default();
-        creds.set("10.111.100.2", "music", "pw1").unwrap();
-        creds.set("10.111.0.2", "backup", "pw2").unwrap();
+        creds.put(1, "10.111.100.2", "music", "pw1");
+        creds.put(1, "10.111.0.2", "backup", "pw2");
         let settings = Settings {
             primary: ServerConfig {
                 username: " music ".into(),
@@ -576,7 +836,8 @@ mod tests {
             }),
             ..Settings::default()
         };
-        let servers = Servers::from_settings(&settings, &creds);
+        let libs = Libraries::from_settings(&settings, &creds);
+        let servers = libs.get(1).unwrap().servers().unwrap();
         let p = servers.primary.config();
         assert_eq!(
             (p.host.as_str(), p.username.as_str()),
@@ -595,6 +856,185 @@ mod tests {
         let src = AppSource::default();
         assert_eq!(src.open("a.mp3").err(), Some(SourceError::Unreachable));
         assert_eq!(src.walk(&mut |_| {}), Err(SourceError::Unreachable));
+        // No library in use counts as not set up.
+        src.set(Some(Libraries::from_settings(
+            &Settings::default(),
+            &MemoryStore::default(),
+        )));
+        assert!(src.libraries().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            libraries: vec![local_library(2, dir.path())],
+            ..Settings::default()
+        };
+        src.set(Some(Libraries::from_settings(
+            &settings,
+            &MemoryStore::default(),
+        )));
+        assert_eq!(
+            src.open_in(5, "a.mp3").err(),
+            Some(SourceError::Unreachable),
+            "a library not in use"
+        );
+    }
+
+    fn local_library(id: LibraryId, path: &std::path::Path) -> Library {
+        Library {
+            id,
+            name: format!("Disk {id}"),
+            enabled: true,
+            source: LibrarySource::Local {
+                path: path.display().to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn local_libraries_never_touch_the_keychain() {
+        let creds = MemoryStore::default();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../crates/core/tests/fixtures/tone.mp3"),
+            dir.path().join("a.mp3"),
+        )
+        .unwrap();
+        // The first library not set up (no user), so only a local one is in use.
+        let settings = Settings {
+            libraries: vec![local_library(2, dir.path())],
+            ..Settings::default()
+        };
+        let libs = Libraries::from_settings(&settings, &creds);
+        assert_eq!(libs.ids(), [2]);
+        let lib = libs.get(2).unwrap();
+        assert_eq!(lib.probe(), ConnStatus::Ok);
+        let src = AppSource::default();
+        src.set(Some(libs));
+        src.open_in(2, "a.mp3").unwrap();
+        src.libraries()
+            .unwrap()
+            .get(2)
+            .unwrap()
+            .source()
+            .walk(&mut |_| {})
+            .unwrap();
+        let test = test_target(&settings, &creds, 2, "primary", None, None);
+        assert!(test.is_err(), "no server to test");
+        assert_eq!(creds.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_missing_folder_is_reported_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("Volumes/USB disk");
+        let lib = LibraryConn::local(3, "USB".into(), &disk.display().to_string());
+        assert_eq!(lib.probe(), ConnStatus::Missing, "not plugged in");
+        assert!(lib.offline_now());
+        std::fs::create_dir_all(&disk).unwrap();
+        assert_eq!(lib.probe(), ConnStatus::Ok, "plugged in");
+        assert!(!lib.offline_now());
+        // A file where the folder should be is no music folder either.
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let lib = LibraryConn::local(4, String::new(), &file.display().to_string());
+        assert_eq!(lib.probe(), ConnStatus::Missing);
+        assert_eq!(
+            crate::i18n::tr("en", ConnStatus::Missing.text_key()),
+            "Music folder not found. Is the disk connected?"
+        );
+    }
+
+    #[test]
+    fn the_summary_is_the_worst_library_status() {
+        use ConnStatus::*;
+        assert_eq!(worst(&[]), None);
+        assert_eq!(worst(&[Ok, Ok]), Some(Ok));
+        assert_eq!(worst(&[Ok, Secondary]), Some(Secondary));
+        assert_eq!(worst(&[Missing, Secondary]), Some(Missing));
+        assert_eq!(worst(&[Unreachable, Missing]), Some(Unreachable));
+        assert_eq!(worst(&[Auth, Unreachable, Ok]), Some(Auth));
+        let payload = StatusPayload::new(vec![
+            LibraryStatus {
+                id: 1,
+                name: String::new(),
+                status: Ok,
+            },
+            LibraryStatus {
+                id: 2,
+                name: "USB".into(),
+                status: Missing,
+            },
+        ])
+        .unwrap();
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["status"], "missing");
+        assert_eq!(json["libraries"][1]["name"], "USB");
+        assert_eq!(payload.of(2), Some(Missing));
+        assert_eq!(payload.of(9), None);
+        assert!(StatusPayload::new(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn libraries_in_use_are_the_set_up_ones_that_are_on() {
+        let creds = MemoryStore::default();
+        let dir = tempfile::tempdir().unwrap();
+        let off = Library {
+            enabled: false,
+            ..local_library(3, dir.path())
+        };
+        let blank = Library {
+            source: LibrarySource::Local { path: " ".into() },
+            ..local_library(4, dir.path())
+        };
+        let mut settings = Settings {
+            primary: ServerConfig {
+                username: "music".into(),
+                ..ServerConfig::default()
+            },
+            libraries: vec![local_library(2, dir.path()), off, blank],
+            ..Settings::default()
+        };
+        assert_eq!(Libraries::from_settings(&settings, &creds).ids(), [1, 2]);
+        settings.default_library_enabled = false;
+        assert_eq!(Libraries::from_settings(&settings, &creds).ids(), [2]);
+    }
+
+    #[test]
+    fn the_monitor_checks_every_library_and_sees_a_disk_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("disk");
+        let settings = Settings {
+            libraries: vec![local_library(2, dir.path()), local_library(3, &disk)],
+            ..Settings::default()
+        };
+        let src = Arc::new(AppSource::default());
+        src.set(Some(Libraries::from_settings(
+            &settings,
+            &MemoryStore::default(),
+        )));
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let monitor_src = src.clone();
+        let t = std::thread::spawn(move || {
+            monitor(monitor_src, wake_rx, |p: &StatusPayload| {
+                let _ = seen_tx.send(p.clone());
+            })
+        });
+        let first = seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first.status, ConnStatus::Missing);
+        assert_eq!(first.of(2), Some(ConnStatus::Ok));
+        assert_eq!(first.of(3), Some(ConnStatus::Missing));
+        std::fs::create_dir(&disk).unwrap();
+        wake_tx.send(()).unwrap();
+        let again = seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(again.status, ConnStatus::Ok);
+        drop(wake_tx);
+        t.join().unwrap();
+    }
+
+    /// The first library's servers.
+    fn smb_servers(settings: &Settings, creds: &MemoryStore) -> Servers {
+        Servers::new(1, &settings.primary, settings.secondary.as_ref(), creds)
     }
 
     /// Settings and a credential store from `.env.test` (primary `SMB_TEST_*`,
@@ -628,9 +1068,7 @@ mod tests {
             username: p("USER"),
             domain: env.get("SMB_TEST_DOMAIN").cloned(),
         };
-        creds
-            .set(&primary.host, &primary.username, &p("PASS"))
-            .unwrap();
+        creds.put(1, &primary.host, &primary.username, &p("PASS"));
         let secondary = env.get("SMB_TEST2_HOST").map(|host| ServerConfig {
             host: host.clone(),
             share: s("SHARE"),
@@ -639,7 +1077,7 @@ mod tests {
             domain: env.get("SMB_TEST2_DOMAIN").cloned(),
         });
         if let Some(sec) = &secondary {
-            creds.set(&sec.host, &sec.username, &s("PASS")).unwrap();
+            creds.put(1, &sec.host, &sec.username, &s("PASS"));
         }
         let settings = Settings {
             primary,
@@ -654,7 +1092,7 @@ mod tests {
     #[ignore]
     fn live_probe_reports_ok_secondary_and_auth() {
         let (settings, creds) = live_settings();
-        let servers = Servers::from_settings(&settings, &creds);
+        let servers = smb_servers(&settings, &creds);
         assert_eq!(servers.probe(), ConnStatus::Ok);
         assert_eq!(
             servers.probe(),
@@ -666,9 +1104,9 @@ mod tests {
         if let Some(sec) = &settings.secondary {
             let mut down = settings.clone();
             down.primary.host = "192.0.2.1".into();
-            let servers = Servers::from_settings(&down, &creds);
+            let servers = smb_servers(&down, &creds);
             assert_eq!(servers.probe(), ConnStatus::Secondary);
-            let pw = creds.get(&sec.host, &sec.username).unwrap();
+            let pw = server_password(&creds, 1, sec).unwrap();
             let entry = SmbSource::connect(smb_config(sec, pw))
                 .unwrap()
                 .walk_limited(1, &mut |_| true)
@@ -683,16 +1121,15 @@ mod tests {
         }
 
         let wrong = MemoryStore::default();
-        wrong
-            .set(
-                &settings.primary.host,
-                &settings.primary.username,
-                "definitely-wrong",
-            )
-            .unwrap();
+        wrong.put(
+            1,
+            &settings.primary.host,
+            &settings.primary.username,
+            "definitely-wrong",
+        );
         let mut primary_only = settings.clone();
         primary_only.secondary = None;
-        let servers = Servers::from_settings(&primary_only, &wrong);
+        let servers = smb_servers(&primary_only, &wrong);
         assert_eq!(servers.probe(), ConnStatus::Auth);
     }
 }

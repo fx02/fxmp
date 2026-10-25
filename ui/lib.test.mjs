@@ -37,6 +37,9 @@ import {
   patchPlan,
   retryDelay,
   sliderFollows,
+  libraryName,
+  libraryFromForm,
+  statusTooltip,
 } from "./lib.mjs";
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
@@ -181,7 +184,7 @@ test("locales: plural forms match the language's categories, placeholders match 
 });
 
 test("every translation key used by the UI and the Rust code exists", () => {
-  const KEY = /["'`]((?:language|player|conn|tabs|genres|merge|common|artists|albums|settings|scan|tray|err|unreadable|playlist|menu|about)\.[a-z_]+)["'`]/g;
+  const KEY = /["'`]((?:language|player|conn|tabs|genres|merge|common|artists|albums|settings|scan|tray|err|unreadable|playlist|menu|about|libraries)\.[a-z_]+)["'`]/g;
   const sources = [read("./app.js"), read("./lib.mjs"), read("./index.html")];
   const rustDir = new URL("../src-tauri/src/", import.meta.url);
   for (const f of readdirSync(rustDir).filter((f) => f.endsWith(".rs"))) sources.push(read(`../src-tauri/src/${f}`));
@@ -425,4 +428,74 @@ test("sliderFollows: a volume from elsewhere moves the slider unless it was just
   assert.equal(sliderFollows(null, 1000), true, "never touched");
   assert.equal(sliderFollows(1000, 1200), false, "still being dragged");
   assert.equal(sliderFollows(1000, 1600), true, "left alone long enough");
+});
+
+test("connMessage words a missing folder", () => {
+  assert.equal(connMessage("missing", en), "Music folder not found. Is the disk connected?");
+  assert.equal(connMessage("missing", hr), "Mapa s glazbom nije pronađena. Je li disk spojen?");
+});
+
+test("libraryName: its own name, else the main server, the folder or the host", () => {
+  const local = (path) => ({ type: "local", path });
+  assert.equal(libraryName({ id: 3, name: " Disk ", source: local("/x") }, en), "Disk");
+  assert.equal(libraryName({ id: 1, name: "" }, en), "Main server");
+  assert.equal(libraryName({ id: 1, name: "" }, hr), "Glavni server");
+  assert.equal(libraryName({ id: 2, name: "", source: local("/Volumes/USB Disk/") }, en), "USB Disk");
+  assert.equal(libraryName({ id: 2, name: "", source: local("D:\\Glazba\\Čista") }, en), "Čista");
+  const smb = { type: "smb", primary: { host: " nas.local " }, secondary: null };
+  assert.equal(libraryName({ id: 4, name: "", source: smb }, en), "nas.local");
+  assert.equal(libraryName({ id: 5, name: "" }, en), "Library 5");
+});
+
+test("libraryFromForm builds the backend's library", () => {
+  const smbForm = { host: " h ", share: "F", root: "MP3", username: " u ", domain: "" };
+  assert.deepEqual(
+    libraryFromForm({ id: 0, name: " NAS ", enabled: true, type: "smb", primary: smbForm, secondary: null }),
+    {
+      id: 0,
+      name: "NAS",
+      enabled: true,
+      source: { type: "smb", primary: { host: "h", share: "F", root: "MP3", username: "u", domain: null }, secondary: null },
+    },
+  );
+  assert.deepEqual(
+    libraryFromForm({ id: 4, name: "", enabled: false, type: "local", path: " /Volumes/Glazba čž " }),
+    { id: 4, name: "", enabled: false, source: { type: "local", path: "/Volumes/Glazba čž" } },
+  );
+});
+
+test("statusTooltip lists every library's state", () => {
+  const payload = {
+    status: "missing",
+    libraries: [
+      { id: 1, name: "", status: "ok" },
+      { id: 2, name: "USB", status: "missing" },
+    ],
+  };
+  assert.equal(
+    statusTooltip(payload, en),
+    "Main server: Connected\nUSB: Music folder not found. Is the disk connected?",
+  );
+  // Names of unnamed libraries come from the list of libraries.
+  const known = [{ id: 2, name: "", source: { type: "local", path: "/Volumes/Disk" } }];
+  assert.equal(
+    statusTooltip({ ...payload, libraries: [{ id: 2, name: "", status: "ok" }] }, en, known),
+    "Disk: Connected",
+  );
+  assert.equal(statusTooltip(null, en), "");
+});
+
+test("scan texts name the library when several are scanned", () => {
+  const p = { seen: 3, read: 3, failed: 0, library: { id: 2, name: "USB" }, library_index: 2, library_count: 3 };
+  assert.equal(scanProgressText(p, en), "USB (2/3): Scanning… 3 files");
+  assert.equal(scanProgressText({ ...p, library_count: 1 }, en), "Scanning… 3 files");
+  const done = { ok: true, cancelled: false, total: 2, read: 0, failed: 0, removed: 0 };
+  assert.equal(
+    scanDoneText({ ...done, offline: [{ id: 2, name: "USB", error: "x" }, { id: 1, name: "", error: "y" }] }, en),
+    "Library refreshed: 2 files. New or changed: 0, unreadable: 0, removed: 0. Not reachable, their tracks were kept: USB, Main server.",
+  );
+  assert.equal(
+    scanDoneText({ ...done, from_backup: [{ id: 1, name: "" }] }, hr),
+    "Katalog osvježen: 2 datoteke. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0. Skenirano s rezervnog servera, ništa nije uklonjeno: Glavni server.",
+  );
 });

@@ -128,9 +128,21 @@ export function makeT(lang, dict, fallback) {
 
 export function scanProgressText(p, t) {
   // Nothing is counted while the share is still being listed.
-  if (!p || !p.seen) return t("scan.listing");
-  const text = t("scan.progress", { files: t("scan.files", { n: p.seen }) });
-  return p.failed ? t("scan.unreadable", { text, n: p.failed }) : text;
+  let text = t("scan.listing");
+  if (p && p.seen) {
+    text = t("scan.progress", { files: t("scan.files", { n: p.seen }) });
+    if (p.failed) text = t("scan.unreadable", { text, n: p.failed });
+  }
+  // Several libraries: say which one.
+  if (p && p.library && p.library_count > 1) {
+    return t("scan.library_progress", {
+      library: libraryName(p.library, t),
+      index: p.library_index,
+      count: p.library_count,
+      text,
+    });
+  }
+  return text;
 }
 
 /** Text for the `scan-done` event payload. */
@@ -143,15 +155,65 @@ export function scanDoneText(d, t) {
     failed: d.failed,
     removed: d.removed,
   });
+  const parts = [done];
   // Folders the share would not list: their tracks were kept, not removed.
-  return d.skipped_dirs ? `${done} ${t("scan.skipped_dirs", { n: d.skipped_dirs })}` : done;
+  if (d.skipped_dirs) parts.push(t("scan.skipped_dirs", { n: d.skipped_dirs }));
+  const names = (libs) => libs.map((l) => libraryName(l, t)).join(", ");
+  if (d.offline && d.offline.length) parts.push(t("scan.offline", { names: names(d.offline) }));
+  if (d.from_backup && d.from_backup.length) parts.push(t("scan.from_backup", { names: names(d.from_backup) }));
+  return parts.join(" ");
 }
 
-const CONN_STATUSES = ["ok", "secondary", "unreachable", "auth"];
+const CONN_STATUSES = ["ok", "secondary", "unreachable", "auth", "missing"];
 
-/** Text for a connection status code ("ok", "secondary", "unreachable", "auth"). */
+/** Text for a connection status code ("ok", "secondary", "unreachable", "auth", "missing"). */
 export function connMessage(status, t) {
   return CONN_STATUSES.includes(status) ? t(`conn.${status}`) : "";
+}
+
+// ---------- libraries ----------
+
+/**
+ * A library's name for the eye: its own, else "Main server" for the first one,
+ * the folder's name for a local folder, the host for an SMB server, or a number.
+ */
+export function libraryName(lib, t) {
+  const own = (lib.name || "").trim();
+  if (own) return own;
+  if (lib.id === 1) return t("libraries.main");
+  const src = lib.source;
+  if (src && src.type === "local") {
+    const last = (src.path || "").split(/[\\/]/).filter(Boolean).pop();
+    if (last) return last;
+  }
+  if (src && src.type === "smb" && src.primary && (src.primary.host || "").trim()) {
+    return src.primary.host.trim();
+  }
+  return t("libraries.number", { id: String(lib.id) });
+}
+
+/** The library editor's values -> backend `Library` (id 0 = a new one). */
+export function libraryFromForm({ id, name, enabled, type, path, primary, secondary }) {
+  const source =
+    type === "local"
+      ? { type: "local", path: (path || "").trim() }
+      : { type: "smb", primary: serverFromForm(primary), secondary: secondary ? serverFromForm(secondary) : null };
+  return { id, name: (name || "").trim(), enabled: Boolean(enabled), source };
+}
+
+/**
+ * The status dot's tooltip: one line per library, "Name: state". Unnamed
+ * libraries are named from `known` (the libraries list) when given.
+ */
+export function statusTooltip(payload, t, known = []) {
+  if (!payload || !payload.libraries) return "";
+  return payload.libraries
+    .map((l) => {
+      const full = known.find((k) => k.id === l.id);
+      const name = libraryName(l.name || !full ? l : full, t);
+      return `${name}: ${connMessage(l.status, t)}`;
+    })
+    .join("\n");
 }
 
 const UNKNOWN_KEY = "_none";

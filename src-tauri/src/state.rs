@@ -14,15 +14,15 @@ use smp_core::catalog::Catalog;
 use smp_core::genre::{migrate_selection, UNKNOWN_DISPLAY};
 use smp_core::scan::{scan_with, ScanOptions, ScanProgress};
 use smp_core::source::{MusicSource, SourceError, Which};
-use smp_core::TrackId;
+use smp_core::{LibraryId, TrackId};
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
-use crate::connection::{monitor, AppSource, ConnStatus, Servers, StatusPayload};
-use crate::credentials::{CredentialStore, Keychain};
+use crate::connection::{monitor, AppSource, ConnStatus, Libraries, StatusPayload};
+use crate::credentials::{self, CredentialStore, Keychain};
 use crate::devdata;
 use crate::i18n;
 use crate::playlist::{self, SharedPlaylist};
-use crate::provider::{BannedSet, CatalogProvider, Playback};
+use crate::provider::{BannedSet, CatalogProvider, LibraryHealth, Playback};
 use crate::settings::{self, Settings, SettingsStore};
 use crate::writer::CatalogWriter;
 
@@ -72,12 +72,23 @@ pub struct PositionPayload {
     pub duration_ms: Option<u64>,
 }
 
+/// A library as the scan reports it (the UI names a blank one).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct LibraryRef {
+    pub id: LibraryId,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanProgressPayload {
     seen: usize,
     read: usize,
     failed: usize,
     current: String,
+    /// The library being scanned, and which of how many it is.
+    library: Option<LibraryRef>,
+    library_index: usize,
+    library_count: usize,
 }
 
 impl From<&ScanProgress> for ScanProgressPayload {
@@ -87,8 +98,19 @@ impl From<&ScanProgress> for ScanProgressPayload {
             read: p.read,
             failed: p.failed,
             current: p.current.clone(),
+            library: None,
+            library_index: 0,
+            library_count: 0,
         }
     }
+}
+
+/// A library a scan could not read (offline), and why.
+#[derive(Debug, Clone, Serialize)]
+struct LibraryProblem {
+    #[serde(flatten)]
+    library: LibraryRef,
+    error: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -105,6 +127,10 @@ struct ScanDonePayload {
     removed: usize,
     /// Folders that could not be listed (their tracks were kept).
     skipped_dirs: usize,
+    /// Libraries skipped because they could not be read (their tracks were kept).
+    offline: Vec<LibraryProblem>,
+    /// SMB libraries listed by their backup server: nothing of theirs was removed.
+    from_backup: Vec<LibraryRef>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,7 +159,8 @@ pub struct AppState {
     pub player: Player,
     pub source: Arc<AppSource>,
     pub creds: Arc<dyn CredentialStore>,
-    pub status: Mutex<Option<ConnStatus>>,
+    /// The libraries' last status (shared with the providers).
+    pub status: Arc<Mutex<Option<StatusPayload>>>,
     wake_monitor: Mutex<Sender<()>>,
     pub now_playing: Mutex<Option<NowPlaying>>,
     /// The player is paused (also before a track is loaded).
@@ -186,10 +213,10 @@ impl AppState {
         let catalog_path = data_dir.join("catalog.db");
 
         let loaded = Settings::load(&settings_path);
-        // Saved settings with a username: the user has set up the server.
+        // Saved settings with a username or another library: something is set up.
         let configured = loaded
             .as_ref()
-            .is_some_and(|s| !s.primary.username.trim().is_empty());
+            .is_some_and(|s| !s.primary.username.trim().is_empty() || !s.libraries.is_empty());
         let mut settings = loaded.unwrap_or_default();
         i18n::set_current(&settings.language);
         // Genre keys renamed by newer genre rules (saved with the next settings write).
@@ -209,11 +236,15 @@ impl AppState {
         };
         let playback_db = Catalog::open(&catalog_path)?;
         let writer = CatalogWriter::spawn(Catalog::open(&catalog_path)?)?;
+        let disabled = libraries_off(&settings, &query);
+        if let Err(e) = writer.call(move |c| c.set_disabled_libraries(&disabled)) {
+            log::warn!("cannot mark the libraries that are off: {e}");
+        }
         let creds: Arc<dyn CredentialStore> = Arc::new(Keychain {
             service: devdata::keychain_service(dev_dir.is_some()),
         });
 
-        // Servers are set once their passwords are read (see below).
+        // Libraries are set once their passwords are read (see below).
         let source = Arc::new(AppSource::default());
 
         let (events_tx, events_rx) = mpsc::channel();
@@ -241,7 +272,7 @@ impl AppState {
             player,
             source: source.clone(),
             creds,
-            status: Mutex::new(None),
+            status: Arc::new(Mutex::new(None)),
             wake_monitor: Mutex::new(wake_tx),
             now_playing: Mutex::new(None),
             paused: AtomicBool::new(false),
@@ -302,10 +333,10 @@ impl AppState {
                 monitor(source, wake_rx, |status| {
                     log::info!("connection status: {status:?}");
                     let st = handle.state::<AppState>();
-                    *lock(&st.status) = Some(status);
-                    let _ = handle.emit("connection-status", StatusPayload::from(status));
-                    // At login the VPN may come up later: resume once the share answers,
-                    // or the saved track would fail and be passed over.
+                    *lock(&st.status) = Some(status.clone());
+                    let _ = handle.emit("connection-status", status);
+                    // At login the VPN may come up later: resume once the track's
+                    // library answers, or the saved track would fail and be passed over.
                     st.resume_playlist(status);
                 })
             })?;
@@ -318,8 +349,10 @@ impl AppState {
                 .name("credentials".into())
                 .spawn(move || {
                     let st = handle.state::<AppState>();
-                    let servers = Servers::from_settings(&st.settings.get(), st.creds.as_ref());
-                    if !st.source.set_if_unset(servers) {
+                    let settings = st.settings.get();
+                    credentials::migrate_legacy(st.creds.as_ref(), &settings);
+                    let libraries = Libraries::from_settings(&settings, st.creds.as_ref());
+                    if !st.source.set_if_unset(libraries) {
                         return; // Settings were saved meanwhile.
                     }
                     st.wake_monitor();
@@ -376,10 +409,19 @@ impl AppState {
         self.save_playlist_soon();
     }
 
-    /// On start, once the share answers (`status`): loads the saved playlist's
-    /// current track (or the next one) where it stopped, paused unless "Resume
-    /// playing automatically on start" is on or Play was pressed meanwhile.
-    pub fn resume_playlist(&self, status: ConnStatus) {
+    /// On start, once the library of the track to resume answers (`status`): loads
+    /// the saved playlist's current track (or the next one) where it stopped,
+    /// paused unless "Resume playing automatically on start" is on or Play was
+    /// pressed meanwhile.
+    pub fn resume_playlist(&self, status: &StatusPayload) {
+        let due_track = {
+            let mut l = lock(&self.playlist);
+            l.resume_at.map(|r| r.0).or_else(|| l.queue.successor())
+        };
+        let library = due_track
+            .and_then(|id| lock(&self.query).track(id).ok())
+            .map(|r| r.library_id);
+        let status = resume_status(status, library);
         resume_with(
             &self.resume,
             &self.engine,
@@ -417,23 +459,31 @@ impl AppState {
         let _ = lock(&self.unreadable_changed).send(());
     }
 
-    /// After the servers changed: reconnects, or with no server set up (no username)
-    /// drops the connection and reports no status, as on a first start.
+    /// After the libraries changed: reconnects, or with none set up (no username,
+    /// no other library) drops the connection and reports no status, as on a first
+    /// start.
     pub fn forget_or_reconnect(&self, app: &AppHandle, settings: &Settings) {
-        if settings.primary.username.trim().is_empty() {
-            self.source.set(None);
+        self.reconnect(settings);
+        if self.source.libraries().is_none() {
             *lock(&self.status) = None;
             let _ = app.emit("connection-status", None::<StatusPayload>);
-        } else {
-            self.reconnect(settings);
         }
     }
 
-    /// Replaces the servers (fresh connections, forgetting a rejected password) and
-    /// re-checks the connection.
+    /// Replaces the libraries (fresh connections, forgetting a rejected password),
+    /// tells the catalog which are off, and re-checks the connections.
     pub fn reconnect(&self, settings: &Settings) {
-        self.source
-            .set(Some(Servers::from_settings(settings, self.creds.as_ref())));
+        self.source.set(Some(Libraries::from_settings(
+            settings,
+            self.creds.as_ref(),
+        )));
+        let disabled = libraries_off(settings, &lock(&self.query));
+        if let Err(e) = self
+            .writer
+            .call(move |c| c.set_disabled_libraries(&disabled))
+        {
+            log::warn!("cannot mark the libraries that are off: {e}");
+        }
         self.wake_monitor();
     }
 
@@ -443,10 +493,10 @@ impl AppState {
             db: self.catalog.clone(),
             writer: self.writer.clone(),
             banned: self.banned.clone(),
-            active_server: {
-                let source = self.source.clone();
-                Arc::new(move || source.servers().map(|s| s.failover.active()))
-            },
+            libraries: Arc::new(LiveLibraries {
+                source: self.source.clone(),
+                status: self.status.clone(),
+            }),
         }
     }
 
@@ -457,6 +507,60 @@ impl AppState {
             scanning,
             progress: lock(&self.scan_progress).clone().filter(|_| scanning),
         }
+    }
+}
+
+/// The libraries that are off: switched off in the settings, or no longer there
+/// (tracks of a library the settings lost are kept, but hidden).
+pub fn libraries_off(settings: &Settings, catalog: &Catalog) -> Vec<LibraryId> {
+    let known: Vec<LibraryId> = settings.all_libraries().iter().map(|l| l.id).collect();
+    let mut off = settings.disabled_libraries();
+    match catalog.library_track_counts() {
+        Ok(counts) => off.extend(counts.into_keys().filter(|id| !known.contains(id))),
+        Err(e) => log::warn!("cannot count the libraries' tracks: {e}"),
+    }
+    off.sort_unstable();
+    off
+}
+
+/// The status the resume waits for: that of the library of the track to resume
+/// (`library`), or, when that library is unknown or not in use, the best status
+/// of any (the resume then finds out for itself).
+pub fn resume_status(status: &StatusPayload, library: Option<LibraryId>) -> ConnStatus {
+    library
+        .and_then(|l| status.of(l))
+        .or_else(|| {
+            status
+                .libraries
+                .iter()
+                .map(|l| l.status)
+                .find(|s| s.reachable())
+        })
+        .unwrap_or(status.status)
+}
+
+/// The libraries as the app knows them while playing.
+struct LiveLibraries {
+    source: Arc<AppSource>,
+    status: Arc<Mutex<Option<StatusPayload>>>,
+}
+
+impl LibraryHealth for LiveLibraries {
+    fn active_server(&self, library: LibraryId) -> Option<Which> {
+        self.source.libraries()?.get(library)?.active_server()
+    }
+
+    /// A local folder is checked now; an SMB library is offline while its last
+    /// status says so (a missing share folder on the server reads as "not found").
+    fn offline(&self, library: LibraryId) -> bool {
+        let Some(libs) = self.source.libraries() else {
+            return false;
+        };
+        let Some(lib) = libs.get(library) else {
+            return false;
+        };
+        let last = lock(&self.status).as_ref().and_then(|s| s.of(library));
+        lib.offline_now() || last.is_some_and(|s| !s.reachable())
     }
 }
 
@@ -689,12 +793,17 @@ fn on_player_event(app: &AppHandle, ev: Event) {
             emit_now_playing(app, &np);
             st.save_playlist_soon();
             // Playback moved between servers: let the monitor confirm and report it.
-            if let Some(servers) = st.source.servers() {
-                let expected = match servers.failover.active() {
-                    Which::Primary => ConnStatus::Ok,
-                    Which::Secondary => ConnStatus::Secondary,
-                };
-                if *lock(&st.status) != Some(expected) {
+            if let Some(libs) = st.source.libraries() {
+                let status = lock(&st.status).clone();
+                let moved = libs.iter().any(|lib| {
+                    let expected = match lib.active_server() {
+                        Some(Which::Primary) => ConnStatus::Ok,
+                        Some(Which::Secondary) => ConnStatus::Secondary,
+                        None => return false,
+                    };
+                    status.as_ref().and_then(|s| s.of(lib.id)) != Some(expected)
+                });
+                if moved {
                     st.wake_monitor();
                 }
             }
@@ -757,7 +866,7 @@ fn on_player_event(app: &AppHandle, ev: Event) {
 /// Starts a scan on its own thread with its own catalog connection.
 pub fn start_scan(app: &AppHandle) -> Result<(), String> {
     let st = app.state::<AppState>();
-    if st.source.servers().is_none() {
+    if st.source.libraries().is_none() {
         return Err(i18n::t("err.save_first"));
     }
     if st.clearing.load(Ordering::SeqCst) {
@@ -804,6 +913,44 @@ fn scan_error_message(lang: &str, e: &smp_core::Error) -> String {
     }
 }
 
+/// What one library's scan added up to (see [`add_up_scans`]).
+type LibraryScan = (LibraryRef, smp_core::Result<smp_core::scan::ScanReport>);
+
+/// The `scan-done` payload of a refresh of several libraries: the reports added up,
+/// libraries that could not be read listed (their tracks were kept), and an error
+/// only when none could be scanned.
+fn add_up_scans(lang: &str, scans: Vec<LibraryScan>) -> ScanDonePayload {
+    let mut done = ScanDonePayload::default();
+    let mut scanned = 0;
+    for (library, result) in scans {
+        match result {
+            Ok(r) => {
+                scanned += 1;
+                done.total += r.total;
+                done.read += r.read;
+                done.unchanged += r.unchanged;
+                done.failed += r.failed;
+                done.removed += r.removed;
+                done.skipped_dirs += r.skipped_dirs.len();
+                if r.from_backup {
+                    done.from_backup.push(library);
+                }
+            }
+            Err(e) => done.offline.push(LibraryProblem {
+                library,
+                error: scan_error_message(lang, &e),
+            }),
+        }
+    }
+    done.ok = scanned > 0;
+    if !done.ok {
+        done.error = done.offline.first().map(|p| p.error.clone());
+    }
+    done
+}
+
+/// "Refresh library": scans every library in use, one after another. One that
+/// cannot be read is skipped (its tracks are kept) and the next one is scanned.
 fn run_scan(app: &AppHandle) {
     let st = app.state::<AppState>();
     let started = Instant::now();
@@ -811,65 +958,86 @@ fn run_scan(app: &AppHandle) {
         "scan-progress",
         ScanProgressPayload::from(&ScanProgress::default()),
     );
+    let libraries: Vec<_> = st
+        .source
+        .libraries()
+        .map(|l| l.iter().cloned().collect())
+        .unwrap_or_default();
+    let count = libraries.len();
     let mut last_genres = Instant::now();
-    let mut progress = |p: &ScanProgress| {
-        let payload = ScanProgressPayload::from(p);
-        *lock(&st.scan_progress) = Some(payload.clone());
-        let _ = app.emit("scan-progress", payload);
-        if last_genres.elapsed() >= GENRES_REFRESH {
-            last_genres = Instant::now();
-            let _ = app.emit("genres-changed", ());
+    let mut scans: Vec<LibraryScan> = Vec::new();
+    for (index, lib) in libraries.iter().enumerate() {
+        if st.cancel_scan.load(Ordering::SeqCst) {
+            break;
         }
-    };
-    let result = Catalog::open(&st.catalog_path).and_then(|mut catalog| {
-        scan_with(
-            smp_core::DEFAULT_LIBRARY,
-            st.source.as_ref(),
-            &mut catalog,
-            &mut progress,
-            &st.cancel_scan,
-            &ScanOptions::default(),
-        )
-    });
-    let cancelled = st.cancel_scan.load(Ordering::SeqCst);
-    let cancel_reason = lock(&st.cancel_reason).take().filter(|_| cancelled);
-    let payload = match result {
-        Ok(r) => {
-            log::info!(
-                "scan finished in {:.1} s: {} files, {} read, {} unchanged, {} failed, {} removed, {} folders skipped{}",
-                started.elapsed().as_secs_f32(),
+        let library = LibraryRef {
+            id: lib.id,
+            name: lib.name.clone(),
+        };
+        let mut progress = |p: &ScanProgress| {
+            let payload = ScanProgressPayload {
+                library: Some(library.clone()),
+                library_index: index + 1,
+                library_count: count,
+                ..ScanProgressPayload::from(p)
+            };
+            *lock(&st.scan_progress) = Some(payload.clone());
+            let _ = app.emit("scan-progress", payload);
+            if last_genres.elapsed() >= GENRES_REFRESH {
+                last_genres = Instant::now();
+                let _ = app.emit("genres-changed", ());
+            }
+        };
+        progress(&ScanProgress::default());
+        let result = Catalog::open(&st.catalog_path).and_then(|mut catalog| {
+            scan_with(
+                lib.id,
+                lib.source(),
+                &mut catalog,
+                &mut progress,
+                &st.cancel_scan,
+                &ScanOptions::default(),
+            )
+        });
+        match &result {
+            Ok(r) => log::info!(
+                "scan of library {} finished: {} files, {} read, {} unchanged, {} failed, \
+                 {} removed, {} folders skipped{}",
+                lib.id,
                 r.total,
                 r.read,
                 r.unchanged,
                 r.failed,
                 r.removed,
                 r.skipped_dirs.len(),
-                if cancelled { " (cancelled)" } else { "" }
-            );
-            ScanDonePayload {
-                ok: true,
-                cancelled,
-                cancel_reason,
-                error: None,
-                total: r.total,
-                read: r.read,
-                unchanged: r.unchanged,
-                failed: r.failed,
-                removed: r.removed,
-                skipped_dirs: r.skipped_dirs.len(),
+                if r.from_backup {
+                    " (from the backup server)"
+                } else {
+                    ""
+                }
+            ),
+            Err(e) => {
+                log::warn!(
+                    "scan of library {} failed, its tracks are kept: {e}",
+                    lib.id
+                );
+                st.wake_monitor();
             }
         }
-        Err(e) => {
-            log::warn!("scan failed: {e}");
-            st.wake_monitor();
-            ScanDonePayload {
-                cancelled,
-                cancel_reason,
-                error: Some(scan_error_message(&i18n::current(), &e)),
-                ..Default::default()
-            }
-        }
+        scans.push((library, result));
+    }
+    let cancelled = st.cancel_scan.load(Ordering::SeqCst);
+    let cancel_reason = lock(&st.cancel_reason).take().filter(|_| cancelled);
+    let payload = ScanDonePayload {
+        cancelled,
+        cancel_reason,
+        ..add_up_scans(&i18n::current(), scans)
     };
+    log::info!(
+        "refresh of {count} libraries finished in {:.1} s{}",
+        started.elapsed().as_secs_f32(),
+        if cancelled { " (cancelled)" } else { "" }
+    );
     st.scanning.store(false, Ordering::SeqCst);
     *lock(&st.scan_progress) = None;
     let _ = app.emit("genres-changed", ());
@@ -947,6 +1115,89 @@ pub fn clear_library(app: &AppHandle) -> Result<(), String> {
         }
         Err(e) => {
             log::warn!("clearing the library failed: {e}");
+            Err(i18n::tf("err.database", &[("error", &e.to_string())]))
+        }
+    }
+}
+
+/// Takes out of the playlist the tracks that are gone or whose library is off;
+/// if that changed the track due next, the player drops the one it prepared.
+pub fn prune_playlist(app: &AppHandle, st: &AppState) -> smp_core::Result<()> {
+    let ids: Vec<TrackId> = lock(&st.playlist)
+        .queue
+        .order()
+        .iter()
+        .map(|e| e.id)
+        .collect();
+    let keep: std::collections::HashSet<TrackId> = {
+        let q = lock(&st.query);
+        let off = q.disabled_libraries()?;
+        q.tracks_by_ids(&ids)?
+            .into_iter()
+            .filter(|r| !off.contains(&r.library_id))
+            .map(|r| r.id)
+            .collect()
+    };
+    let due_changed = {
+        let mut l = lock(&st.playlist);
+        let before = l.queue.successor();
+        l.queue.forget_where(|id| !keep.contains(&id));
+        l.queue.successor() != before
+    };
+    if due_changed {
+        st.player.send(Command::Requeue);
+    }
+    st.playlist_changed(app);
+    Ok(())
+}
+
+/// Removes library `id` (not the first one): stops a scan (no scan starts until
+/// it is done), drops the library from the settings, deletes its tracks and takes
+/// them out of the playlist, and forgets its passwords.
+pub fn remove_library(app: &AppHandle, id: LibraryId) -> Result<(), String> {
+    let st = app.state::<AppState>();
+    if id == smp_core::DEFAULT_LIBRARY {
+        return Err(i18n::t("err.remove_default"));
+    }
+    let Some(library) = st.settings.get().library(id) else {
+        return Err(i18n::t("err.no_library"));
+    };
+    let reason = i18n::t("scan.cancelled_settings");
+    let _slot = take_scan_slot(
+        &st.scanning,
+        || {
+            cancel_scan(&st, Some(&reason));
+        },
+        CLEAR_SCAN_WAIT,
+    )
+    .ok_or_else(|| i18n::t("err.remove_busy"))?;
+    let mut new = st.settings.get();
+    new.libraries.retain(|l| l.id != id);
+    let saved = st
+        .settings
+        .replace_and_save(new, |_, _| {})
+        .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
+    st.forget_or_reconnect(app, &saved);
+    let removed = st.writer.call(move |c| c.remove_library(id));
+    if let crate::settings::LibrarySource::Smb { primary, secondary } = &library.source {
+        for server in std::iter::once(primary).chain(secondary.as_ref()) {
+            if let Err(e) = credentials::delete_server_password(st.creds.as_ref(), id, server) {
+                log::warn!("library {id}: password not deleted: {e}");
+            }
+        }
+    }
+    if let Err(e) = prune_playlist(app, &st) {
+        log::warn!("playlist after removing library {id}: {e}");
+    }
+    let _ = app.emit("genres-changed", ());
+    let _ = app.emit(UNREADABLE_EVENT, ());
+    match removed {
+        Ok(n) => {
+            log::info!("library {id} removed with its {n} tracks");
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!("deleting the tracks of library {id} failed: {e}");
             Err(i18n::tf("err.database", &[("error", &e.to_string())]))
         }
     }

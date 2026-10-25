@@ -11,17 +11,19 @@ use smp_core::audio::output::list_output_devices;
 use smp_core::audio::player::Command;
 use smp_core::genre::{known_genre, known_genre_names};
 use smp_core::source::Which;
-use smp_core::TrackId;
+use smp_core::{LibraryId, TrackId, DEFAULT_LIBRARY};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::about;
 use crate::autostart;
-use crate::connection::{status_of, test_server, test_target, ConnStatus, StatusPayload};
-use crate::credentials::CredentialStore;
+use crate::connection::{
+    folder_status, status_of, test_server, test_target, ConnStatus, StatusPayload,
+};
+use crate::credentials::{self, CredentialStore};
 use crate::i18n;
 use crate::lookup;
 use crate::playlist::{self, PlaylistFacets, PlaylistPage, PreviousAction, QueueFilter, Selection};
-use crate::settings::{ServerConfig, Settings, SettingsStore};
+use crate::settings::{Library, LibrarySource, ServerConfig, Settings, SettingsStore};
 use crate::state::{
     self, apply_player_settings, lock, AppState, Engine, NowPlaying, PositionPayload, Press,
     ResumeGate, ScanStatus,
@@ -137,14 +139,60 @@ fn encode_segment(seg: &str) -> String {
     out
 }
 
-/// Where a track lives: `smb://host/share/root/rel_path` on the server the failure
-/// came from (the configured primary when unknown or no backup is set up). Never
-/// holds a username or password, even one typed into the server field.
-pub fn file_location(settings: &Settings, server: Option<Which>, rel_path: &str) -> FileLocation {
-    let cfg = match (server, &settings.secondary) {
-        (Some(Which::Secondary), Some(secondary)) => secondary,
-        _ => &settings.primary,
-    };
+/// Where track `rel_path` of library `library` lives. In an SMB library:
+/// `smb://host/share/root/rel_path` on the server the failure came from (the
+/// primary when unknown or no backup is set up), never with a username or
+/// password, even one typed into the server field. In a local folder: the file's
+/// path (with the folder's separators) and its `file://` URL. Just `rel_path` for
+/// a library no longer set up.
+pub fn file_location(
+    settings: &Settings,
+    library: LibraryId,
+    server: Option<Which>,
+    rel_path: &str,
+) -> FileLocation {
+    match settings.library(library).map(|l| l.source) {
+        Some(LibrarySource::Smb { primary, secondary }) => {
+            let cfg = match (server, &secondary) {
+                (Some(Which::Secondary), Some(secondary)) => secondary,
+                _ => &primary,
+            };
+            smb_location(cfg, rel_path)
+        }
+        Some(LibrarySource::Local { path }) => local_location(&path, rel_path),
+        None => FileLocation {
+            path: rel_path.to_string(),
+            url: rel_path.to_string(),
+        },
+    }
+}
+
+/// A file in local folder `root` (a macOS/Linux path, or a Windows one with `\`).
+fn local_location(root: &str, rel_path: &str) -> FileLocation {
+    let root = root.trim();
+    let windows = root.contains('\\') && !root.starts_with('/');
+    let sep = if windows { "\\" } else { "/" };
+    let rel: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+    let path = format!(
+        "{}{sep}{}",
+        root.trim_end_matches(['/', '\\']),
+        rel.join(sep)
+    );
+    let segments: Vec<String> = root
+        .split(['/', '\\'])
+        .chain(rel.iter().copied())
+        .filter(|s| !s.is_empty())
+        .map(encode_segment)
+        .collect();
+    // `/Volumes/x` and `D:\x` are file:///…; a network path `\\server\share` is file://server/….
+    let lead = if root.starts_with("\\\\") { "" } else { "/" };
+    FileLocation {
+        path,
+        url: format!("file://{lead}{}", segments.join("/")),
+    }
+}
+
+fn smb_location(cfg: &ServerConfig, rel_path: &str) -> FileLocation {
     let host = cfg.host.trim();
     let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
     let segments: Vec<&str> = [cfg.share.trim(), cfg.root.trim(), rel_path]
@@ -160,8 +208,8 @@ pub fn file_location(settings: &Settings, server: Option<Which>, rel_path: &str)
 }
 
 /// Resets the settings (see [`Settings::reset`]) and saves them at once; with
-/// `forget_servers` the servers' keychain passwords are deleted first. `apply` runs
-/// with the old and the new settings, as in [`SettingsStore::replace_and_save`].
+/// `forget_servers` every library's keychain passwords are deleted first. `apply`
+/// runs with the old and the new settings, as in [`SettingsStore::replace_and_save`].
 pub fn reset_settings_now(
     store: &SettingsStore,
     creds: &dyn CredentialStore,
@@ -170,11 +218,8 @@ pub fn reset_settings_now(
 ) -> CmdResult<Settings> {
     let old = store.get();
     if forget_servers {
-        for server in std::iter::once(&old.primary).chain(old.secondary.as_ref()) {
-            let username = server.username.trim();
-            if !username.is_empty() {
-                creds.delete(server.host.trim(), username)?;
-            }
+        for library in old.all_libraries() {
+            forget_passwords(creds, library.id, &library.source, None)?;
         }
     }
     store
@@ -185,6 +230,142 @@ pub fn reset_settings_now(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_settings(app: AppHandle) -> CmdResult<Settings> {
     run(app, |_, st| Ok(st.settings.get())).await
+}
+
+/// Deletes the passwords of `source`'s servers (library `library`) that `kept`
+/// (the library's new source) no longer has.
+fn forget_passwords(
+    creds: &dyn CredentialStore,
+    library: LibraryId,
+    source: &LibrarySource,
+    kept: Option<&LibrarySource>,
+) -> CmdResult<()> {
+    let servers = |s: Option<&LibrarySource>| -> Vec<ServerConfig> {
+        match s {
+            Some(LibrarySource::Smb { primary, secondary }) => std::iter::once(primary.clone())
+                .chain(secondary.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let same = |a: &ServerConfig, b: &ServerConfig| {
+        a.host.trim() == b.host.trim() && a.username.trim() == b.username.trim()
+    };
+    let kept = servers(kept);
+    for old in servers(Some(source)) {
+        if !kept.iter().any(|k| same(k, &old)) {
+            credentials::delete_server_password(creds, library, &old)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether saving server `form` needs a typed password (as the form's own rule):
+/// the password is stored per host and username, so a new account (or share) has
+/// none to keep.
+pub fn password_needed(saved: Option<&ServerConfig>, form: &ServerConfig) -> bool {
+    let Some(saved) = saved.filter(|s| !s.username.trim().is_empty()) else {
+        return true;
+    };
+    saved.host.trim() != form.host.trim()
+        || saved.share.trim() != form.share.trim()
+        || saved.username.trim() != form.username.trim()
+}
+
+/// The servers of an SMB source.
+fn smb_servers(source: &LibrarySource) -> Option<(&ServerConfig, Option<&ServerConfig>)> {
+    match source {
+        LibrarySource::Smb { primary, secondary } => Some((primary, secondary.as_ref())),
+        LibrarySource::Local { .. } => None,
+    }
+}
+
+/// `settings` with `library` saved: a new one (id 0) gets the next id, an existing
+/// one is changed (the first library only in its name and switch; its servers are
+/// the server form's). Checks that it is complete; `typed` says whether a password
+/// was typed for its primary and secondary server. Also returns the library as
+/// saved and whether its source changed (a new library's did).
+pub fn save_library_settings(
+    settings: &Settings,
+    library: Library,
+    typed: (bool, bool),
+) -> CmdResult<(Settings, Library, bool)> {
+    let mut new = settings.clone();
+    let name = library.name.trim().to_string();
+    if library.id == DEFAULT_LIBRARY {
+        if smb_servers(&library.source).is_none() {
+            return Err(i18n::t("err.no_library"));
+        }
+        new.default_library_name = name;
+        new.default_library_enabled = library.enabled;
+        let saved = new.library(DEFAULT_LIBRARY).expect("always there");
+        return Ok((new, saved, false));
+    }
+    let old = match library.id {
+        0 => None,
+        id => Some(
+            settings
+                .libraries
+                .iter()
+                .find(|l| l.id == id)
+                .cloned()
+                .ok_or_else(|| i18n::t("err.no_library"))?,
+        ),
+    };
+    let source = match library.source {
+        LibrarySource::Local { path } if path.trim().is_empty() => {
+            return Err(i18n::t("err.missing_folder"))
+        }
+        LibrarySource::Local { path } => LibrarySource::Local {
+            path: path.trim().to_string(),
+        },
+        smb @ LibrarySource::Smb { .. } => smb,
+    };
+    if let Some((primary, secondary)) = smb_servers(&source) {
+        let old_servers = old.as_ref().and_then(|o| smb_servers(&o.source));
+        let checks = [
+            (Some(primary), old_servers.map(|o| o.0), typed.0),
+            (secondary, old_servers.and_then(|o| o.1), typed.1),
+        ];
+        for (server, saved, typed) in checks {
+            let Some(server) = server else { continue };
+            if server.host.trim().is_empty() {
+                return Err(i18n::t("err.missing_host"));
+            }
+            if server.username.trim().is_empty() {
+                return Err(i18n::t("err.missing_user"));
+            }
+            if !typed && password_needed(saved, server) {
+                return Err(i18n::t("err.missing_password"));
+            }
+        }
+    }
+    let saved = Library {
+        id: old
+            .as_ref()
+            .map_or_else(|| settings.next_library_id(), |o| o.id),
+        name,
+        enabled: library.enabled,
+        source,
+    };
+    let changed = old.as_ref().is_none_or(|o| o.source != saved.source);
+    match new.libraries.iter_mut().find(|l| l.id == saved.id) {
+        Some(slot) => *slot = saved.clone(),
+        None => new.libraries.push(saved.clone()),
+    }
+    Ok((new, saved, changed))
+}
+
+/// Whether any library's source differs between `old` and `new` (or one came or
+/// went): a scan running then reads a source that is no longer set.
+fn sources_changed(old: &Settings, new: &Settings) -> bool {
+    let sources = |s: &Settings| -> Vec<(LibraryId, LibrarySource)> {
+        s.all_libraries()
+            .into_iter()
+            .map(|l| (l.id, l.source))
+            .collect()
+    };
+    sources(old) != sources(new)
 }
 
 /// Saves settings; a non-empty password goes to the keychain, an empty or missing
@@ -198,11 +379,13 @@ pub async fn save_settings(
 ) -> CmdResult<()> {
     run(app, move |app, st| {
         let settings = settings.clamped();
-        let store = |server: Option<&crate::settings::ServerConfig>, pw: Option<String>| match (
+        let store = |server: Option<&ServerConfig>, pw: Option<String>| match (
             server,
             pw.filter(|p| !p.is_empty()),
         ) {
-            (Some(s), Some(pw)) => st.creds.set(s.host.trim(), s.username.trim(), &pw),
+            (Some(s), Some(pw)) => {
+                credentials::set_server_password(st.creds.as_ref(), DEFAULT_LIBRARY, s, &pw)
+            }
             _ => Ok(()),
         };
         store(Some(&settings.primary), primary_password)?;
@@ -211,7 +394,7 @@ pub async fn save_settings(
         let saved = st
             .settings
             .replace_and_save(settings, |old, new| {
-                servers_changed = old.primary != new.primary || old.secondary != new.secondary;
+                servers_changed = sources_changed(old, new);
                 apply_player_settings(&st.player, new);
             })
             .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
@@ -228,29 +411,34 @@ pub async fn save_settings(
     .await
 }
 
-/// Connects once to a server: "ok", "auth" or "unreachable". `server` and `password`
-/// are the form's unsaved values; without them the saved settings and the keychain
-/// password are used, and the live connection to that server forgets a rejected
-/// password and is re-checked.
+/// Connects once to server `which` ("primary"/"secondary") of library `library`
+/// (the first one when not given): "ok", "auth" or "unreachable". `server` and
+/// `password` are the form's unsaved values; without them the saved settings and
+/// the keychain password are used, and the live connection to that server forgets
+/// a rejected password and is re-checked.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn test_connection(
     app: AppHandle,
+    library: Option<LibraryId>,
     which: String,
     server: Option<ServerConfig>,
     password: Option<String>,
 ) -> CmdResult<ConnStatus> {
+    let library = library.unwrap_or(DEFAULT_LIBRARY);
     run(app, move |_, st| {
         let saved = server.is_none();
         let cfg = test_target(
             &st.settings.get(),
             st.creds.as_ref(),
+            library,
             &which,
             server,
             password,
         )?;
         let status = status_of(test_server(cfg), None);
         if saved {
-            if let Some(servers) = st.source.servers() {
+            let libs = st.source.libraries();
+            if let Some(servers) = libs.as_ref().and_then(|l| l.get(library)?.servers()) {
                 let live = match which.as_str() {
                     "primary" => Some(&servers.primary),
                     _ => servers.secondary.as_ref(),
@@ -266,13 +454,182 @@ pub async fn test_connection(
     .await
 }
 
+/// "Test" for a local folder: "ok", or "missing" when it is not there or cannot
+/// be read (a disk not plugged in).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn test_folder(app: AppHandle, path: String) -> CmdResult<ConnStatus> {
+    run(app, move |_, _| {
+        if path.trim().is_empty() {
+            return Err(i18n::t("err.missing_folder"));
+        }
+        Ok(folder_status(std::path::Path::new(path.trim())))
+    })
+    .await
+}
+
+/// "Choose folder…": the system's folder picker; `None` when cancelled.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn pick_folder(app: AppHandle, start: Option<String>) -> CmdResult<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    run(app, move |app, _| {
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title(i18n::t("libraries.choose_folder_title"));
+        if let Some(dir) = start.filter(|d| std::path::Path::new(d).is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        // Blocks this command thread only; the dialog itself runs on the main thread.
+        let Some(chosen) = dialog.blocking_pick_folder() else {
+            return Ok(None);
+        };
+        let path = chosen
+            .into_path()
+            .map_err(|e| i18n::tf("err.folder", &[("error", &e.to_string())]))?;
+        Ok(Some(path.display().to_string()))
+    })
+    .await
+}
+
+/// A library for the Libraries list.
+#[derive(Debug, Clone, Serialize)]
+pub struct LibraryInfo {
+    #[serde(flatten)]
+    pub library: Library,
+    /// Where its music is: `smb://host/share/folder` or the folder's path.
+    pub location: String,
+    /// Tracks of it in the catalog.
+    pub tracks: usize,
+}
+
+fn library_info(
+    library: Library,
+    counts: &std::collections::HashMap<LibraryId, usize>,
+) -> LibraryInfo {
+    let location = match &library.source {
+        LibrarySource::Smb { primary, .. } => smb_location(primary, "").path,
+        LibrarySource::Local { path } => path.clone(),
+    };
+    LibraryInfo {
+        tracks: counts.get(&library.id).copied().unwrap_or(0),
+        location,
+        library,
+    }
+}
+
+/// Every library, the first (SMB) one first, with its track count.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_libraries(app: AppHandle) -> CmdResult<Vec<LibraryInfo>> {
+    run(app, |_, st| {
+        let counts = lock(&st.query).library_track_counts().map_err(db_err)?;
+        Ok(st
+            .settings
+            .get()
+            .all_libraries()
+            .into_iter()
+            .map(|l| library_info(l, &counts))
+            .collect())
+    })
+    .await
+}
+
+/// After a library changed: its tracks out of the playlist if it is off, and the
+/// views that show tracks reloaded.
+fn library_changed(app: &AppHandle, st: &AppState) {
+    if let Err(e) = state::prune_playlist(app, st) {
+        log::warn!("playlist after a library change: {e}");
+    }
+    let _ = app.emit("genres-changed", ());
+    let _ = app.emit(state::UNREADABLE_EVENT, ());
+    let _ = app.emit("libraries-changed", ());
+}
+
+/// Adds (id 0) or changes a library (see [`save_library_settings`]); a typed
+/// password goes to the keychain under the library, an empty one keeps the stored
+/// password. Passwords of servers it no longer has are deleted; a changed source
+/// stops a running scan. Returns the library as saved.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_library(
+    app: AppHandle,
+    library: Library,
+    primary_password: Option<String>,
+    secondary_password: Option<String>,
+) -> CmdResult<LibraryInfo> {
+    run(app, move |app, st| {
+        let primary_password = primary_password.filter(|p| !p.is_empty());
+        let secondary_password = secondary_password.filter(|p| !p.is_empty());
+        let old = st.settings.get();
+        let (new, saved, changed) = save_library_settings(
+            &old,
+            library,
+            (primary_password.is_some(), secondary_password.is_some()),
+        )?;
+        if let Some((primary, secondary)) = smb_servers(&saved.source) {
+            let creds = st.creds.as_ref();
+            if let Some(pw) = &primary_password {
+                credentials::set_server_password(creds, saved.id, primary, pw)?;
+            }
+            if let (Some(server), Some(pw)) = (secondary, &secondary_password) {
+                credentials::set_server_password(creds, saved.id, server, pw)?;
+            }
+        }
+        if let Some(before) = old.library(saved.id) {
+            forget_passwords(
+                st.creds.as_ref(),
+                saved.id,
+                &before.source,
+                Some(&saved.source),
+            )?;
+        }
+        let new = st
+            .settings
+            .replace_and_save(new, |_, _| {})
+            .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
+        if changed {
+            state::cancel_scan(st, Some(&i18n::t("scan.cancelled_settings")));
+        }
+        st.forget_or_reconnect(app, &new);
+        library_changed(app, st);
+        let counts = lock(&st.query).library_track_counts().map_err(db_err)?;
+        Ok(library_info(saved, &counts))
+    })
+    .await
+}
+
+/// Switches a library on or off (its tracks are kept either way).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_library_enabled(app: AppHandle, id: LibraryId, enabled: bool) -> CmdResult<()> {
+    run(app, move |app, st| {
+        let old = st.settings.get();
+        let library = old.library(id).ok_or_else(|| i18n::t("err.no_library"))?;
+        let (new, _, _) =
+            save_library_settings(&old, Library { enabled, ..library }, (false, false))?;
+        let new = st
+            .settings
+            .replace_and_save(new, |_, _| {})
+            .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
+        st.forget_or_reconnect(app, &new);
+        library_changed(app, st);
+        Ok(())
+    })
+    .await
+}
+
+/// Removes a library and its tracks: see [`state::remove_library`].
+#[tauri::command(rename_all = "snake_case")]
+pub async fn remove_library(app: AppHandle, id: LibraryId) -> CmdResult<()> {
+    run(app, move |app, _| {
+        state::remove_library(app, id)?;
+        let _ = app.emit("libraries-changed", ());
+        tray::refresh_genres(app);
+        Ok(())
+    })
+    .await
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_connection_status(app: AppHandle) -> CmdResult<Option<StatusPayload>> {
-    run(
-        app,
-        |_, st| Ok((*lock(&st.status)).map(StatusPayload::from)),
-    )
-    .await
+    run(app, |_, st| Ok(lock(&st.status).clone())).await
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -584,12 +941,16 @@ fn add_to_playlist(
         .map(|t| t.id)
         .chain(lock(&st.banned).iter().copied())
         .collect();
-    let known: HashSet<TrackId> = lock(&st.query)
-        .tracks_by_ids(&ids)
-        .map_err(db_err)?
-        .into_iter()
-        .map(|t| t.id)
-        .collect();
+    let known: HashSet<TrackId> = {
+        let q = lock(&st.query);
+        let off = q.disabled_libraries().map_err(db_err)?;
+        q.tracks_by_ids(&ids)
+            .map_err(db_err)?
+            .into_iter()
+            .filter(|t| !off.contains(&t.library_id))
+            .map(|t| t.id)
+            .collect()
+    };
     let ids: Vec<TrackId> = ids
         .into_iter()
         .filter(|id| known.contains(id) && !banned.contains(id))
@@ -1191,7 +1552,7 @@ pub async fn list_unreadable(app: AppHandle) -> CmdResult<Vec<UnreadableRow>> {
         Ok(rows
             .into_iter()
             .map(|t| {
-                let loc = file_location(&settings, t.server, &t.rel_path);
+                let loc = file_location(&settings, t.library_id, t.server, &t.rel_path);
                 let tags = tags.get(&t.id).cloned().unwrap_or_default();
                 (t, loc, tags)
             })
@@ -1250,11 +1611,30 @@ pub async fn reset_settings(app: AppHandle, forget_servers: bool) -> CmdResult<S
             st.creds.as_ref(),
             forget_servers,
             |old, new| {
-                servers_changed = old.primary != new.primary || old.secondary != new.secondary;
+                servers_changed = sources_changed(old, new);
                 apply_player_settings(&st.player, new);
             },
         )?;
         log::info!("settings reset to defaults (servers forgotten: {forget_servers})");
+        if forget_servers {
+            // The other libraries went with the servers: so do their tracks.
+            let gone: Vec<LibraryId> = lock(&st.query)
+                .library_track_counts()
+                .map_err(db_err)?
+                .into_keys()
+                .filter(|id| new.library(*id).is_none())
+                .collect();
+            for id in gone {
+                if let Err(e) = st.writer.call(move |c| c.remove_library(id)) {
+                    log::warn!("tracks of library {id} not deleted: {e}");
+                }
+            }
+            if let Err(e) = state::prune_playlist(app, st) {
+                log::warn!("playlist after the reset: {e}");
+            }
+            let _ = app.emit("genres-changed", ());
+            let _ = app.emit("libraries-changed", ());
+        }
         if servers_changed || forget_servers {
             state::cancel_scan(st, Some(&i18n::t("scan.cancelled_settings")));
             st.forget_or_reconnect(app, &new);
@@ -1313,7 +1693,7 @@ mod tests {
     #[test]
     fn file_location_uses_the_failing_server_and_no_credentials() {
         let s = two_servers();
-        let loc = |s: &Settings, w, p| file_location(s, w, p);
+        let loc = |s: &Settings, w, p| file_location(s, 1, w, p);
         assert_eq!(
             loc(&s, None, "Rock/A b.mp3").path,
             "smb://10.111.100.2/F/MP3/Rock/A b.mp3"
@@ -1353,7 +1733,7 @@ mod tests {
     #[test]
     fn file_url_is_percent_encoded_and_the_path_readable() {
         let s = two_servers();
-        let l = file_location(&s, None, "Rock & Roll/A b#1 100%?ž.mp3");
+        let l = file_location(&s, 1, None, "Rock & Roll/A b#1 100%?ž.mp3");
         assert_eq!(
             l.url,
             "smb://10.111.100.2/F/MP3/Rock%20&%20Roll/A%20b%231%20100%25%3F%C5%BE.mp3"
@@ -1369,9 +1749,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::settings::FILE_NAME);
         let creds = MemoryStore::default();
-        creds.set("10.111.100.2", "music", "pw1").unwrap();
-        creds.set("10.111.0.2", "backup", "pw2").unwrap();
+        creds.put(1, "10.111.100.2", "music", "pw1");
+        creds.put(1, "10.111.0.2", "backup", "pw2");
+        creds
+            .set("10.111.100.2/music", "from before libraries")
+            .unwrap();
+        creds.put(2, "10.0.0.7", "u", "pw3");
         let start = Settings {
+            libraries: vec![crate::settings::Library {
+                id: 2,
+                name: "Office".into(),
+                enabled: true,
+                source: LibrarySource::Smb {
+                    primary: ServerConfig {
+                        host: "10.0.0.7".into(),
+                        username: "u".into(),
+                        ..ServerConfig::default()
+                    },
+                    secondary: None,
+                },
+            }],
             volume: 0.1,
             notify: true,
             autostart: true,
@@ -1393,7 +1790,8 @@ mod tests {
         assert!(kept.last_selection.is_empty());
         assert_eq!(kept.language, "hr");
         assert_eq!(Settings::load(&path).unwrap(), kept, "saved at once");
-        assert_eq!(creds.get("10.111.100.2", "music").as_deref(), Some("pw1"));
+        assert_eq!(kept.libraries, start.libraries);
+        assert_eq!(creds.accounts().len(), 4, "passwords kept");
 
         let forgot = reset_settings_now(&store, &creds, true, |_, _| {}).unwrap();
         assert_eq!(
@@ -1403,8 +1801,7 @@ mod tests {
                 ..Settings::default()
             }
         );
-        assert_eq!(creds.get("10.111.100.2", "music"), None);
-        assert_eq!(creds.get("10.111.0.2", "backup"), None);
+        assert!(creds.accounts().is_empty(), "{:?}", creds.accounts());
         assert_eq!(Settings::load(&path).unwrap(), forgot);
     }
 
@@ -1588,5 +1985,195 @@ mod tests {
             [Some("DAC".to_string()), Some("DAC".to_string()), None]
         );
         assert_eq!(s.device, None);
+    }
+
+    fn library(id: LibraryId, source: LibrarySource) -> Library {
+        Library {
+            id,
+            name: String::new(),
+            enabled: true,
+            source,
+        }
+    }
+
+    fn local(path: &str) -> LibrarySource {
+        LibrarySource::Local { path: path.into() }
+    }
+
+    #[test]
+    fn unreadable_paths_show_their_library_location() {
+        let s = Settings {
+            libraries: vec![
+                library(2, local("/Volumes/USB Disk/")),
+                library(
+                    3,
+                    LibrarySource::Smb {
+                        primary: ServerConfig {
+                            host: "nas".into(),
+                            share: "Music".into(),
+                            root: "".into(),
+                            username: "u".into(),
+                            domain: None,
+                        },
+                        secondary: None,
+                    },
+                ),
+            ],
+            ..two_servers()
+        };
+        let l = file_location(&s, 2, None, "Rock/A b čž#1.mp3");
+        assert_eq!(l.path, "/Volumes/USB Disk/Rock/A b čž#1.mp3");
+        assert_eq!(
+            l.url,
+            "file:///Volumes/USB%20Disk/Rock/A%20b%20%C4%8D%C5%BE%231.mp3"
+        );
+        let l = file_location(&s, 3, Some(Which::Secondary), "x.mp3");
+        assert_eq!(l.url, "smb://nas/Music/x.mp3");
+        assert_eq!(
+            file_location(&s, 1, None, "x.mp3").url,
+            "smb://10.111.100.2/F/MP3/x.mp3"
+        );
+        // A library removed meanwhile: just the path.
+        assert_eq!(file_location(&s, 9, None, "x.mp3").path, "x.mp3");
+        // Windows folders.
+        let w = Settings {
+            libraries: vec![library(2, local(r"D:\Glazba\"))],
+            ..Settings::default()
+        };
+        let l = file_location(&w, 2, None, "Rock/a b.mp3");
+        assert_eq!(l.path, r"D:\Glazba\Rock\a b.mp3");
+        assert_eq!(l.url, "file:///D:/Glazba/Rock/a%20b.mp3");
+    }
+
+    #[test]
+    fn a_password_is_needed_for_a_new_account_or_share() {
+        let saved = ServerConfig {
+            username: "music".into(),
+            ..ServerConfig::default()
+        };
+        assert!(password_needed(None, &saved));
+        assert!(!password_needed(Some(&saved), &saved));
+        let root = ServerConfig {
+            root: "Other".into(),
+            ..saved.clone()
+        };
+        assert!(
+            !password_needed(Some(&saved), &root),
+            "only the folder changed"
+        );
+        for changed in [
+            ServerConfig {
+                host: "h2".into(),
+                ..saved.clone()
+            },
+            ServerConfig {
+                share: "G".into(),
+                ..saved.clone()
+            },
+            ServerConfig {
+                username: " other".into(),
+                ..saved.clone()
+            },
+        ] {
+            assert!(password_needed(Some(&saved), &changed), "{changed:?}");
+        }
+        let no_user = ServerConfig::default();
+        assert!(password_needed(Some(&no_user), &saved));
+    }
+
+    #[test]
+    fn saving_a_library_adds_or_changes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = Settings::default();
+        // A new local folder gets the next id.
+        let (s, lib, changed) = save_library_settings(
+            &base,
+            Library {
+                id: 0,
+                name: " Disk ".into(),
+                ..library(0, local(&dir.path().display().to_string()))
+            },
+            (false, false),
+        )
+        .unwrap();
+        assert_eq!((lib.id, lib.name.as_str()), (2, "Disk"));
+        assert!(changed);
+        assert_eq!(s.libraries, std::slice::from_ref(&lib));
+        // Renamed and switched off: the source is the same.
+        let (s2, _, changed) = save_library_settings(
+            &s,
+            Library {
+                name: "USB".into(),
+                enabled: false,
+                ..lib.clone()
+            },
+            (false, false),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(s2.libraries[0].name, "USB");
+        assert_eq!(s2.disabled_libraries(), [2]);
+        // Another folder: a source change.
+        let (_, _, changed) =
+            save_library_settings(&s2, library(2, local("/elsewhere")), (false, false)).unwrap();
+        assert!(changed);
+        // The first library's name and switch.
+        let (s3, first, changed) = save_library_settings(
+            &s2,
+            Library {
+                id: 1,
+                name: "NAS".into(),
+                enabled: false,
+                ..s2.all_libraries()[0].clone()
+            },
+            (false, false),
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!((first.id, s3.default_library_name.as_str()), (1, "NAS"));
+        assert!(!s3.default_library_enabled);
+        assert_eq!(s3.libraries, s2.libraries);
+    }
+
+    #[test]
+    fn a_library_must_be_complete_to_be_saved() {
+        let base = Settings::default();
+        let err = |l| save_library_settings(&base, l, (false, false)).unwrap_err();
+        assert_eq!(
+            err(library(0, local("  "))),
+            i18n::tr("en", "err.missing_folder")
+        );
+        let smb = |host: &str, user: &str| LibrarySource::Smb {
+            primary: ServerConfig {
+                host: host.into(),
+                username: user.into(),
+                ..ServerConfig::default()
+            },
+            secondary: None,
+        };
+        assert_eq!(
+            err(library(0, smb("", "u"))),
+            i18n::tr("en", "err.missing_host")
+        );
+        assert_eq!(
+            err(library(0, smb("h", ""))),
+            i18n::tr("en", "err.missing_user")
+        );
+        // A new SMB library needs a password typed.
+        assert_eq!(
+            err(library(0, smb("h", "u"))),
+            i18n::tr("en", "err.missing_password")
+        );
+        assert!(save_library_settings(&base, library(0, smb("h", "u")), (true, false)).is_ok());
+        // Another library's id is not taken over.
+        assert_eq!(
+            err(library(7, local("/x"))),
+            i18n::tr("en", "err.no_library")
+        );
+        // The first library stays an SMB server.
+        assert_eq!(
+            err(library(1, local("/x"))),
+            i18n::tr("en", "err.no_library")
+        );
     }
 }

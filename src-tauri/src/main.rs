@@ -59,7 +59,8 @@ fn main() {
             }
             // The window starts hidden: a start at login stays in the menu bar unless
             // the server still has to be set up.
-            let configured = !settings.primary.username.trim().is_empty();
+            let configured =
+                !settings.primary.username.trim().is_empty() || !settings.libraries.is_empty();
             if !(configured && autostart::is_autostart_launch(std::env::args())) {
                 tray::show_main_window(handle);
             }
@@ -76,6 +77,12 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::save_settings,
+            commands::get_libraries,
+            commands::save_library,
+            commands::set_library_enabled,
+            commands::remove_library,
+            commands::test_folder,
+            commands::pick_folder,
             commands::test_connection,
             commands::get_connection_status,
             commands::start_scan,

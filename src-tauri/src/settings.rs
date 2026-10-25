@@ -7,7 +7,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use smp_core::{LibraryId, DEFAULT_LIBRARY};
 
 use crate::i18n;
 
@@ -38,11 +39,71 @@ impl Default for ServerConfig {
     }
 }
 
+/// Where a library's music is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+// A settings value, built and cloned rarely: boxing the servers buys nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum LibrarySource {
+    /// An SMB server, with an optional backup server it falls back to.
+    Smb {
+        primary: ServerConfig,
+        secondary: Option<ServerConfig>,
+    },
+    /// A folder on this computer (an external disk, a mounted network volume…).
+    Local { path: String },
+}
+
+/// A music library: one source whose tracks the catalog keeps under its id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Library {
+    pub id: LibraryId,
+    /// Blank: the UI shows a default name.
+    #[serde(default)]
+    pub name: String,
+    /// Off: its tracks stay in the catalog but are neither listed nor played.
+    #[serde(default = "on")]
+    pub enabled: bool,
+    pub source: LibrarySource,
+}
+
+fn on() -> bool {
+    true
+}
+
+/// Reads the saved further libraries; an entry that cannot be read (a hand-edited
+/// file), or whose id is taken or not above the first library's, is dropped
+/// rather than making the whole settings file unreadable.
+fn lenient_libraries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Library>, D::Error> {
+    let values = match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Array(v) => v,
+        _ => return Ok(Vec::new()),
+    };
+    let mut libraries: Vec<Library> = Vec::new();
+    for value in values {
+        match serde_json::from_value::<Library>(value) {
+            Ok(l) if l.id > DEFAULT_LIBRARY && libraries.iter().all(|o| o.id != l.id) => {
+                libraries.push(l)
+            }
+            Ok(l) => log::warn!("settings: library id {} dropped (taken)", l.id),
+            Err(e) => log::warn!("settings: a library entry dropped: {e}"),
+        }
+    }
+    Ok(libraries)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// The first library's (an SMB server's) servers: set up on first run.
     pub primary: ServerConfig,
     pub secondary: Option<ServerConfig>,
+    /// The first library's name (blank: a default name) and whether it is on.
+    pub default_library_name: String,
+    pub default_library_enabled: bool,
+    /// Further libraries (ids above [`DEFAULT_LIBRARY`]), in the order shown.
+    #[serde(deserialize_with = "lenient_libraries")]
+    pub libraries: Vec<Library>,
     /// Linear, 0..1.
     pub volume: f32,
     /// Output device name; `None` = system default.
@@ -69,6 +130,9 @@ impl Default for Settings {
         Self {
             primary: ServerConfig::default(),
             secondary: None,
+            default_library_name: String::new(),
+            default_library_enabled: true,
+            libraries: Vec::new(),
             volume: 0.7,
             device: None,
             crossfade_enabled: true,
@@ -99,8 +163,48 @@ impl Settings {
         self
     }
 
+    /// Every library, the first (SMB) one first.
+    pub fn all_libraries(&self) -> Vec<Library> {
+        let first = Library {
+            id: DEFAULT_LIBRARY,
+            name: self.default_library_name.clone(),
+            enabled: self.default_library_enabled,
+            source: LibrarySource::Smb {
+                primary: self.primary.clone(),
+                secondary: self.secondary.clone(),
+            },
+        };
+        std::iter::once(first)
+            .chain(self.libraries.iter().cloned())
+            .collect()
+    }
+
+    pub fn library(&self, id: LibraryId) -> Option<Library> {
+        self.all_libraries().into_iter().find(|l| l.id == id)
+    }
+
+    /// The libraries switched off.
+    pub fn disabled_libraries(&self) -> Vec<LibraryId> {
+        self.all_libraries()
+            .into_iter()
+            .filter(|l| !l.enabled)
+            .map(|l| l.id)
+            .collect()
+    }
+
+    /// The id for a new library (never one in use).
+    pub fn next_library_id(&self) -> LibraryId {
+        self.libraries
+            .iter()
+            .map(|l| l.id)
+            .max()
+            .unwrap_or(DEFAULT_LIBRARY)
+            .max(DEFAULT_LIBRARY)
+            + 1
+    }
+
     /// "Reset settings to defaults": every setting back to its default except the
-    /// language, and the servers unless `forget_servers`.
+    /// language, and the servers and libraries unless `forget_servers`.
     pub fn reset(&self, forget_servers: bool) -> Self {
         let defaults = Settings {
             language: self.language.clone(),
@@ -112,6 +216,9 @@ impl Settings {
             Settings {
                 primary: self.primary.clone(),
                 secondary: self.secondary.clone(),
+                default_library_name: self.default_library_name.clone(),
+                default_library_enabled: self.default_library_enabled,
+                libraries: self.libraries.clone(),
                 ..defaults
             }
         }
@@ -297,6 +404,9 @@ mod tests {
                 username: "music".into(),
                 ..ServerConfig::default()
             }),
+            default_library_name: String::new(),
+            default_library_enabled: true,
+            libraries: Vec::new(),
             volume: 0.2,
             device: Some("USB DAC".into()),
             crossfade_enabled: false,
@@ -425,5 +535,110 @@ mod tests {
             .unwrap();
         assert_eq!(seen, Some((false, true)));
         assert!(Settings::load(&path).unwrap().notify);
+    }
+
+    fn local(id: LibraryId, path: &str) -> Library {
+        Library {
+            id,
+            name: format!("Disk {id}"),
+            enabled: true,
+            source: LibrarySource::Local { path: path.into() },
+        }
+    }
+
+    #[test]
+    fn a_fresh_install_has_exactly_the_smb_library() {
+        let s = Settings::default();
+        let libs = s.all_libraries();
+        assert_eq!(libs.len(), 1);
+        assert_eq!(libs[0].id, smp_core::DEFAULT_LIBRARY);
+        assert!(libs[0].enabled);
+        assert_eq!(
+            libs[0].source,
+            LibrarySource::Smb {
+                primary: ServerConfig::default(),
+                secondary: None
+            }
+        );
+        assert_eq!(s.next_library_id(), 2);
+        // Settings from before libraries read the same.
+        let old: Settings =
+            serde_json::from_str(r#"{"primary": {"username": "music"}, "volume": 0.5}"#).unwrap();
+        assert_eq!(old.all_libraries().len(), 1);
+        assert_eq!(old.primary.username, "music");
+    }
+
+    #[test]
+    fn libraries_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let s = Settings {
+            default_library_name: "NAS".into(),
+            default_library_enabled: false,
+            libraries: vec![
+                local(2, "/Volumes/Glazba čćž 🎵"),
+                Library {
+                    id: 5,
+                    name: "Office".into(),
+                    enabled: false,
+                    source: LibrarySource::Smb {
+                        primary: ServerConfig {
+                            host: "10.0.0.5".into(),
+                            username: "u".into(),
+                            ..ServerConfig::default()
+                        },
+                        secondary: Some(ServerConfig::default()),
+                    },
+                },
+            ],
+            ..customised()
+        };
+        s.save(&path).unwrap();
+        let back = Settings::load(&path).unwrap();
+        assert_eq!(back, s);
+        let ids: Vec<LibraryId> = back.all_libraries().iter().map(|l| l.id).collect();
+        assert_eq!(ids, [1, 2, 5]);
+        assert_eq!(back.all_libraries()[0].name, "NAS");
+        assert_eq!(back.disabled_libraries(), [1, 5]);
+        assert_eq!(back.next_library_id(), 6);
+        assert_eq!(back.library(2).unwrap(), local(2, "/Volumes/Glazba čćž 🎵"));
+        assert!(back.library(3).is_none());
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(json.contains(r#""type": "local""#), "{json}");
+        assert!(!json.to_lowercase().contains("password"));
+    }
+
+    #[test]
+    fn a_bad_library_entry_is_dropped_not_the_whole_file() {
+        let s: Settings = serde_json::from_str(
+            r#"{"volume": 0.3, "libraries": [
+                {"id": 2, "source": {"type": "local", "path": "/a"}},
+                {"id": 3, "source": {"type": "ftp"}},
+                {"id": 1, "source": {"type": "local", "path": "/taken"}},
+                {"id": 2, "source": {"type": "local", "path": "/again"}},
+                "nonsense"
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.volume, 0.3);
+        assert_eq!(s.libraries.len(), 1);
+        assert_eq!(s.libraries[0].id, 2);
+        assert!(s.libraries[0].enabled, "on unless saved off");
+        assert_eq!(s.libraries[0].name, "");
+    }
+
+    #[test]
+    fn reset_keeps_libraries_unless_servers_are_forgotten() {
+        let s = Settings {
+            libraries: vec![local(2, "/x")],
+            default_library_name: "NAS".into(),
+            ..customised()
+        };
+        let kept = s.reset(false);
+        assert_eq!(kept.libraries, s.libraries);
+        assert_eq!(kept.default_library_name, "NAS");
+        let forgot = s.reset(true);
+        assert!(forgot.libraries.is_empty());
+        assert_eq!(forgot.all_libraries().len(), 1);
     }
 }

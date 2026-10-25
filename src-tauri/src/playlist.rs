@@ -640,6 +640,17 @@ pub fn restore(query: &Catalog, saved: SavedPlaylist) -> smp_core::Result<Playli
 
 #[cfg(test)]
 mod tests {
+    /// Every library reachable, read from its primary server.
+    struct AllOnline;
+    impl crate::provider::LibraryHealth for AllOnline {
+        fn active_server(&self, _: smp_core::LibraryId) -> Option<Which> {
+            Some(Which::Primary)
+        }
+        fn offline(&self, _: smp_core::LibraryId) -> bool {
+            false
+        }
+    }
+
     use super::*;
     use crate::provider::{BannedSet, CatalogProvider, Playback};
     use crate::writer::CatalogWriter;
@@ -686,7 +697,7 @@ mod tests {
                 db: Arc::new(Mutex::new(Catalog::open(&path).unwrap())),
                 writer: CatalogWriter::spawn(Catalog::open(&path).unwrap()).unwrap(),
                 banned: BannedSet::default(),
-                active_server: Arc::new(|| Some(Which::Primary)),
+                libraries: Arc::new(AllOnline),
             };
             Self {
                 _dir: dir,
