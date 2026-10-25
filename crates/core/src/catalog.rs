@@ -180,7 +180,8 @@ CREATE TABLE IF NOT EXISTS playlist(
     id INTEGER PRIMARY KEY CHECK (id = 1),
     selection TEXT NOT NULL,
     shuffle INTEGER NOT NULL,
-    entries BLOB NOT NULL
+    entries BLOB NOT NULL,
+    format INTEGER NOT NULL DEFAULT 1
 );
 -- Where the playlist is (one row, small: written every few seconds while playing).
 CREATE TABLE IF NOT EXISTS playlist_cursor(
@@ -232,6 +233,15 @@ const ADDED_TRACK_COLUMNS: &[(&str, &str)] = &[
     ("last_error_at", "INTEGER"),
     ("last_error_server", "TEXT"),
 ];
+
+/// Columns added to the playlist tables after they first shipped (as for `tracks`).
+const ADDED_PLAYLIST_COLUMNS: &[(&str, &str, &str)] = &[
+    ("playlist", "format", "INTEGER NOT NULL DEFAULT 1"),
+    ("playlist_cursor", "resume", "INTEGER NOT NULL DEFAULT 1"),
+];
+
+/// Layout of the saved playlist's blobs; a playlist saved in another one is not read.
+const PLAYLIST_FORMAT: i64 = 1;
 
 /// A data migration: the catalog version it brings, what it does, and the step.
 type Migration = (i64, &'static str, fn(&Catalog) -> Result<()>);
@@ -369,6 +379,18 @@ impl Catalog {
             }
             self.conn
                 .execute_batch("CREATE INDEX IF NOT EXISTS idx_tracks_year ON tracks(year)")?;
+            for (table, name, decl) in ADDED_PLAYLIST_COLUMNS {
+                let have: bool = self.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
+                    [name],
+                    |r| r.get(0),
+                )?;
+                if !have {
+                    self.conn
+                        .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"))?;
+                    log::info!("catalog: added column {table}.{name}");
+                }
+            }
             Ok(())
         })
     }
@@ -896,8 +918,9 @@ impl Catalog {
     ) -> Result<()> {
         let blob = ids_to_blob(order.iter().map(|e| if e.manual { -e.id } else { e.id }));
         self.conn.execute(
-            "INSERT OR REPLACE INTO playlist(id, selection, shuffle, entries) VALUES(1, ?1, ?2, ?3)",
-            params![selection, shuffle, blob],
+            "INSERT OR REPLACE INTO playlist(id, selection, shuffle, entries, format)
+             VALUES(1, ?1, ?2, ?3, ?4)",
+            params![selection, shuffle, blob, PLAYLIST_FORMAT],
         )?;
         Ok(())
     }
@@ -923,8 +946,8 @@ impl Catalog {
         let list = self
             .conn
             .query_row(
-                "SELECT selection, shuffle, entries FROM playlist WHERE id=1",
-                [],
+                "SELECT selection, shuffle, entries FROM playlist WHERE id=1 AND format=?1",
+                [PLAYLIST_FORMAT],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -955,14 +978,13 @@ impl Catalog {
             )
             .optional()?
             .unwrap_or_default();
+        // Track ids are positive; anything else is damage and left out.
         let order = blob_to_ids(&entries)
             .into_iter()
-            .map(|id| {
-                if id < 0 {
-                    Entry::manual(-id)
-                } else {
-                    Entry::new(id)
-                }
+            .filter_map(|id| match id {
+                1.. => Some(Entry::new(id)),
+                0 => None,
+                _ => id.checked_neg().map(Entry::manual),
             })
             .collect();
         Ok(Some(SavedPlaylist {
@@ -1220,6 +1242,7 @@ impl Catalog {
 mod tests {
     use super::*;
     use crate::failure::{FailCode, Failure};
+    use crate::queue::Entry;
     use crate::source::Which;
 
     fn meta(genre: Option<&str>) -> TrackMeta {
@@ -2097,6 +2120,56 @@ mod tests {
         c.save_playlist_order("{}", false, &[]).unwrap();
         let saved = c.load_playlist().unwrap().unwrap();
         assert_eq!(saved.cursor, PlaylistCursor::default());
+    }
+
+    #[test]
+    fn a_playlist_cursor_table_from_before_resume_gets_the_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("catalog.db");
+        {
+            let c = Catalog::open(&db).unwrap();
+            c.conn
+                .execute_batch(
+                    "DROP TABLE playlist_cursor;
+                     CREATE TABLE playlist_cursor(
+                         id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER,
+                         history BLOB NOT NULL, history_pos INTEGER,
+                         position_ms INTEGER NOT NULL);",
+                )
+                .unwrap();
+        }
+        let c = Catalog::open(&db).unwrap();
+        c.save_playlist_order("{}", false, &[Entry::new(1)])
+            .unwrap();
+        let cursor = PlaylistCursor {
+            resume: true,
+            position_ms: 5,
+            ..Default::default()
+        };
+        c.save_playlist_cursor(&cursor).unwrap();
+        assert_eq!(c.load_playlist().unwrap().unwrap().cursor, cursor);
+    }
+
+    #[test]
+    fn a_playlist_of_another_format_or_with_bad_ids_is_not_misread() {
+        let c = Catalog::open_in_memory().unwrap();
+        c.save_playlist_order("{}", false, &[Entry::new(1), Entry::manual(2)])
+            .unwrap();
+        let mut blob = Vec::new();
+        for id in [3i64, 0, i64::MIN, -4] {
+            blob.extend(id.to_le_bytes());
+        }
+        c.conn
+            .execute("UPDATE playlist SET entries=?1", [blob])
+            .unwrap();
+        let order = c.load_playlist().unwrap().unwrap().order;
+        assert_eq!(order, [Entry::new(3), Entry::manual(4)], "bad ids dropped");
+        c.conn.execute("UPDATE playlist SET format=99", []).unwrap();
+        assert_eq!(
+            c.load_playlist().unwrap(),
+            None,
+            "a newer format is not read"
+        );
     }
 
     #[test]

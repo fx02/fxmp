@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 use rubato::{FftFixedIn, Resampler};
 use symphonia::core::audio::{Channels, SampleBuffer};
-use symphonia::core::codecs::{Decoder as CodecDecoder, DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{
+    Decoder as CodecDecoder, DecoderOptions, CODEC_TYPE_MP3, CODEC_TYPE_NULL,
+};
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
@@ -138,6 +140,8 @@ impl Resample {
 }
 
 pub struct Decoder {
+    /// MP3 seeks coarsely (see [`Decoder::seek_to`]).
+    is_mp3: bool,
     format: Box<dyn FormatReader>,
     codec: Box<dyn CodecDecoder>,
     track_id: u32,
@@ -220,6 +224,7 @@ impl Decoder {
         };
         let (resample, skip_frames) = Self::make_resample(src_rate, out_rate)?;
         Ok(Self {
+            is_mp3: params.codec == CODEC_TYPE_MP3,
             format,
             codec,
             track_id,
@@ -254,18 +259,28 @@ impl Decoder {
         self.duration_ms
     }
 
-    /// Moves to `ms` from the start (accurate: frames before it are decoded and
-    /// dropped) and returns where reading continues, in ms. On an error the decoder is
-    /// in an unknown state: open the track again.
+    /// Moves to `ms` from the start and returns where reading continues, in ms. FLAC
+    /// and Ogg seek accurately (frames before the target are decoded and dropped).
+    /// MP3 has no index: an accurate seek would read the whole file up to the target
+    /// (over the network), so it jumps to the byte position estimated from the file's
+    /// length and frame count (symphonia's coarse seek; without a Xing/Info header the
+    /// count is estimated from the bit rate) and drops frames from there to the
+    /// target; that lands within about a second. On an error the decoder is in an
+    /// unknown state: open the track again.
     pub fn seek_to(&mut self, ms: u64) -> Result<u64> {
         if self.duration_ms.is_some_and(|d| ms > d) {
             return Err(Error::Decode(format!("seek to {ms} ms is past the end")));
         }
+        let mode = if self.is_mp3 {
+            SeekMode::Coarse
+        } else {
+            SeekMode::Accurate
+        };
         let time = Time::new(ms / 1000, (ms % 1000) as f64 / 1000.0);
         let seeked = self
             .format
             .seek(
-                SeekMode::Accurate,
+                mode,
                 SeekTo::Time {
                     time,
                     track_id: Some(self.track_id),
@@ -288,8 +303,16 @@ impl Decoder {
         };
         let required = to_frames(seeked.required_ts);
         let actual = to_frames(seeked.actual_ts);
-        self.discard_src_frames = required.saturating_sub(actual);
-        // Start over with an empty resampler, as at the start of the stream.
+        self.restart_output(required.saturating_sub(actual))?;
+        let delay = params.delay.unwrap_or(0) as u64;
+        let landed = required.max(actual).saturating_sub(delay);
+        Ok(landed * 1000 / rate.max(1) as u64)
+    }
+
+    /// Empties what was decoded and starts output anew (as at the start of the
+    /// stream), dropping `discard` source frames first.
+    fn restart_output(&mut self, discard: u64) -> Result<()> {
+        self.discard_src_frames = discard;
         self.ready.clear();
         let (resample, skip) = Self::make_resample(self.cur_rate, self.out_rate)?;
         self.resample = resample;
@@ -297,9 +320,7 @@ impl Decoder {
         self.seg_src_frames = 0;
         self.seg_out_frames = 0;
         self.ended = false;
-        let delay = params.delay.unwrap_or(0) as u64;
-        let landed = required.max(actual).saturating_sub(delay);
-        Ok(landed * 1000 / rate.max(1) as u64)
+        Ok(())
     }
 
     /// Fills `out` with interleaved stereo samples and returns how many it wrote.
@@ -730,9 +751,10 @@ mod tests {
     }
 
     #[test]
-    fn seek_to_lands_within_100_ms_for_every_format() {
+    fn seek_to_lands_within_100_ms_for_flac_and_ogg() {
         let rate = 44100;
-        for name in ["step.mp3", "step.flac", "step.ogg"] {
+        // mp3 estimates its position (see the tests below).
+        for name in ["step.flac", "step.ogg"] {
             for target in [0u64, 1000, 2500, 4200] {
                 let mut d = open("fixtures-audio", name, rate).unwrap();
                 let landed = d.seek_to(target).unwrap();
@@ -778,6 +800,71 @@ mod tests {
             let s = drain(&mut d);
             let at = switch_ms(&s, rate).expect("1500 Hz part");
             assert!((at as i64 - 1000).abs() <= 100, "{name}: switch at {at} ms");
+        }
+    }
+
+    /// Counts the bytes read through it.
+    struct Counting<R>(R, std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.read(b)?;
+            self.1
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Counting<R> {
+        fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
+            self.0.seek(p)
+        }
+    }
+
+    #[test]
+    fn a_late_mp3_seek_estimates_instead_of_reading_the_file() {
+        let rate = 44100;
+        for name in ["step.mp3", "step_noxing.mp3"] {
+            let p = path("fixtures-audio", name);
+            let len = std::fs::metadata(&p).unwrap().len();
+            let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let r = Counting(File::open(&p).unwrap(), read.clone());
+            let mut d = Decoder::open(Box::new(r), Some(len), "mp3", rate).unwrap();
+            let opened = read.load(std::sync::atomic::Ordering::Relaxed);
+            let landed = d.seek_to(5_000).unwrap();
+            let mut buf = vec![0.0f32; 4096];
+            d.read(&mut buf).unwrap();
+            let used = read.load(std::sync::atomic::Ordering::Relaxed) - opened;
+            assert!(
+                used < len / 3,
+                "{name}: read {used} of {len} bytes for a seek near the end"
+            );
+            assert!(
+                (landed as i64 - 5_000).abs() <= 1_000,
+                "{name}: reports {landed} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn an_estimated_mp3_seek_lands_within_a_second() {
+        let rate = 44100;
+        for name in ["step.mp3", "step_noxing.mp3"] {
+            for target in [1000u64, 2500] {
+                let mut d = open("fixtures-audio", name, rate).unwrap();
+                let landed = d.seek_to(target).unwrap();
+                let s = drain(&mut d);
+                let at = switch_ms(&s, rate).expect("1500 Hz part") as i64;
+                assert!(
+                    (at - (3000 - target as i64)).abs() <= 1_000,
+                    "{name} @ {target}: switch at {at} ms"
+                );
+                // Where it reports to be is where it is.
+                assert!(
+                    (at - (3000 - landed as i64)).abs() <= 150,
+                    "{name} @ {target}: reports {landed} ms, switch at {at} ms"
+                );
+            }
         }
     }
 

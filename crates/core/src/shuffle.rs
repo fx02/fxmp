@@ -1,63 +1,15 @@
+//! True-random shuffling: every pass over a selection is a fresh Fisher-Yates
+//! permutation from an OS-entropy seeded RNG, with no repeats within a pass. The
+//! play queue ([`crate::queue::Queue`]) makes its passes here.
+
 use crate::TrackId;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-/// True-random shuffler: each pass is a fresh Fisher-Yates permutation of the
-/// pool; no repeats within a pass, and a new pass never starts with the track
-/// that was played last.
-pub struct Shuffler<R: Rng> {
-    pool: Vec<TrackId>,
-    /// Remaining tracks of the current pass, consumed from the back.
-    order: Vec<TrackId>,
-    last: Option<TrackId>,
-    first: Option<TrackId>,
-    rng: R,
-}
-
-impl<R: Rng> Shuffler<R> {
-    pub fn new(pool: Vec<TrackId>, avoid_first: Option<TrackId>, rng: R) -> Self {
-        let mut s = Shuffler {
-            pool,
-            order: Vec::new(),
-            last: avoid_first,
-            first: None,
-            rng,
-        };
-        s.refill();
-        s.first = s.order.last().copied();
-        s
-    }
-
-    fn refill(&mut self) {
-        // Consumed from the back.
-        let mut order = shuffled_pass(&self.pool, self.last, &mut self.rng);
-        order.reverse();
-        self.order = order;
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<TrackId> {
-        if self.pool.is_empty() {
-            return None;
-        }
-        if self.order.is_empty() {
-            self.refill();
-        }
-        let id = self.order.pop()?;
-        self.last = Some(id);
-        Some(id)
-    }
-
-    pub fn remove(&mut self, id: TrackId) {
-        self.pool.retain(|&t| t != id);
-        self.order.retain(|&t| t != id);
-    }
-
-    /// First track of the first pass (to persist in `selection_state`).
-    pub fn first(&self) -> Option<TrackId> {
-        self.first
-    }
+/// An RNG seeded from OS entropy: every run of a selection shuffles differently.
+pub fn entropy_rng() -> StdRng {
+    StdRng::from_entropy()
 }
 
 /// One pass over `pool` in play order: a fresh Fisher-Yates permutation whose first
@@ -76,75 +28,53 @@ pub fn shuffled_pass<R: Rng>(
     order
 }
 
-pub fn entropy_shuffler(pool: Vec<TrackId>, avoid_first: Option<TrackId>) -> Shuffler<StdRng> {
-    Shuffler::new(pool, avoid_first, StdRng::from_entropy())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    #[test]
-    fn empty_pool_returns_none() {
-        let mut s = entropy_shuffler(vec![], None);
-        assert_eq!(s.next(), None);
-        assert_eq!(s.first(), None);
+    fn pass(pool: &[TrackId], avoid: Option<TrackId>) -> Vec<TrackId> {
+        shuffled_pass(pool, avoid, &mut entropy_rng())
     }
 
     #[test]
-    fn single_track_pool_repeats_forever() {
-        let mut s = entropy_shuffler(vec![7], Some(7));
-        for _ in 0..5 {
-            assert_eq!(s.next(), Some(7));
-        }
+    fn empty_and_single_track_pools() {
+        assert!(pass(&[], Some(1)).is_empty());
+        assert_eq!(pass(&[7], Some(7)), [7], "nothing else to start with");
     }
 
     #[test]
-    fn no_repeat_within_pass() {
-        let mut s = entropy_shuffler((0..100).collect(), None);
-        let got: Vec<_> = (0..100).map(|_| s.next().unwrap()).collect();
-        let set: HashSet<_> = got.iter().copied().collect();
-        assert_eq!(set.len(), 100);
-        assert!(got.iter().all(|x| (0..100).contains(x)));
+    fn a_pass_has_every_track_once() {
+        let pool: Vec<TrackId> = (0..100).collect();
+        let got = pass(&pool, None);
+        assert_eq!(got.len(), 100);
+        assert_eq!(got.iter().copied().collect::<HashSet<_>>().len(), 100);
     }
 
     #[test]
     fn avoid_first_is_respected() {
         for x in 0..10 {
             for _ in 0..50 {
-                let s = entropy_shuffler((0..10).collect(), Some(x));
-                assert_ne!(s.first(), Some(x));
+                assert_ne!(pass(&(0..10).collect::<Vec<_>>(), Some(x))[0], x);
             }
         }
     }
 
     #[test]
     fn first_track_distribution_is_uniform() {
+        let pool: Vec<TrackId> = (0..50).collect();
         let mut counts = [0u32; 50];
         for _ in 0..1000 {
-            let mut s = entropy_shuffler((0..50).collect(), None);
-            counts[s.next().unwrap() as usize] += 1;
+            counts[pass(&pool, None)[0] as usize] += 1;
         }
         assert!(counts.iter().all(|&c| c >= 1), "{counts:?}");
         assert!(counts.iter().all(|&c| c <= 60), "{counts:?}");
     }
 
     #[test]
-    fn new_pass_does_not_start_with_last_played() {
-        let mut s = entropy_shuffler((0..5).collect(), None);
-        let v: Vec<_> = (0..2000).map(|_| s.next().unwrap()).collect();
-        for i in (5..v.len()).step_by(5) {
-            assert_ne!(v[i], v[i - 1], "pass boundary at {i}");
-        }
-    }
-
-    #[test]
-    fn remove_skips_removed_track() {
-        let mut s = entropy_shuffler((0..10).collect(), None);
-        s.remove(3);
-        for _ in 0..100 {
-            assert_ne!(s.next(), Some(3));
-        }
+    fn entropy_seeding_differs_between_runs() {
+        let pool: Vec<TrackId> = (0..1000).collect();
+        let runs: HashSet<Vec<TrackId>> = (0..5).map(|_| pass(&pool, None)).collect();
+        assert_eq!(runs.len(), 5, "every run shuffles anew");
     }
 }

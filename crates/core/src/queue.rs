@@ -215,15 +215,16 @@ impl<R: Rng> Queue<R> {
         self.next_pass.as_ref()?.first().map(|e| e.id)
     }
 
-    /// `id` started playing.
-    pub fn started(&mut self, id: TrackId) {
+    /// `id` started playing. False when the queue did not expect it (a track asked
+    /// for just before the queue changed): it only goes into the history.
+    pub fn started(&mut self, id: TrackId) -> bool {
         match self.target.take() {
-            Some(Target::Restart) if self.current() == Some(id) => return,
+            Some(Target::Restart) if self.current() == Some(id) => return true,
             Some(Target::Back) => {
                 if let Some(p) = self.history_pos.filter(|&p| p > 0) {
                     if self.history[p - 1] == id {
                         self.history_pos = Some(p - 1);
-                        return;
+                        return true;
                     }
                 }
             }
@@ -232,12 +233,13 @@ impl<R: Rng> Queue<R> {
         if let Some(p) = self.history_pos.filter(|&p| p + 1 < self.history.len()) {
             if self.history[p + 1] == id {
                 self.history_pos = Some(p + 1);
-                return;
+                return true;
             }
         }
         let next = self.cursor.map_or(0, |c| c + 1);
-        if self.order.get(next).is_some_and(|e| e.id == id) {
+        let expected = if self.order.get(next).is_some_and(|e| e.id == id) {
             self.cursor = Some(next);
+            true
         } else if self
             .next_pass
             .as_ref()
@@ -247,10 +249,12 @@ impl<R: Rng> Queue<R> {
             self.order = self.next_pass.take().unwrap_or_default();
             self.cursor = Some(0);
             self.changed();
-        }
-        // Anything else (a track asked for just before the queue changed) only goes
-        // into the history; the order keeps its place.
+            true
+        } else {
+            false
+        };
         self.push_history(id);
+        expected
     }
 
     fn push_history(&mut self, id: TrackId) {
@@ -616,6 +620,21 @@ mod tests {
         q.started(2);
         assert_eq!(q.current(), Some(2));
         assert_eq!(q.successor(), Some(4));
+    }
+
+    #[test]
+    fn started_says_whether_the_queue_expected_that_track() {
+        let mut q = Queue::fixed(&[1, 2, 3], rng());
+        assert!(q.started(1), "the first track");
+        assert!(
+            !q.started(9),
+            "a track from elsewhere (a race with a new selection)"
+        );
+        q.go_back();
+        assert!(q.started(1), "going back");
+        assert!(q.started(9), "forward through the history");
+        q.restart();
+        assert!(q.started(9), "a restart");
     }
 
     #[test]

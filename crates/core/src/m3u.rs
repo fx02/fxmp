@@ -1,5 +1,6 @@
 //! Extended M3U playlists in UTF-8 (`.m3u8`): `#EXTM3U`, then an `#EXTINF` line and
-//! a path per track. Paths are relative to the library root with `/` separators, so
+//! a path per track. Paths are relative to the library root with `/` separators (as
+//! the share lists them), so
 //! the file works from the music folder on any system and in any player. Lines end
 //! in CRLF, which old Windows players need and every other player accepts.
 
@@ -67,7 +68,7 @@ fn extinf(t: &M3uTrack) -> String {
     let artist = t.artist.map(one_line).unwrap_or_default();
     let title = t.title.map(one_line).filter(|s| !s.is_empty());
     let title = title.unwrap_or_else(|| {
-        let name = t.rel_path.rsplit(['/', '\\']).next().unwrap_or(t.rel_path);
+        let name = t.rel_path.rsplit('/').next().unwrap_or(t.rel_path);
         one_line(name.rsplit_once('.').map_or(name, |(stem, _)| stem))
     });
     if artist.is_empty() {
@@ -77,10 +78,14 @@ fn extinf(t: &M3uTrack) -> String {
     }
 }
 
-/// The relative path with `/` separators; one starting with `#` would read as a
+/// The relative path as it is (spaces and backslashes are part of a name on the
+/// share); only line breaks become spaces, and one starting with `#` would read as a
 /// comment, so it gets `./` in front.
 fn path_line(rel_path: &str) -> String {
-    let p = one_line(&rel_path.replace('\\', "/"));
+    let p: String = rel_path
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     let p = p.trim_start_matches('/');
     if p.starts_with('#') {
         format!("./{p}")
@@ -149,7 +154,7 @@ mod tests {
     fn missing_tags_fall_back_to_the_file_name_and_lines_stay_lines() {
         let got = export(&[
             M3uTrack {
-                rel_path: "a\\b\\Some Song.ogg",
+                rel_path: "a/b/Some Song.ogg",
                 artist: Some("  "),
                 title: Some(""),
                 duration_ms: Some(0),
@@ -168,6 +173,20 @@ mod tests {
              a/b/Some Song.ogg\r\n\
              #EXTINF:0,Two  Lines - Tab here\r\n\
              ./#1 Hits/x.mp3\r\n"
+        );
+    }
+
+    #[test]
+    fn paths_are_written_as_they_are() {
+        let got = export(&[M3uTrack {
+            rel_path: " Odd/name with\\backslash .mp3",
+            artist: Some(" A "),
+            title: Some(" T "),
+            duration_ms: Some(1000),
+        }]);
+        assert_eq!(
+            got,
+            "#EXTM3U\r\n#EXTINF:1,A - T\r\n Odd/name with\\backslash .mp3\r\n"
         );
     }
 

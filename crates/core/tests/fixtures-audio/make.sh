@@ -14,3 +14,5 @@ $FF -y -filter_complex "$STEP" -ac 1 -c:a flac step.flac
 $FF -y -filter_complex "$STEP" -ac 1 -c:a libmp3lame -b:a 48k step.mp3
 # The native (experimental) Vorbis encoder only does stereo.
 $FF -y -filter_complex "$STEP" -ac 2 -c:a vorbis -strict -2 -b:a 64k step.ogg
+# The same without a Xing/Info header (no frame count): mp3 seeking estimates from bytes.
+$FF -y -filter_complex "$STEP" -ac 1 -c:a libmp3lame -b:a 48k -write_xing 0 step_noxing.mp3
