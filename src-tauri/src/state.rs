@@ -935,12 +935,14 @@ pub fn cancel_scan(st: &AppState, reason: Option<&str>) -> bool {
     true
 }
 
-/// Text for a failed scan, in `lang`: connection problems in the words the status uses.
+/// Text for a failed scan, in `lang`: connection problems in the words the status
+/// uses, anything else translated around its (English) detail.
 fn scan_error_message(lang: &str, e: &smp_core::Error) -> String {
     match e {
         smp_core::Error::Source(SourceError::Auth) => i18n::tr(lang, ConnStatus::Auth.text_key()),
         smp_core::Error::Source(_) => i18n::tr(lang, ConnStatus::Unreachable.text_key()),
-        other => other.to_string(),
+        smp_core::Error::Db(_) => i18n::trf(lang, "err.database", &[("error", &e.to_string())]),
+        other => i18n::trf(lang, "scan.failed", &[("error", &other.to_string())]),
     }
 }
 
@@ -1588,7 +1590,20 @@ mod tests {
             );
         }
         let other = smp_core::Error::Other("disk full".into());
-        assert_eq!(scan_error_message("en", &other), "disk full");
+        assert_eq!(scan_error_message("en", &other), "Scan failed: disk full");
+        let dir = tempfile::tempdir().unwrap();
+        let db = Catalog::open(&dir.path().join("no/such/dir/c.db"))
+            .err()
+            .unwrap();
+        assert!(matches!(db, smp_core::Error::Db(_)));
+        assert_eq!(
+            scan_error_message("hr", &db),
+            i18n::trf("hr", "err.database", &[("error", &db.to_string())])
+        );
+        assert!(
+            scan_error_message("hr", &db).starts_with("Greška baze"),
+            "translated"
+        );
     }
 
     fn statuses(list: &[(LibraryId, ConnStatus)]) -> StatusPayload {

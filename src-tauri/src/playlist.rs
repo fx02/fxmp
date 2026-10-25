@@ -466,7 +466,7 @@ pub fn export_m3u8(
     };
     let name = path
         .file_name()
-        .ok_or_else(|| "no file name".to_string())?
+        .ok_or_else(|| crate::i18n::t("err.no_file_name"))?
         .to_string_lossy();
     let tmp = path.with_file_name(format!(".{name}.part"));
     let written = (|| {
@@ -1139,6 +1139,11 @@ mod tests {
         );
         let bad = dir.path().join("no/such/dir/x.m3u8");
         assert!(export_m3u8(&fx.list, &fx.query, &bad, None).is_err());
+        assert_eq!(
+            export_m3u8(&fx.list, &fx.query, Path::new("/"), None),
+            Err(crate::i18n::t("err.no_file_name")),
+            "translated"
+        );
     }
 
     #[test]

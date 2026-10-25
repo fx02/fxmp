@@ -168,6 +168,7 @@
   "err.playlist_changed": "Popis se u međuvremenu promijenio. Pokušaj ponovno.",
   "err.filter_empty": "Nijedna pjesma ne odgovara filtru.",
   "err.export": "Ne mogu spremiti popis: {error}",
+  "err.no_file_name": "Nije zadan naziv datoteke.",
   "playlist.export_title": "Izvoz popisa",
   "err.lookup_nothing": "Nema se što potražiti.",
   "err.open_browser": "Ne mogu otvoriti preglednik: {error}",

@@ -165,6 +165,7 @@
   "err.playlist_changed": "The playlist changed meanwhile. Try again.",
   "err.filter_empty": "No track matches the filter.",
   "err.export": "Cannot save the playlist: {error}",
+  "err.no_file_name": "No file name was given.",
   "playlist.export_title": "Export playlist",
   "err.lookup_nothing": "There is nothing to look up.",
   "err.open_browser": "Cannot open the browser: {error}",
