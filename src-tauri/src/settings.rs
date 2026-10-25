@@ -377,6 +377,22 @@ impl SettingsStore {
         Ok(s.clone())
     }
 
+    /// Makes new settings from the current ones (`change`) and writes them now,
+    /// all under the lock, so nothing saved meanwhile is lost. `apply` runs under
+    /// the lock with the old and the new settings.
+    pub fn change_and_save(
+        &self,
+        change: impl FnOnce(&Settings) -> Settings,
+        apply: impl FnOnce(&Settings, &Settings),
+    ) -> io::Result<Settings> {
+        let mut s = self.shared.lock();
+        let new = change(&s).clamped();
+        self.shared.save_locked(&new)?;
+        apply(&s, &new);
+        *s = new;
+        Ok(s.clone())
+    }
+
     /// Writes the current settings now (e.g. on exit, ahead of a pending save).
     pub fn flush(&self) -> io::Result<()> {
         let s = self.shared.lock();

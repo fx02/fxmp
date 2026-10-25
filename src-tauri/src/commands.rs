@@ -395,8 +395,52 @@ fn sources_changed(old: &Settings, new: &Settings) -> bool {
     sources(old) != sources(new)
 }
 
-/// Saves settings; a non-empty password goes to the keychain, an empty or missing
-/// one keeps the stored password.
+/// Saves the server form (`form`'s main and backup server, notifications and
+/// start at login; everything else stays as stored, so a library saved since
+/// the window read the settings is kept). A typed password goes to the
+/// keychain first; once saved, the passwords of servers the first library no
+/// longer has are deleted. `apply` runs as in [`SettingsStore::change_and_save`].
+pub fn save_server_form(
+    store: &SettingsStore,
+    creds: &dyn CredentialStore,
+    form: Settings,
+    primary_password: Option<&str>,
+    secondary_password: Option<&str>,
+    apply: impl FnOnce(&Settings, &Settings),
+) -> CmdResult<Settings> {
+    let put = |server: Option<&ServerConfig>, pw: Option<&str>| match (
+        server,
+        pw.filter(|p| !p.is_empty()),
+    ) {
+        (Some(s), Some(pw)) => credentials::set_server_password(creds, DEFAULT_LIBRARY, s, pw),
+        _ => Ok(()),
+    };
+    put(Some(&form.primary), primary_password)?;
+    put(form.secondary.as_ref(), secondary_password)?;
+    let mut before = None;
+    let saved = store
+        .change_and_save(
+            |current| {
+                before = current.library(DEFAULT_LIBRARY);
+                Settings {
+                    primary: form.primary,
+                    secondary: form.secondary,
+                    notify: form.notify,
+                    autostart: form.autostart,
+                    ..current.clone()
+                }
+            },
+            apply,
+        )
+        .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
+    if let (Some(before), Some(now)) = (before, saved.library(DEFAULT_LIBRARY)) {
+        forget_passwords(creds, DEFAULT_LIBRARY, &before.source, Some(&now.source))?;
+    }
+    Ok(saved)
+}
+
+/// Saves the server form (see [`save_server_form`]); a non-empty password goes to
+/// the keychain, an empty or missing one keeps the stored password.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn save_settings(
     app: AppHandle,
@@ -405,26 +449,18 @@ pub async fn save_settings(
     secondary_password: Option<String>,
 ) -> CmdResult<()> {
     run(app, move |app, st| {
-        let settings = settings.clamped();
-        let store = |server: Option<&ServerConfig>, pw: Option<String>| match (
-            server,
-            pw.filter(|p| !p.is_empty()),
-        ) {
-            (Some(s), Some(pw)) => {
-                credentials::set_server_password(st.creds.as_ref(), DEFAULT_LIBRARY, s, &pw)
-            }
-            _ => Ok(()),
-        };
-        store(Some(&settings.primary), primary_password)?;
-        store(settings.secondary.as_ref(), secondary_password)?;
         let mut servers_changed = false;
-        let saved = st
-            .settings
-            .replace_and_save(settings, |old, new| {
+        let saved = save_server_form(
+            &st.settings,
+            st.creds.as_ref(),
+            settings,
+            primary_password.as_deref(),
+            secondary_password.as_deref(),
+            |old, new| {
                 servers_changed = sources_changed(old, new);
                 apply_player_settings(&st.player, new);
-            })
-            .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
+            },
+        )?;
         if servers_changed {
             state::cancel_scan(st, Some(&i18n::t("scan.cancelled_settings")));
         }
@@ -1815,6 +1851,68 @@ mod tests {
         assert_eq!(
             l.path,
             "smb://10.111.100.2/F/MP3/Rock & Roll/A b#1 100%?ž.mp3"
+        );
+    }
+
+    #[test]
+    fn saving_the_server_form_keeps_libraries_and_forgets_the_old_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::settings::FILE_NAME);
+        let creds = MemoryStore::default();
+        creds.put(1, "10.111.100.2", "music", "pw1");
+        creds.put(1, "10.111.0.2", "backup", "pw2");
+        let local = |id: LibraryId| crate::settings::Library {
+            id,
+            name: String::new(),
+            enabled: true,
+            source: LibrarySource::Local {
+                path: format!("/music/{id}"),
+            },
+        };
+        let start = Settings {
+            libraries: vec![local(2)],
+            last_library_id: 2,
+            volume: 0.3,
+            ..two_servers()
+        };
+        let store = SettingsStore::new(path.clone(), start.clone()).unwrap();
+        // The window read the settings, then a library was added meanwhile.
+        let form = Settings {
+            primary: ServerConfig {
+                host: "10.0.0.9".into(),
+                username: "music2".into(),
+                ..start.primary.clone()
+            },
+            notify: true,
+            volume: 0.9,
+            ..start.clone()
+        };
+        store.update(
+            |s| {
+                s.libraries.push(local(3));
+                s.last_library_id = 3;
+            },
+            |_| {},
+        );
+        let saved =
+            save_server_form(&store, &creds, form, Some("new-pw"), None, |_, _| {}).unwrap();
+        assert_eq!(
+            saved.libraries,
+            [local(2), local(3)],
+            "the new library stays"
+        );
+        assert_eq!(saved.last_library_id, 3);
+        assert_eq!(
+            saved.volume, 0.3,
+            "only the form's fields come from the form"
+        );
+        assert!(saved.notify);
+        assert_eq!(saved.primary.host, "10.0.0.9");
+        assert_eq!(Settings::load(&path).unwrap(), saved, "saved at once");
+        assert_eq!(
+            creds.accounts(),
+            ["library-1/10.0.0.9/music2", "library-1/10.111.0.2/backup"],
+            "the old main server's password is gone"
         );
     }
 
