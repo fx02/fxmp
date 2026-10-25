@@ -8,6 +8,9 @@ import {
   scanProgressText,
   scanDoneText,
   connMessage,
+  libraryName,
+  libraryFromForm,
+  statusTooltip,
   serverFromForm,
   missingUsername,
   passwordRequired,
@@ -49,6 +52,10 @@ let t = (key) => key;
 const state = {
   tab: null,
   settings: null,
+  /** The libraries (`get_libraries`), the first (SMB) one first. */
+  libraries: [],
+  /** The library being edited: `{ id (0 = new), type, saved }`, or null. */
+  editing: null,
   configured: false,
   nowPlaying: null,
   genres: [],
@@ -153,6 +160,7 @@ function showTab(name) {
   if (name === "settings") {
     loadDevices();
     loadBanned();
+    loadLibraries();
   }
 }
 
@@ -776,6 +784,11 @@ function renderStatus(payload, checking = false) {
     : state.configured || checking
       ? t("conn.checking")
       : t("conn.not_set_up");
+  // Each library's state, also when several are fine.
+  const tip = statusTooltip(payload, t, state.libraries);
+  dot.title = tip;
+  $("conn-text").title = tip;
+  if (state.libraries.length) renderLibraries();
 }
 
 // ---------- scan ----------
@@ -806,6 +819,7 @@ function renderScanDone(done) {
   clearTimeout(scanNoteTimer);
   scanNoteTimer = setTimeout(() => ($("genre-scan").hidden = true), 8000);
   renderGenres();
+  if (state.tab === "settings") loadLibraries();
   const rescan = state.rescanIfCancelled && done.cancelled && Boolean(done.cancel_reason);
   state.rescanIfCancelled = false;
   if (rescan) startScan();
@@ -1375,8 +1389,10 @@ async function onReset() {
     if (!settings) return;
   }
   state.settings = settings;
-  state.configured = !missingUsername(settings.primary);
+  state.configured = !missingUsername(settings.primary) || settings.libraries.length > 0;
   renderSettings(settings);
+  closeLibraryForm();
+  loadLibraries();
   loadDevices();
   if (!state.configured) renderStatus(null);
   renderGenres();
@@ -1408,6 +1424,7 @@ async function onClear() {
   renderUnreadableTab();
   renderArtists();
   loadBanned();
+  loadLibraries();
   showTab("genres");
   renderGenres();
   toast(t("settings.clear_done"));
@@ -1567,6 +1584,292 @@ async function onSave(e) {
   }
 }
 
+// ---------- libraries ----------
+
+async function loadLibraries() {
+  const libs = await run("get_libraries");
+  if (!libs) return;
+  state.libraries = libs;
+  renderLibraries();
+  // Unnamed libraries in the status tooltip are named from the list.
+  const tip = statusTooltip(state.status, t, state.libraries);
+  $("conn-dot").title = tip;
+  $("conn-text").title = tip;
+}
+
+function libraryStatus(id) {
+  const libs = (state.status && state.status.libraries) || [];
+  const found = libs.find((l) => l.id === id);
+  return found ? found.status : null;
+}
+
+function renderLibraries() {
+  $("libraries-list").replaceChildren(
+    ...state.libraries.map((lib) => {
+      const status = lib.enabled ? libraryStatus(lib.id) : null;
+      const dot = el("span", {
+        className: "dot" + (status ? ` ${status}` : ""),
+        title: status ? connMessage(status, t) : "",
+      });
+      const type = t(lib.source.type === "local" ? "libraries.type_local" : "libraries.type_smb");
+      const details = `${type} · ${lib.location} · ${t("libraries.tracks", { n: lib.tracks })}`;
+      const on = el("input", { type: "checkbox", checked: lib.enabled });
+      on.addEventListener("change", () => setLibraryEnabled(lib, on));
+      const edit = el("button", { type: "button", textContent: t("libraries.edit") });
+      edit.addEventListener("click", () => openLibraryForm(lib, lib.source.type));
+      const actions = [el("label", { className: "check" }, on, el("span", { textContent: t("libraries.enabled") })), edit];
+      if (lib.id !== 1) {
+        const remove = el("button", { type: "button", className: "danger", textContent: t("libraries.remove") });
+        remove.addEventListener("click", () => removeLibrary(lib));
+        actions.push(remove);
+      }
+      return el(
+        "li",
+        { className: "library" + (lib.enabled ? "" : " off") },
+        dot,
+        el(
+          "div",
+          { className: "library-text" },
+          el("div", { className: "library-name", textContent: libraryName(lib, t) }),
+          el("div", { className: "note", textContent: details }),
+        ),
+        el("div", { className: "library-actions" }, ...actions),
+      );
+    }),
+  );
+  if (state.editing) renderLibraryFormTitle();
+}
+
+async function setLibraryEnabled(lib, box) {
+  box.disabled = true;
+  try {
+    await invoke("set_library_enabled", { id: lib.id, enabled: box.checked });
+  } catch (e) {
+    toast(String(e));
+    box.checked = !box.checked;
+  } finally {
+    box.disabled = false;
+  }
+  loadLibraries();
+}
+
+async function removeLibrary(lib) {
+  const name = libraryName(lib, t);
+  const answer = await confirmDialog({
+    title: t("libraries.remove_title", { name }),
+    text: t("libraries.remove_text", { tracks: t("libraries.tracks", { n: lib.tracks }) }),
+    okLabel: t("libraries.remove_button"),
+  });
+  if (!answer) return;
+  try {
+    await invoke("remove_library", { id: lib.id });
+    toast(t("libraries.removed"));
+    if (state.editing && state.editing.id === lib.id) closeLibraryForm();
+  } catch (e) {
+    toast(String(e));
+  }
+  loadLibraries();
+}
+
+function libFieldset(which) {
+  return document.querySelector(`fieldset[data-libserver="${which}"]`);
+}
+
+function readLibServer(which) {
+  const fs = libFieldset(which);
+  const values = {};
+  for (const f of serverFields) values[f] = fs.elements[f].value;
+  return serverFromForm(values);
+}
+
+/** The edited library's saved server (null for a new library or server). */
+function savedLibServer(which) {
+  const lib = state.editing && state.editing.saved;
+  if (!lib || lib.source.type !== "smb") return null;
+  return which === "primary" ? lib.source.primary : lib.source.secondary;
+}
+
+function updateLibPasswordHint(which) {
+  const pw = libFieldset(which).elements.password;
+  pw.placeholder = passwordRequired(savedLibServer(which), readLibServer(which))
+    ? t("settings.password_required")
+    : t("settings.password_keep");
+}
+
+function fillLibServer(which, cfg) {
+  const fs = libFieldset(which);
+  for (const f of serverFields) fs.elements[f].value = (cfg && cfg[f]) || "";
+  fs.elements.password.value = "";
+  fs.querySelector(".test-result").textContent = "";
+  updateLibPasswordHint(which);
+}
+
+function renderLibraryFormTitle() {
+  const ed = state.editing;
+  $("library-form-title").textContent = ed.saved
+    ? t("libraries.editing", { name: libraryName(ed.saved, t) })
+    : t(ed.type === "local" ? "libraries.new_local" : "libraries.new_smb");
+}
+
+/** Opens the editor on `lib` (null: a new library of `type`, "smb" or "local"). */
+function openLibraryForm(lib, type) {
+  const f = $("library-form");
+  state.editing = { id: lib ? lib.id : 0, type, saved: lib };
+  const main = Boolean(lib) && lib.id === 1;
+  renderLibraryFormTitle();
+  f.elements.name.value = lib ? lib.name : "";
+  f.elements.enabled.checked = lib ? lib.enabled : true;
+  $("library-local").hidden = type !== "local";
+  $("library-smb").hidden = type !== "smb" || main;
+  $("library-main-note").hidden = !main;
+  f.elements.path.value = lib && type === "local" ? lib.source.path : "";
+  $("folder-result").textContent = "";
+  if (type === "smb" && !main) {
+    const src = lib ? lib.source : null;
+    fillLibServer("primary", src && src.primary);
+    fillLibServer("secondary", src && src.secondary);
+    $("lib-use-secondary").checked = Boolean(src && src.secondary);
+    libFieldset("secondary").hidden = !(src && src.secondary);
+  }
+  $("library-result").textContent = "";
+  f.hidden = false;
+  f.scrollIntoView({ block: "nearest" });
+  f.elements.name.focus();
+}
+
+function closeLibraryForm() {
+  $("library-form").hidden = true;
+  state.editing = null;
+}
+
+async function onChooseFolder() {
+  const input = $("library-form").elements.path;
+  const path = await run("pick_folder", { start: input.value.trim() || null });
+  if (!path) return;
+  input.value = path;
+  onTestFolder();
+}
+
+async function onTestFolder() {
+  const out = $("folder-result");
+  const path = $("library-form").elements.path.value.trim();
+  out.className = "test-result";
+  if (!path) {
+    out.textContent = t("err.missing_folder");
+    out.classList.add("bad");
+    return;
+  }
+  try {
+    const status = await invoke("test_folder", { path });
+    out.textContent = status === "ok" ? t("libraries.folder_ok") : connMessage(status, t);
+    out.classList.add(status === "ok" ? "ok" : "bad");
+  } catch (e) {
+    out.textContent = String(e);
+    out.classList.add("bad");
+  }
+}
+
+async function onLibTest(button) {
+  const which = button.dataset.which;
+  const fs = libFieldset(which);
+  const out = fs.querySelector(".test-result");
+  const server = readLibServer(which);
+  out.className = "test-result";
+  if (!server.host || missingUsername(server)) {
+    out.textContent = t("settings.test_missing");
+    out.classList.add("bad");
+    return;
+  }
+  out.textContent = t("settings.testing");
+  button.disabled = true;
+  try {
+    // A new library (id 0) has no saved password to fall back on.
+    const status = await invoke("test_connection", {
+      library: state.editing ? state.editing.id : 0,
+      which,
+      server,
+      password: fs.elements.password.value || null,
+    });
+    out.textContent = status === "ok" ? t("settings.test_ok") : connMessage(status, t);
+    out.classList.add(status === "ok" ? "ok" : "bad");
+  } catch (e) {
+    out.textContent = String(e);
+    out.classList.add("bad");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function onLibrarySave(e) {
+  e.preventDefault();
+  const ed = state.editing;
+  if (!ed) return;
+  const f = $("library-form");
+  const result = $("library-result");
+  result.className = "result bad";
+  const main = ed.id === 1;
+  let primary = null;
+  let secondary = null;
+  if (ed.type === "smb" && !main) {
+    primary = readLibServer("primary");
+    secondary = $("lib-use-secondary").checked ? readLibServer("secondary") : null;
+    for (const [which, srv] of [["primary", primary], ["secondary", secondary]]) {
+      if (!srv) continue;
+      const els = libFieldset(which).elements;
+      let missing = null;
+      if (!srv.host) {
+        missing = "host";
+        result.textContent = t(`settings.missing_host_${which}`);
+      } else if (missingUsername(srv)) {
+        missing = "username";
+        result.textContent = t(`settings.missing_user_${which}`);
+      } else if (!els.password.value && passwordRequired(savedLibServer(which), srv)) {
+        missing = "password";
+        result.textContent = t(`settings.missing_password_${which}`);
+      }
+      if (missing) {
+        els[missing].focus();
+        return;
+      }
+    }
+  }
+  if (ed.type === "local" && !f.elements.path.value.trim()) {
+    result.textContent = t("err.missing_folder");
+    f.elements.path.focus();
+    return;
+  }
+  const values = { id: ed.id, name: f.elements.name.value, enabled: f.elements.enabled.checked };
+  // The main server's servers are the form's above: only its name and switch change here.
+  const library = main
+    ? { id: 1, name: values.name.trim(), enabled: values.enabled, source: ed.saved.source }
+    : libraryFromForm({ ...values, type: ed.type, path: f.elements.path.value, primary, secondary });
+  const password = (which, srv) => (srv ? libFieldset(which).elements.password.value || null : null);
+  const submit = e.submitter || f.querySelector("button[type=submit]");
+  submit.disabled = true;
+  result.textContent = "";
+  try {
+    const saved = await invoke("save_library", {
+      library,
+      primary_password: password("primary", primary),
+      secondary_password: password("secondary", secondary),
+    });
+    toast(t("libraries.saved"));
+    closeLibraryForm();
+    state.settings = (await run("get_settings")) || state.settings;
+    await loadLibraries();
+    // A new library: read it in straight away.
+    if (ed.id === 0 && saved.enabled) {
+      if (state.scanning) state.rescanIfCancelled = true;
+      else startScan();
+    }
+  } catch (err) {
+    result.className = "result bad";
+    result.textContent = String(err);
+  } finally {
+    submit.disabled = false;
+  }
+}
+
 async function loadDevices() {
   const names = await run("list_devices");
   if (!names) return;
@@ -1644,7 +1947,9 @@ function rerender() {
   }
   $("crossfade-label").textContent = t("settings.seconds", { n: Number($("crossfade-secs").value) });
   for (const which of ["primary", "secondary"]) updatePasswordHint(which);
-  for (const out of document.querySelectorAll(".test-result, #save-result")) out.textContent = "";
+  for (const which of ["primary", "secondary"]) updateLibPasswordHint(which);
+  for (const out of document.querySelectorAll(".test-result, #save-result, #library-result")) out.textContent = "";
+  renderLibraries();
   renderAbout();
   if (pl.facets) renderFacets();
   if (pl.meta) {
@@ -1804,6 +2109,18 @@ function wire() {
   $("btn-scan").addEventListener("click", startScan);
   $("btn-empty-scan").addEventListener("click", startScan);
 
+  // Libraries
+  $("btn-add-smb").addEventListener("click", () => openLibraryForm(null, "smb"));
+  $("btn-add-local").addEventListener("click", () => openLibraryForm(null, "local"));
+  $("library-form").addEventListener("submit", onLibrarySave);
+  $("btn-library-cancel").addEventListener("click", closeLibraryForm);
+  $("btn-choose-folder").addEventListener("click", onChooseFolder);
+  $("btn-test-folder").addEventListener("click", onTestFolder);
+  for (const b of document.querySelectorAll(".btn-lib-test")) b.addEventListener("click", () => onLibTest(b));
+  $("lib-use-secondary").addEventListener("change", (e) => (libFieldset("secondary").hidden = !e.target.checked));
+  for (const which of ["primary", "secondary"])
+    libFieldset(which).addEventListener("input", () => updateLibPasswordHint(which));
+
   // Unreadable files
   $("unreadable-list").addEventListener("click", (e) => {
     const li = e.target.closest("li");
@@ -1871,13 +2188,15 @@ async function init() {
     listen("position", (e) => onPosition(e.payload)),
     listen("playlist-changed", () => onPlaylistChanged()),
     listen("audio-changed", (e) => onAudioChanged(e.payload)),
+    listen("libraries-changed", () => loadLibraries()),
   ]);
 
   if (settings) {
     state.settings = settings;
-    state.configured = !missingUsername(settings.primary);
+    state.configured = !missingUsername(settings.primary) || settings.libraries.length > 0;
     renderSettings(settings);
   }
+  await loadLibraries();
   // A tab the user already picked while starting up stays.
   if (!state.tab) showTab(state.configured ? "genres" : "settings");
 

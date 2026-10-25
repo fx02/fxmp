@@ -146,6 +146,66 @@
       </div>
     </form>
 
+    <h3 data-i18n="libraries.title"></h3>
+    <p class="note" data-i18n="libraries.note"></p>
+    <ul id="libraries-list" class="list libraries"></ul>
+    <div class="row">
+      <button id="btn-add-smb" type="button" data-i18n="libraries.add_smb"></button>
+      <button id="btn-add-local" type="button" data-i18n="libraries.add_local"></button>
+    </div>
+    <form id="library-form" class="library-form" autocomplete="off" hidden>
+      <h4 id="library-form-title"></h4>
+      <label class="field"><span data-i18n="libraries.name"></span>
+        <input name="name" data-i18n-placeholder="settings.optional" spellcheck="false">
+      </label>
+      <div id="library-local">
+        <label class="field"><span data-i18n="libraries.folder"></span>
+          <input name="path" spellcheck="false">
+        </label>
+        <div class="row">
+          <button type="button" id="btn-choose-folder" data-i18n="libraries.choose_folder"></button>
+          <button type="button" id="btn-test-folder" data-i18n="libraries.test_folder"></button>
+          <span id="folder-result" class="test-result"></span>
+        </div>
+      </div>
+      <div id="library-smb">
+        <fieldset data-libserver="primary">
+          <legend data-i18n="settings.main_server"></legend>
+          <label><span data-i18n="settings.server"></span> <input name="host" spellcheck="false"></label>
+          <label><span data-i18n="settings.share"></span> <input name="share" spellcheck="false"></label>
+          <label><span data-i18n="settings.path"></span> <input name="root" spellcheck="false"></label>
+          <label><span data-i18n="settings.username"></span> <input name="username" spellcheck="false"></label>
+          <label><span data-i18n="settings.password"></span> <input name="password" type="password" autocomplete="new-password"></label>
+          <label><span data-i18n="settings.domain"></span> <input name="domain" data-i18n-placeholder="settings.optional" spellcheck="false"></label>
+          <div class="row">
+            <button type="button" class="btn-lib-test" data-which="primary" data-i18n="settings.test"></button>
+            <span class="test-result"></span>
+          </div>
+        </fieldset>
+        <label class="check"><input id="lib-use-secondary" type="checkbox"> <span data-i18n="settings.backup_server"></span></label>
+        <fieldset data-libserver="secondary" hidden>
+          <legend data-i18n="settings.backup_server"></legend>
+          <label><span data-i18n="settings.server"></span> <input name="host" spellcheck="false"></label>
+          <label><span data-i18n="settings.share"></span> <input name="share" spellcheck="false"></label>
+          <label><span data-i18n="settings.path"></span> <input name="root" spellcheck="false"></label>
+          <label><span data-i18n="settings.username"></span> <input name="username" spellcheck="false"></label>
+          <label><span data-i18n="settings.password"></span> <input name="password" type="password" autocomplete="new-password"></label>
+          <label><span data-i18n="settings.domain"></span> <input name="domain" data-i18n-placeholder="settings.optional" spellcheck="false"></label>
+          <div class="row">
+            <button type="button" class="btn-lib-test" data-which="secondary" data-i18n="settings.test"></button>
+            <span class="test-result"></span>
+          </div>
+        </fieldset>
+      </div>
+      <p id="library-main-note" class="note" hidden data-i18n="libraries.main_note"></p>
+      <label class="check"><input name="enabled" type="checkbox"> <span data-i18n="libraries.enabled"></span></label>
+      <div class="row">
+        <button type="submit" class="primary" data-i18n="settings.save"></button>
+        <button type="button" id="btn-library-cancel" data-i18n="common.cancel"></button>
+        <span id="library-result" class="result"></span>
+      </div>
+    </form>
+
     <h3 data-i18n="settings.playback"></h3>
     <label class="field"><span data-i18n="settings.device"></span>
       <select id="device"></select>

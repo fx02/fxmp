@@ -142,7 +142,7 @@ button.ban.confirm { width: auto; padding: 3px 8px; background: var(--danger); b
 .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); opacity: 0.6; }
 .dot.ok { background: var(--ok); opacity: 1; }
 .dot.secondary { background: var(--warn); opacity: 1; }
-.dot.unreachable, .dot.auth { background: var(--bad); opacity: 1; }
+.dot.unreachable, .dot.auth, .dot.missing { background: var(--bad); opacity: 1; }
 .conn-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* Tabs */
@@ -397,3 +397,14 @@ button.danger-solid:hover:not(:disabled) { filter: brightness(1.08); background:
 .about .row { flex-wrap: wrap; }
 button.link { background: none; border-color: transparent; color: var(--accent); padding-left: 2px; padding-right: 2px; text-decoration: underline; }
 button.link:hover:not(:disabled) { background: none; filter: brightness(1.15); }
+
+/* Libraries */
+.list.libraries li { align-items: center; gap: 8px; padding: 6px; }
+.list.libraries li.off .library-text { opacity: 0.55; }
+.library-text { flex: 1; min-width: 0; }
+.library-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.library-text .note { margin: 2px 0 0; overflow-wrap: anywhere; }
+.library-actions { flex: none; display: flex; align-items: center; gap: 6px; }
+.library-actions .check { margin: 0; }
+.library-form { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; margin: 10px 0; }
+.library-form h4 { margin: 2px 0 6px; }

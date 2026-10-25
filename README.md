@@ -14,6 +14,8 @@ A macOS-first Tauri 2 player that plays music straight from an SMB share
 - Lives in the Dock and in the menu bar, with media keys and Now Playing,
   optional notifications and start at login.
 - Optional backup server: if the main server does not answer, the backup is used.
+- More music sources ("libraries"): further SMB servers and local folders (an
+  external disk, a mounted network volume) play together with the main server.
 
 ## Installation (macOS 12+, Apple Silicon and Intel)
 
@@ -44,8 +46,70 @@ On first launch a window opens. In **Settings** enter:
 - optionally turn on **Backup server** (suggested `10.111.0.2`) and enter its details.
 
 Click "Test connection", then "Save" and "Refresh library". Passwords are kept
-only in the macOS keychain (service `smb-music-player`), never in a file or a log.
-macOS will ask whether the app may read the keychain: choose **Always Allow**.
+only in the macOS keychain (service `smb-music-player`, one entry per server of
+each library: account `library-{id}/{host}/{username}`), never in a file or a
+log. macOS will ask whether the app may read the keychain: choose **Always Allow**.
+Versions before libraries stored the account as `{host}/{username}`; on the
+first start of this version those entries move to the main server's library
+(the old entry is deleted only once the new one reads back the same, so macOS
+may ask once more, for deleting it).
+
+## Libraries (several music sources)
+
+**Settings → Libraries** lists every music source. The first one is always the
+main SMB server from the form above (with its optional backup server); it can
+be renamed and switched off, but not removed. "Add SMB server…" and "Add local
+folder…" add more, any number of them:
+
+- **SMB server**: its own server, share, path, username, password and optional
+  backup server, each with "Test connection". Its passwords go to the keychain
+  under that library.
+- **Local folder**: "Choose folder…" opens the system's folder picker (any
+  folder: an external disk under `/Volumes`, a mounted network volume, a folder
+  in your home). "Check folder" says whether it can be read. No password, and
+  no keychain access at all.
+
+Each library has a name (blank: "Main server", the folder's name or the
+server's address), an **On** switch and (except the main one) **Remove**:
+
+- Genres, shuffle, artists, the playlist and the Unreadable tab span every
+  library that is on. A library switched off keeps its tracks in the catalog
+  but hides them everywhere (and takes them out of the playlist); switching it
+  on brings them back without a new scan.
+- **Remove** (asks first) deletes the library's tracks from the catalog, with
+  their bans, loudness and failures, and its passwords from the keychain. The
+  music files are not touched.
+- "Refresh library" scans every library that is on, one after another; the
+  progress says which one ("USB (2/3): Scanning… 120 files"). A library that
+  cannot be read (a disk not plugged in, a server down) is skipped and named in
+  the result; its tracks are kept, never removed. An SMB library that had to
+  be listed from its backup server (the main one was down) only gets new and
+  changed files: nothing is removed until a refresh from the main server
+  ("Scanned from the backup server, nothing removed: …"), since the backup may
+  lag behind.
+- The status dot shows the worst state of the libraries in use; its tooltip
+  lists each one ("USB: Music folder not found. Is the disk connected?"). A
+  library that is down is checked again every 15 s, so a disk plugged back in
+  (or a VPN coming up) recovers on its own.
+- Each track plays from its own library. While a library is offline its
+  tracks fail as unreachable and are passed over, but they are not counted
+  towards the 3 failures that leave a track out of the shuffle (an unplugged
+  disk does not get its tracks excluded).
+- Local folders: hidden files and the macOS `._*` companion files are skipped,
+  names with spaces and any letters (č, ć, ž, emoji…) work, linked folders are
+  followed but a link loop is not, and a name that is not valid Unicode is
+  skipped (logged).
+- The same file in two libraries (say, the NAS and a copy on a USB disk) is
+  two tracks: duplicates are not merged in this version.
+- The catalog keeps tracks by library and path. Updating to this version moves
+  every existing track to the main server's library in place: bans, loudness,
+  years, failures, genre merges, the shuffle history and the saved playlist all
+  stay, and nothing is scanned again.
+- An exported playlist (`.m3u8`) lists each track's path relative to its own
+  library's root, so a playlist mixing libraries only resolves for the tracks
+  of the library whose folder it is saved in.
+- Android is a separate project; the core library's local-folder source
+  (`LocalSource` in `smp-core`) is what it will use to read music on the device.
 
 ## Usage
 
@@ -124,6 +188,8 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
 - A folder on the share that cannot be listed during a refresh is skipped and
   reported ("N folders could not be read; their tracks were kept"): its tracks
   stay in the library as they were (bans, loudness), instead of being removed.
+  In a local-folder library the Unreadable tab shows the file's path (and
+  "Copy path" gives its `file://` URL).
   A refresh that fails or is cancelled leaves the library as it was.
 - Now-playing bar: "Artist – Title (Year)", the elapsed and total time
   (`m:ss / m:ss`, `h:mm:ss` for an hour or longer; only the elapsed time when
@@ -142,8 +208,9 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
   - **Reset settings to defaults**: volume, crossfade, output device,
     normalization, notifications, start at login (the login item is removed)
     and the last genre selection go back to their defaults; the language stays.
-    The servers and passwords stay unless "Also forget servers and passwords"
-    is ticked, which also deletes the passwords from the keychain.
+    The servers, libraries and passwords stay unless "Also forget servers and
+    passwords" is ticked, which also deletes every library's passwords from the
+    keychain and removes the added libraries with their tracks.
   - **Clear library**: stops a running scan and the music and empties the
     library (tracks, genres, genre merges, bans, unreadable list, shuffle
     history). Settings stay. "Refresh library" then reads the music again.
@@ -286,6 +353,12 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] A full first scan to the end, with genres appearing along the way.
 - [ ] The keychain prompt ("Always Allow"), and tracks play normally afterwards.
 - [ ] Switching to the backup server when the main one is unreachable.
+- [ ] Libraries: add a local folder on a USB disk with "Choose folder…", refresh,
+      and play; unplug the disk (the dot turns red, the tooltip names it, its
+      tracks are passed over and not listed as unreadable), plug it back in (green
+      again within 15 s). Switch a library off and on; remove one (its tracks
+      leave the genres). After updating, the keychain shows `library-1/…` entries
+      and no old `{host}/{username}` ones, and the main server still connects.
 - [ ] Genre chip, ban and "Restore" behave correctly during real listening.
 - [ ] After the first "Refresh library" on this version, years appear (window,
       menu bar label and tooltip, albums) and bans are still there.
