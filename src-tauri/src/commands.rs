@@ -945,12 +945,34 @@ pub fn set_volume_now(app: &AppHandle, st: &AppState, v: f32) {
 }
 
 /// Picks the output device (`None` = system default) from Settings or the tray.
+/// Picking the current one again leaves the player alone (a device switch drops
+/// the sound for a moment); the tray's marks are still put right.
 pub fn set_device_now(app: &AppHandle, st: &AppState, name: Option<String>) {
-    let s = st.settings.update(
-        |s| s.device = name,
-        |s| st.player.send(Command::SetDevice(s.device.clone())),
-    );
+    let s = switch_device(&st.settings, name, |d| {
+        st.player.send(Command::SetDevice(d))
+    });
     audio_changed(app, &s);
+}
+
+/// Saves `name` as the output device and calls `send` with it, under the
+/// settings lock, only when it differs from the saved one.
+pub fn switch_device(
+    store: &SettingsStore,
+    name: Option<String>,
+    send: impl FnOnce(Option<String>),
+) -> Settings {
+    let changed = std::cell::Cell::new(false);
+    store.update(
+        |s| {
+            changed.set(s.device != name);
+            s.device = name;
+        },
+        |s| {
+            if changed.get() {
+                send(s.device.clone());
+            }
+        },
+    )
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1559,5 +1581,18 @@ mod tests {
             merge_target("en", "ZZ Test Preimenovano").unwrap_err(),
             "\u{201c}ZZ Test Preimenovano\u{201d} is not a known genre."
         );
+    }
+
+    #[test]
+    fn picking_the_current_device_again_does_not_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("s.json"), Settings::default()).unwrap();
+        let mut sent = Vec::new();
+        switch_device(&store, Some("DAC".into()), |d| sent.push(d));
+        switch_device(&store, Some("DAC".into()), |d| sent.push(d));
+        let s = switch_device(&store, None, |d| sent.push(d));
+        switch_device(&store, None, |d| sent.push(d));
+        assert_eq!(sent, [Some("DAC".to_string()), None]);
+        assert_eq!(s.device, None);
     }
 }

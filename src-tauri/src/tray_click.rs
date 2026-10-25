@@ -7,9 +7,12 @@
 
 use std::time::{Duration, Instant};
 
-/// The shortest and the longest double-click window used, whatever the system says.
+/// The shortest and the longest double-click window used on macOS, whatever the
+/// system says.
 pub const MIN_WINDOW: Duration = Duration::from_millis(250);
 pub const MAX_WINDOW: Duration = Duration::from_millis(400);
+/// Windows' default `GetDoubleClickTime`, if it cannot be read.
+pub const WINDOWS_DEFAULT: Duration = Duration::from_millis(500);
 
 /// What a click does right away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,10 +74,16 @@ impl ClickClassifier {
 
     /// A double click the system reported (Windows) at `now`: toggles, cancels the
     /// waiting "Next", and the button-up that follows is not a click.
+    /// If the first click's "Next" already fired (should the window ever be
+    /// shorter than the system's), the double click does nothing and its
+    /// button-up is swallowed too: one Next, never also a pause.
     pub fn double_click(&mut self, now: Instant) -> ClickAction {
-        self.pending = None;
         self.swallow_until = Some(now + self.window);
-        ClickAction::Toggle
+        if self.pending.take().is_some() {
+            ClickAction::Toggle
+        } else {
+            ClickAction::Ignore
+        }
     }
 
     /// Whether the click `seq` still wants its "Next" at `now` (it was neither
@@ -87,6 +96,17 @@ impl ClickClassifier {
             }
             _ => false,
         }
+    }
+}
+
+/// The double-click window: on Windows exactly the system interval (the system
+/// reports a double click up to that long after the first click, so "Next" must
+/// not fire earlier); elsewhere the system interval clamped by [`clamp_window`].
+pub fn window_for(system: Option<Duration>, windows: bool) -> Duration {
+    if windows {
+        system.unwrap_or(WINDOWS_DEFAULT)
+    } else {
+        clamp_window(system)
     }
 }
 
@@ -218,5 +238,50 @@ mod tests {
         assert_eq!(clamp_window(Some(ms(100))), MIN_WINDOW);
         assert_eq!(clamp_window(Some(ms(320))), ms(320));
         assert_eq!(clamp_window(None), MAX_WINDOW);
+    }
+
+    #[test]
+    fn on_windows_the_window_is_the_system_interval_unclamped() {
+        // Windows reports the double click up to GetDoubleClickTime after the
+        // first click: the window must be at least that long.
+        assert_eq!(window_for(Some(ms(500)), true), ms(500));
+        assert_eq!(window_for(Some(ms(900)), true), ms(900));
+        assert_eq!(window_for(None, true), WINDOWS_DEFAULT);
+        assert_eq!(window_for(Some(ms(500)), false), MAX_WINDOW);
+        assert_eq!(window_for(Some(ms(100)), false), MIN_WINDOW);
+    }
+
+    #[test]
+    fn a_slow_windows_double_click_only_toggles() {
+        // GetDoubleClickTime 500 ms; the second click comes 480 ms after the
+        // first, past the macOS clamp: the Next must not have fired yet.
+        let w = window_for(Some(ms(500)), true);
+        let t0 = Instant::now();
+        let mut c = ClickClassifier::new(w);
+        let ClickAction::Wait(seq) = c.click(t0) else {
+            panic!()
+        };
+        assert!(
+            !c.due(seq, t0 + ms(470)),
+            "no Next before Windows' own window ends"
+        );
+        assert_eq!(c.double_click(t0 + ms(480)), ClickAction::Toggle);
+        assert_eq!(c.click(t0 + ms(520)), ClickAction::Ignore);
+        assert!(!c.due(seq, t0 + ms(600)));
+    }
+
+    #[test]
+    fn a_double_click_after_the_next_fired_does_nothing_more() {
+        // Should the timer ever win anyway: the late double click neither
+        // toggles nor lets its button-up skip again.
+        let t0 = Instant::now();
+        let mut c = ClickClassifier::new(W);
+        let ClickAction::Wait(seq) = c.click(t0) else {
+            panic!()
+        };
+        assert!(c.due(seq, t0 + W));
+        assert_eq!(c.double_click(t0 + ms(320)), ClickAction::Ignore);
+        assert_eq!(c.click(t0 + ms(340)), ClickAction::Ignore);
+        assert!(matches!(c.click(t0 + ms(1000)), ClickAction::Wait(_)));
     }
 }

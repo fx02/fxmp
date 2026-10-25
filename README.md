@@ -153,8 +153,10 @@ macOS will ask whether the app may read the keychain: choose **Always Allow**.
 - Menu bar icon:
   - **one left click = next track**, **double click = pause/resume** (a double
     click never also skips). To tell the two apart, "next" waits for the
-    double-click time to pass (the system setting, kept between 0.25 and 0.4 s),
-    so a single click reacts about 0.3 s later than before.
+    double-click time to pass: the system double-click interval, max 0.4 s
+    (0.4 s on a default Mac; shorter if System Settings → Mouse/Trackpad →
+    Double-click speed is faster). So a single click reacts that much later
+    than before.
   - Right click opens the menu: the current track; Pause, Previous, Next, Ban;
     **Look up current song** (on the default lookup site) and **Copy current
     song** ("Artist – Title (Year)"); Genre; **Volume** (0–100 % in steps of
@@ -253,8 +255,8 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] Five starts of the same genre give five different first tracks.
 - [ ] Look in light and dark mode (420×640, long titles, genre chip, ⋯).
 - [ ] Left click on the menu bar icon reliably skips the track (if the click does
-      not arrive reliably: move "Next" to the first menu item), about 0.3 s
-      after the click.
+      not arrive reliably: move "Next" to the first menu item), after the
+      system double-click interval, max 0.4 s (0.4 s on a default Mac).
 - [ ] Double click on the menu bar icon pauses / resumes and does not skip;
       three quick clicks pause once (and then skip once).
 - [ ] Menu bar menu → Volume: the checked step follows the window's slider, and

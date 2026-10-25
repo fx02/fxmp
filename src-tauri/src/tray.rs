@@ -149,7 +149,7 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
             &version,
         ],
     )?;
-    let window = tray_click::clamp_window(tray_click::system_interval());
+    let window = tray_click::window_for(tray_click::system_interval(), cfg!(windows));
     log::info!("tray: double-click window {} ms", window.as_millis());
     let icon = TrayIconBuilder::with_id("main")
         .icon(Image::from_bytes(include_bytes!(
