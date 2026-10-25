@@ -649,6 +649,9 @@ mod tests {
         fn offline(&self, _: smp_core::LibraryId) -> bool {
             false
         }
+        fn any_online(&self) -> bool {
+            true
+        }
     }
 
     use super::*;
@@ -1043,6 +1046,30 @@ mod tests {
             !order.contains(&shuffled),
             "left out of the shuffle: dropped"
         );
+    }
+
+    #[test]
+    fn a_restored_playlist_leaves_out_libraries_that_are_off_or_gone() {
+        let fx = Fx::new();
+        let meta = smp_core::catalog::TrackMeta::default();
+        let (usb, lost) = {
+            let q = lock(&fx.query);
+            (
+                q.upsert_track(2, "usb/a.mp3", 1, 1, &meta).unwrap(),
+                q.upsert_track(9, "lost/b.mp3", 1, 1, &meta).unwrap(),
+            )
+        };
+        let mut p = fx.play_genres(&["jazz"]);
+        let current = take(&mut p).unwrap();
+        // Added by hand: one track of a USB library, one of a library the
+        // settings no longer have.
+        lock(&fx.list).queue.append(&[usb, lost]);
+        // At start the app marks them off before the playlist is restored.
+        lock(&fx.query).set_disabled_libraries(&[2, 9]).unwrap();
+        let list = saved_and_restored(&fx, current, 0);
+        let order: Vec<TrackId> = lock(&list).queue.order().iter().map(|e| e.id).collect();
+        assert!(!order.contains(&usb) && !order.contains(&lost), "{order:?}");
+        assert!(order.contains(&current));
     }
 
     #[test]

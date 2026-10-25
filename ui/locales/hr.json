@@ -290,6 +290,6 @@
   "libraries.remove_text": "Njegove pjesme ({tracks}) izlaze iz kataloga, s blokadama, glasnoćom i greškama, a lozinke se brišu iz keychaina. Glazbene datoteke ostaju gdje jesu.",
   "libraries.remove_button": "Ukloni",
   "libraries.removed": "Izvor glazbe uklonjen.",
-  "scan.looks_empty": "Mapa izgleda prazno, ništa nije uklonjeno: {names}.",
+  "scan.looks_empty": "Mapa izgleda prazno, ništa nije uklonjeno: {names}. Ako glazbe tamo stvarno više nema, ukloni izvor u Postavkama (za glavni server: Isprazni biblioteku).",
   "err.catalog_pending": "Katalog se još mora prilagoditi izvorima glazbe; ponovno pokreni aplikaciju da se ovaj izvor skenira."
 }

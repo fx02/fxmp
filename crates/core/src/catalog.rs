@@ -635,10 +635,13 @@ impl Catalog {
         }
     }
 
+    /// No track of a library that is on.
     pub fn is_empty(&self) -> Result<bool> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
+        let n: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM tracks WHERE {ENABLED}"),
+            [],
+            |r| r.get(0),
+        )?;
         Ok(n == 0)
     }
 
@@ -1076,15 +1079,17 @@ impl Catalog {
         Ok(v)
     }
 
-    /// The genres and years of `ids` (each track counted once).
+    /// The genres and years of `ids` (each track counted once; tracks of a library
+    /// that is off are not counted).
     pub fn facets(&self, ids: &[TrackId]) -> Result<Facets> {
         let wanted: HashSet<TrackId> = ids.iter().copied().collect();
         let mut genres: Vec<GenreCount> = Vec::new();
-        let mut st = self.conn.prepare_cached(
+        let mut st = self.conn.prepare_cached(&format!(
             "SELECT g.key, g.display, tg.track_id FROM genres g
-             JOIN track_genres tg ON tg.genre_id = g.id
-             ORDER BY g.display COLLATE NOCASE, g.key",
-        )?;
+                 JOIN track_genres tg ON tg.genre_id = g.id
+                 JOIN tracks t ON t.id = tg.track_id AND {T_ENABLED}
+                 ORDER BY g.display COLLATE NOCASE, g.key"
+        ))?;
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
             if !wanted.contains(&r.get::<_, TrackId>(2)?) {
@@ -1102,7 +1107,9 @@ impl Catalog {
         }
         let mut years: std::collections::BTreeMap<u16, usize> = Default::default();
         let mut unknown_year = 0;
-        let mut st = self.conn.prepare_cached("SELECT id, year FROM tracks")?;
+        let mut st = self
+            .conn
+            .prepare_cached(&format!("SELECT id, year FROM tracks WHERE {ENABLED}"))?;
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
             if !wanted.contains(&r.get::<_, TrackId>(0)?) {
@@ -1123,14 +1130,15 @@ impl Catalog {
         })
     }
 
-    /// The tracks `ids` in that order (repeats included); ids not in the catalog are
-    /// left out.
+    /// The tracks `ids` in that order (repeats included); ids not in the catalog,
+    /// or of a library that is off, are left out.
     pub fn tracks_by_ids(&self, ids: &[TrackId]) -> Result<Vec<TrackRow>> {
         let mut found: HashMap<TrackId, TrackRow> = HashMap::with_capacity(ids.len());
         // In batches, within SQLite's parameter limit.
         for chunk in ids.chunks(500) {
             let marks = vec!["?"; chunk.len()].join(",");
-            let sql = format!("SELECT {TRACK_COLS} FROM tracks WHERE id IN ({marks})");
+            let sql =
+                format!("SELECT {TRACK_COLS} FROM tracks WHERE id IN ({marks}) AND {ENABLED}");
             let mut st = self.conn.prepare_cached(&sql)?;
             for row in st.query_map(params_from_iter(chunk), row_to_track)? {
                 let row = row?;
@@ -3076,6 +3084,24 @@ mod tests {
         assert_eq!(c.unreadable_count().unwrap(), 0);
         assert!(c.banned().unwrap().is_empty());
         assert!(c.track(b).is_ok(), "kept in the catalog");
+        // Nor in the playlist's rows, facets or export.
+        assert_eq!(
+            c.tracks_by_ids(&[b, a, b2])
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            [a]
+        );
+        let f = c.facets(&[a, b, b2]).unwrap();
+        assert_eq!(f.genres.iter().map(|g| g.count).sum::<usize>(), 1);
+        assert_eq!(f.years[0].count, 1);
+        // A catalog with only hidden tracks counts as empty.
+        let only = Catalog::open_in_memory().unwrap();
+        only.upsert_track(4, "x.mp3", 1, 1, &meta(None)).unwrap();
+        assert!(!only.is_empty().unwrap());
+        only.set_disabled_libraries(&[4]).unwrap();
+        assert!(only.is_empty().unwrap());
         assert_eq!(c.library_track_counts().unwrap()[&2], 2);
 
         c.set_disabled_libraries(&[]).unwrap();

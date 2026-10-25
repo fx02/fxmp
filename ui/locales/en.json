@@ -281,6 +281,6 @@
   "libraries.remove_text": "Its {tracks} leave the catalog, with their bans, loudness and failures, and its passwords are deleted from the keychain. The music files stay where they are.",
   "libraries.remove_button": "Remove",
   "libraries.removed": "Library removed.",
-  "scan.looks_empty": "The folder looks empty, nothing removed: {names}.",
+  "scan.looks_empty": "The folder looks empty, nothing removed: {names}. If its music really is gone, remove the library in Settings (for the main server: Clear library).",
   "err.catalog_pending": "The catalog still has to be updated for libraries; restart the app to scan this library."
 }

@@ -14,7 +14,7 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(target_os = "macos")]
-use crate::commands::{pause_now, play_pause_now, previous_now, spawn_action};
+use crate::commands::{next_now, pause_now, play_pause_now, previous_now, spawn_action};
 use crate::state::{self, lock, AppState, NowPlaying};
 #[cfg(target_os = "macos")]
 use crate::tray::show_main_window;
@@ -70,33 +70,29 @@ fn create_controls(app: &AppHandle) -> Result<MediaControls, String> {
 #[cfg(target_os = "macos")]
 fn on_media_event(app: &AppHandle, event: MediaControlEvent) {
     log::debug!("media key: {event:?}");
-    let command = match event {
-        MediaControlEvent::Toggle => {
-            return spawn_action(app, "play/pause", |_, st| {
-                play_pause_now(st, Command::TogglePause);
-                Ok(())
-            });
-        }
-        MediaControlEvent::Play => {
-            return spawn_action(app, "play", |_, st| {
-                play_pause_now(st, Command::Resume);
-                Ok(())
-            });
-        }
+    match event {
+        MediaControlEvent::Toggle => spawn_action(app, "play/pause", |_, st| {
+            play_pause_now(st, Command::TogglePause);
+            Ok(())
+        }),
+        MediaControlEvent::Play => spawn_action(app, "play", |_, st| {
+            play_pause_now(st, Command::Resume);
+            Ok(())
+        }),
         MediaControlEvent::Pause | MediaControlEvent::Stop => {
-            return spawn_action(app, "pause", |_, st| {
+            spawn_action(app, "pause", |_, st| {
                 pause_now(st);
                 Ok(())
-            });
+            })
         }
-        MediaControlEvent::Next => Command::Next,
-        MediaControlEvent::Previous => {
-            return spawn_action(app, "previous", |_, st| previous_now(st));
-        }
-        MediaControlEvent::Raise => return show_main_window(app),
-        _ => return,
-    };
-    app.state::<AppState>().player.send(command);
+        MediaControlEvent::Next => spawn_action(app, "next", |_, st| {
+            next_now(st);
+            Ok(())
+        }),
+        MediaControlEvent::Previous => spawn_action(app, "previous", |_, st| previous_now(st)),
+        MediaControlEvent::Raise => show_main_window(app),
+        _ => {}
+    }
 }
 
 fn update_now_playing(app: &AppHandle, np: Option<NowPlaying>) {

@@ -496,11 +496,11 @@ test("scan texts name the library when several are scanned", () => {
   );
   assert.equal(
     scanDoneText({ ...done, looks_empty: [{ id: 2, name: "USB" }] }, en),
-    "Library refreshed: 2 files. New or changed: 0, unreadable: 0, removed: 0. The folder looks empty, nothing removed: USB.",
+    "Library refreshed: 2 files. New or changed: 0, unreadable: 0, removed: 0. The folder looks empty, nothing removed: USB. If its music really is gone, remove the library in Settings (for the main server: Clear library).",
   );
   assert.equal(
     scanDoneText({ ...done, looks_empty: [{ id: 2, name: "USB" }] }, hr),
-    "Katalog osvježen: 2 datoteke. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0. Mapa izgleda prazno, ništa nije uklonjeno: USB.",
+    "Katalog osvježen: 2 datoteke. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0. Mapa izgleda prazno, ništa nije uklonjeno: USB. Ako glazbe tamo stvarno više nema, ukloni izvor u Postavkama (za glavni server: Isprazni biblioteku).",
   );
   assert.equal(
     scanDoneText({ ...done, from_backup: [{ id: 1, name: "" }] }, hr),

@@ -225,6 +225,11 @@ impl AppState {
         // Genre keys renamed by newer genre rules (saved with the next settings write).
         settings.last_selection = migrate_selection(&settings.last_selection);
         let query = Catalog::open(&catalog_path)?;
+        // Libraries that are off (or that the settings lost) are marked before
+        // anything is read, so the restored playlist leaves their tracks out.
+        if let Err(e) = query.set_disabled_libraries(&libraries_off(&settings, &query)) {
+            log::warn!("cannot mark the libraries that are off: {e}");
+        }
         let catalog_empty = query.is_empty()?;
         let saved_playlist = match query.load_playlist() {
             Ok(Some(saved)) => playlist::restore(&query, saved).unwrap_or_else(|e| {
@@ -239,10 +244,6 @@ impl AppState {
         };
         let playback_db = Catalog::open(&catalog_path)?;
         let writer = CatalogWriter::spawn(Catalog::open(&catalog_path)?)?;
-        let disabled = libraries_off(&settings, &query);
-        if let Err(e) = writer.call(move |c| c.set_disabled_libraries(&disabled)) {
-            log::warn!("cannot mark the libraries that are off: {e}");
-        }
         let creds: Arc<dyn CredentialStore> = Arc::new(Keychain {
             service: devdata::keychain_service(dev_dir.is_some()),
         });
@@ -535,24 +536,27 @@ pub fn libraries_off(settings: &Settings, catalog: &Catalog) -> Vec<LibraryId> {
     off
 }
 
-/// What the resume waits for, and whether it drops its target: the status of the
-/// library of the track to resume (`library`) when that one answers; otherwise
-/// that of any library that answers, dropping the target if it was in an offline
-/// library (Play is never silent while something can play); with none answering,
-/// the worst status (it waits).
+/// What the resume waits for, and whether it drops its target. It waits for the
+/// library of the track to resume (`library`): an SMB server that does not
+/// answer yet (the VPN comes up later at login) keeps the saved track and
+/// position. Only a local folder that is missing (a disk not plugged in, or not
+/// mounted) is not waited for while another library answers: the target is
+/// dropped and the playlist goes on. A library unknown or not in use: any that
+/// answers. With none answering, the worst status (it waits).
 pub fn resume_decision(status: &StatusPayload, library: Option<LibraryId>) -> (ConnStatus, bool) {
-    let own = library.and_then(|l| status.of(l));
-    if let Some(s) = own.filter(|s| s.reachable()) {
-        return (s, false);
-    }
     let any = status
         .libraries
         .iter()
         .map(|l| l.status)
         .find(|s| s.reachable());
-    match any {
-        Some(s) => (s, own.is_some()),
-        None => (status.status, false),
+    match library.and_then(|l| status.of(l)) {
+        Some(s) if s.reachable() => (s, false),
+        Some(ConnStatus::Missing) => match any {
+            Some(up) => (up, true),
+            None => (status.status, false),
+        },
+        Some(s) => (s, false),
+        None => (any.unwrap_or(status.status), false),
     }
 }
 
@@ -578,6 +582,11 @@ impl LibraryHealth for LiveLibraries {
         };
         let last = lock(&self.status).as_ref().and_then(|s| s.of(library));
         lib.offline_now() || last.is_some_and(|s| !s.reachable())
+    }
+    fn any_online(&self) -> bool {
+        lock(&self.status)
+            .as_ref()
+            .is_some_and(|s| s.libraries.iter().any(|l| l.status.reachable()))
     }
 }
 
@@ -972,15 +981,26 @@ fn add_up_scans(lang: &str, scans: Vec<LibraryScan>) -> ScanDonePayload {
 /// Why `lib` is not scanned now, if it is not: a local folder that is not there
 /// (its disk not mounted, see `connection::folder_status`), or any library but
 /// the first while the catalog is not `ready` for libraries.
-fn not_scannable(lib: &crate::connection::LibraryConn, ready: bool) -> Option<String> {
+/// The check of a local folder is bounded (a hung network volume) and given up
+/// on Cancel; one that does not answer counts as missing.
+fn not_scannable(
+    lib: &Arc<crate::connection::LibraryConn>,
+    ready: bool,
+    cancel: &AtomicBool,
+) -> Option<String> {
+    use crate::connection::{wait_check, LibraryKind, PROBE_TIMEOUT};
     if !ready && lib.id != smp_core::DEFAULT_LIBRARY {
         return Some(i18n::t("err.catalog_pending"));
     }
-    match lib.kind {
-        crate::connection::LibraryKind::Local { .. } if !lib.probe().reachable() => {
-            Some(i18n::t(ConnStatus::Missing.text_key()))
-        }
-        _ => None,
+    if !matches!(lib.kind, LibraryKind::Local { .. }) {
+        return None;
+    }
+    let status = lib
+        .start_check()
+        .and_then(|rx| wait_check(&rx, Instant::now() + PROBE_TIMEOUT, cancel));
+    match status {
+        Some(s) if s.reachable() => None,
+        _ => Some(i18n::t(ConnStatus::Missing.text_key())),
     }
 }
 
@@ -1026,7 +1046,7 @@ fn run_scan(app: &AppHandle) {
             }
         };
         progress(&ScanProgress::default());
-        if let Some(reason) = not_scannable(lib, ready) {
+        if let Some(reason) = not_scannable(lib, ready, &st.cancel_scan) {
             log::warn!("library {} not scanned: {reason}", lib.id);
             scans.push((library, Err(smp_core::Error::Other(reason))));
             continue;
@@ -1565,26 +1585,40 @@ mod tests {
     }
 
     #[test]
-    fn the_resume_goes_ahead_without_its_track_when_only_its_library_is_down() {
+    fn the_resume_waits_for_its_server_but_not_for_an_unplugged_disk() {
         let both = statuses(&[(1, ConnStatus::Ok), (2, ConnStatus::Ok)]);
         assert_eq!(resume_decision(&both, Some(2)), (ConnStatus::Ok, false));
-        // The disk with the resume track is unplugged, the server is up: Play is
-        // not silent. The resume goes ahead, drops its target, and the playlist
-        // goes on with what can be played (the unplugged track is passed over).
+        // At login the USB library is up but the main server is not (VPN not up
+        // yet): the resume keeps its track and position and waits for the server.
+        let login = statuses(&[(1, ConnStatus::Unreachable), (2, ConnStatus::Ok)]);
+        let (status, drop) = resume_decision(&login, Some(1));
+        assert_eq!((status, drop), (ConnStatus::Unreachable, false));
+        let mut gate = ResumeGate::waiting();
+        assert_eq!(gate.due(status), None, "still waiting");
+        // The server answers: resumed, with its target.
+        let up = statuses(&[(1, ConnStatus::Ok), (2, ConnStatus::Ok)]);
+        let (status, drop) = resume_decision(&up, Some(1));
+        assert!(!drop);
+        assert_eq!(gate.due(status), Some(false));
+        // The disk with the resume track is not plugged in (a local folder that is
+        // missing or unmounted) while the server is up: no wait for a disk that
+        // may never come; the target is dropped and the playlist goes on.
         let disk_out = statuses(&[(1, ConnStatus::Ok), (2, ConnStatus::Missing)]);
         assert_eq!(resume_decision(&disk_out, Some(2)), (ConnStatus::Ok, true));
         assert_eq!(resume_decision(&disk_out, Some(1)), (ConnStatus::Ok, false));
+        // A wrong password is not a missing disk either: it waits (and says why).
+        let auth = statuses(&[(1, ConnStatus::Auth), (2, ConnStatus::Ok)]);
+        assert_eq!(resume_decision(&auth, Some(1)), (ConnStatus::Auth, false));
         // Its library not in use (switched off) or unknown: any library that answers.
         assert_eq!(resume_decision(&disk_out, Some(7)), (ConnStatus::Ok, false));
         assert_eq!(resume_decision(&disk_out, None), (ConnStatus::Ok, false));
-        // Nothing answers: it waits, and the status shows why.
+        // Nothing answers: it waits.
         let down = statuses(&[(1, ConnStatus::Unreachable), (2, ConnStatus::Missing)]);
         assert_eq!(
             resume_decision(&down, Some(2)),
             (ConnStatus::Unreachable, false)
         );
-        assert!(ResumeGate::waiting().due(ConnStatus::Unreachable).is_none());
-        // The secondary counts as up.
+        // The backup server counts as up.
         let backup = statuses(&[(1, ConnStatus::Secondary), (2, ConnStatus::Missing)]);
         assert_eq!(
             resume_decision(&backup, Some(2)),
@@ -1621,32 +1655,39 @@ mod tests {
     fn libraries_that_cannot_be_scanned_now_are_skipped_with_a_reason() {
         use crate::connection::LibraryConn;
         let dir = tempfile::tempdir().unwrap();
-        let there = LibraryConn::local(2, String::new(), &dir.path().display().to_string());
-        let gone = LibraryConn::local(3, String::new(), "/no/such/disk");
-        assert_eq!(not_scannable(&there, true), None);
+        let there = Arc::new(LibraryConn::local(
+            2,
+            String::new(),
+            &dir.path().display().to_string(),
+        ));
+        let gone = Arc::new(LibraryConn::local(3, String::new(), "/no/such/disk"));
+        let go = AtomicBool::new(false);
+        assert_eq!(not_scannable(&there, true, &go), None);
         assert_eq!(
-            not_scannable(&gone, true),
+            not_scannable(&gone, true, &go),
             Some(i18n::t("conn.missing")),
             "not touched, its tracks kept"
         );
         // The catalog's update for libraries still to come: only the first library.
         assert_eq!(
-            not_scannable(&there, false),
+            not_scannable(&there, false, &go),
             Some(i18n::t("err.catalog_pending"))
         );
-        let main = crate::connection::LibraryConn::from_library(
-            &Settings {
-                primary: crate::settings::ServerConfig {
-                    username: "u".into(),
-                    ..Default::default()
-                },
-                ..Settings::default()
-            }
-            .all_libraries()[0],
-            &crate::credentials::MemoryStore::default(),
-        )
-        .unwrap();
-        assert_eq!(not_scannable(&main, false), None);
+        let main = Arc::new(
+            crate::connection::LibraryConn::from_library(
+                &Settings {
+                    primary: crate::settings::ServerConfig {
+                        username: "u".into(),
+                        ..Default::default()
+                    },
+                    ..Settings::default()
+                }
+                .all_libraries()[0],
+                &crate::credentials::MemoryStore::default(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(not_scannable(&main, false, &go), None);
     }
 
     #[test]

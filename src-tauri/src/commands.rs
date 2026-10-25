@@ -728,13 +728,20 @@ pub enum PlayAction {
     RememberForResume,
     /// Nothing is loaded: the playlist plays from what is due.
     StartPlaylist,
+    /// The restored playlist waits for a library that is offline while another
+    /// one answers: the saved position is given up and the playlist plays (its
+    /// tracks of the offline library are passed over).
+    PlayWithoutResume,
 }
 
 /// `loaded`: a track is playing, paused or cued; `pending`: the restored playlist
-/// waits for the share; `has_next`: the playlist has a track to play.
-pub fn play_action(loaded: bool, pending: bool, has_next: bool) -> PlayAction {
+/// waits for its library; `has_next`: the playlist has a track to play;
+/// `elsewhere`: some library answers now.
+pub fn play_action(loaded: bool, pending: bool, has_next: bool, elsewhere: bool) -> PlayAction {
     if loaded {
         PlayAction::Player
+    } else if pending && has_next && elsewhere {
+        PlayAction::PlayWithoutResume
     } else if pending {
         PlayAction::RememberForResume
     } else if has_next {
@@ -753,6 +760,15 @@ pub fn play_pause_now(st: &AppState, command: Command) {
         &st.resume,
         &st.engine,
         || lock(&st.playlist).queue.successor().is_some(),
+        || {
+            lock(&st.status)
+                .as_ref()
+                .is_some_and(|s| s.libraries.iter().any(|l| l.status.reachable()))
+        },
+        || {
+            log::info!("Play pressed while the resume waits on an offline library: moving on");
+            lock(&st.playlist).resume_at = None;
+        },
         command,
         |c| st.player.send(c),
         || st.play_playlist(),
@@ -761,11 +777,16 @@ pub fn play_pause_now(st: &AppState, command: Command) {
 
 /// [`play_pause_now`] with its parts passed in: decided, and sent to the player
 /// (`send`), while the resume gate is held, so the resume cannot slip in between.
-/// `start_playlist` runs after the gate is let go (it takes it itself).
+/// `start_playlist` runs after the gate is let go (it takes it itself); before it,
+/// `give_up_resume` drops the saved position when the press moves on from a
+/// resume waiting on an offline library (`elsewhere`: another library answers).
+#[allow(clippy::too_many_arguments)]
 pub fn press_play_pause(
     gate: &Mutex<ResumeGate>,
     engine: &Mutex<Engine>,
     has_next: impl FnOnce() -> bool,
+    elsewhere: impl FnOnce() -> bool,
+    give_up_resume: impl FnOnce(),
     command: Command,
     send: impl FnOnce(Command),
     start_playlist: impl FnOnce(),
@@ -779,7 +800,8 @@ pub fn press_play_pause(
     let loaded = lock(engine).loaded();
     let pending = gate.pending;
     let has_next = !loaded && has_next();
-    match play_action(loaded, pending, has_next) {
+    let elsewhere = !loaded && pending && elsewhere();
+    match play_action(loaded, pending, has_next, elsewhere) {
         PlayAction::Player => send(command),
         PlayAction::RememberForResume => {
             gate.press(press);
@@ -792,6 +814,22 @@ pub fn press_play_pause(
             drop(gate);
             start_playlist();
         }
+        PlayAction::PlayWithoutResume => {
+            drop(gate);
+            give_up_resume();
+            start_playlist();
+        }
+    }
+}
+
+/// Next from the UI, tray or media keys. While the restored playlist still waits
+/// for its library nothing is loaded to skip: it counts as Play (which moves on
+/// when another library answers, see [`play_pause_now`]).
+pub fn next_now(st: &AppState) {
+    if lock(&st.resume).pending && !lock(&st.engine).loaded() {
+        play_pause_now(st, Command::Resume);
+    } else {
+        st.player.send(Command::Next);
     }
 }
 
@@ -814,7 +852,7 @@ pub async fn toggle_pause(app: AppHandle) -> CmdResult<()> {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn next(app: AppHandle) -> CmdResult<()> {
     run(app, |_, st| {
-        st.player.send(Command::Next);
+        next_now(st);
         Ok(())
     })
     .await
@@ -1830,13 +1868,16 @@ mod tests {
     fn play_is_never_silent() {
         use PlayAction::*;
         // Something loaded (playing, paused or cued): the player toggles/resumes.
-        assert_eq!(play_action(true, false, true), Player);
+        assert_eq!(play_action(true, false, true, true), Player);
         // Waiting for the share to resume: remembered, the resume then plays.
-        assert_eq!(play_action(false, true, true), RememberForResume);
+        assert_eq!(play_action(false, true, true, false), RememberForResume);
+        // It waits on an offline library while another one answers: the press
+        // moves on (the saved position is given up), never silent.
+        assert_eq!(play_action(false, true, true, true), PlayWithoutResume);
         // Nothing loaded (the playlist ran out or stopped): play it from what is due.
-        assert_eq!(play_action(false, false, true), StartPlaylist);
+        assert_eq!(play_action(false, false, true, true), StartPlaylist);
         // Nothing to play at all: the player is asked anyway (it may re-try).
-        assert_eq!(play_action(false, false, false), Player);
+        assert_eq!(play_action(false, false, false, true), Player);
     }
 
     use crate::connection::ConnStatus as Status;
@@ -1872,6 +1913,8 @@ mod tests {
             &gate,
             &engine,
             || true,
+            || false,
+            || unreachable!("no resume to give up"),
             Command::TogglePause,
             |c| {
                 assert!(gate.try_lock().is_err(), "sent under the gate");
@@ -1891,11 +1934,53 @@ mod tests {
             &gate,
             &engine,
             || true,
+            || false,
+            || unreachable!("no resume to give up"),
             Command::TogglePause,
             |c| out.borrow_mut().push(kind(&c)),
             || out.borrow_mut().push("start"),
         );
         assert_eq!(*out.borrow(), ["start"]);
+    }
+
+    #[test]
+    fn a_play_press_moves_on_while_the_resume_waits_on_an_offline_library() {
+        // The resume waits for the main server (VPN not up yet); a USB library
+        // answers. Pressing Play gives up the saved position and plays.
+        let gate = Mutex::new(ResumeGate::waiting());
+        let engine = Mutex::new(Engine::Empty);
+        let out = std::cell::RefCell::new(Vec::new());
+        press_play_pause(
+            &gate,
+            &engine,
+            || true,
+            || true,
+            || out.borrow_mut().push("give up the resume"),
+            Command::Resume,
+            |c| out.borrow_mut().push(kind(&c)),
+            || start_with(&gate, &engine, || out.borrow_mut().push("start")),
+        );
+        assert_eq!(*out.borrow(), ["give up the resume", "start"]);
+        assert!(
+            !lock(&gate).pending,
+            "the resume does not come later on top"
+        );
+        // No library answers: the press is remembered for the resume, as before.
+        let gate = Mutex::new(ResumeGate::waiting());
+        let engine = Mutex::new(Engine::Empty);
+        let out = std::cell::RefCell::new(Vec::new());
+        press_play_pause(
+            &gate,
+            &engine,
+            || true,
+            || false,
+            || out.borrow_mut().push("give up the resume"),
+            Command::Resume,
+            |c| out.borrow_mut().push(kind(&c)),
+            || out.borrow_mut().push("start"),
+        );
+        assert!(out.borrow().is_empty());
+        assert!(lock(&gate).play_requested);
     }
 
     #[test]
@@ -1925,6 +2010,8 @@ mod tests {
                         &gate,
                         &engine,
                         || true,
+                        || false,
+                        || unreachable!("no other library"),
                         Command::Resume,
                         |c| log.lock().unwrap().push(kind(&c)),
                         || start_with(&gate, &engine, || log.lock().unwrap().push("start")),

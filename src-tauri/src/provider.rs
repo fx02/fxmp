@@ -5,7 +5,7 @@
 //! WAL) and hands every write to the [`CatalogWriter`]. The playlist itself is
 //! shared with the commands (see [`crate::playlist`]); its lock is held only briefly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use smp_core::audio::dsp::track_gain_db;
@@ -29,6 +29,8 @@ pub trait LibraryHealth: Send + Sync {
     /// The library cannot be read now (a disk unplugged, a server down): a failure
     /// of one of its tracks is not the file's fault.
     fn offline(&self, library: LibraryId) -> bool;
+    /// Some library can be read now.
+    fn any_online(&self) -> bool;
 }
 
 /// What a provider needs while playing.
@@ -55,7 +57,18 @@ impl CatalogProvider {
 }
 
 impl TrackProvider for CatalogProvider {
+    /// Tracks gone, banned or of a library switched off leave the playlist. While
+    /// some library answers, tracks of an offline one are passed over here (they
+    /// stay in the playlist), never handed to the player: a long run of them
+    /// (an album on an unplugged disk) would count as failures in a row and stop
+    /// playback. With no library answering they are handed out as before (the
+    /// network may just be back). At most one round of the playlist is passed
+    /// over; then there is nothing to play.
     fn next_track(&mut self) -> Option<PlayItem> {
+        let mut any_online: Option<bool> = None;
+        let mut offline: HashMap<LibraryId, bool> = HashMap::new();
+        let mut passed = 0;
+        let limit = lock(&self.list).queue.order().len() + 1;
         loop {
             let (id, start_ms) = {
                 let mut l = lock(&self.list);
@@ -77,6 +90,24 @@ impl TrackProvider for CatalogProvider {
                     // Its library was switched off since the playlist was made.
                     log::debug!("track {id}: library {} is off", row.library_id);
                     lock(&self.list).queue.forget(id);
+                    continue;
+                }
+                Ok((_, row))
+                    if *offline
+                        .entry(row.library_id)
+                        .or_insert_with(|| self.ctx.libraries.offline(row.library_id))
+                        && *any_online.get_or_insert_with(|| self.ctx.libraries.any_online()) =>
+                {
+                    passed += 1;
+                    if passed > limit {
+                        log::info!("nothing to play: every due track is in an offline library");
+                        return None;
+                    }
+                    log::debug!(
+                        "track {id}: library {} is offline, passed over",
+                        row.library_id
+                    );
+                    lock(&self.list).queue.pass_over(id);
                     continue;
                 }
                 Ok((_, row)) => row,
@@ -274,6 +305,110 @@ mod tests {
         fn offline(&self, library: smp_core::LibraryId) -> bool {
             library == 2 && self.lib2_offline.load(std::sync::atomic::Ordering::SeqCst)
         }
+        fn any_online(&self) -> bool {
+            true
+        }
+    }
+
+    /// Nothing answers at all.
+    struct AllDown;
+    impl LibraryHealth for AllDown {
+        fn active_server(&self, _: smp_core::LibraryId) -> Option<Which> {
+            None
+        }
+        fn offline(&self, _: smp_core::LibraryId) -> bool {
+            true
+        }
+        fn any_online(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_long_run_of_offline_tracks_is_passed_by_to_an_online_one() {
+        let fx = Fx::new();
+        let health = Arc::new(FakeLibraries::default());
+        health
+            .lib2_offline
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let meta = TrackMeta::default();
+        // An album on the unplugged disk (25 tracks, more than the player's 20
+        // failures in a row), then a track on the server.
+        let mut ids: Vec<TrackId> = (0..25)
+            .map(|i| {
+                fx.query
+                    .upsert_track(2, &format!("usb/{i}.mp3"), 1, 1, &meta)
+                    .unwrap()
+            })
+            .collect();
+        let online = fx.query.upsert_track(1, "nas/a.mp3", 1, 1, &meta).unwrap();
+        ids.push(online);
+        let list = SharedPlaylist::default();
+        lock(&list).replace(
+            Selection::Manual,
+            smp_core::queue::Queue::fixed(&ids, smp_core::shuffle::entropy_rng()),
+        );
+        let ctx = Playback {
+            libraries: health.clone(),
+            ..fx.ctx.clone()
+        };
+        let mut p = CatalogProvider::new(ctx, list.clone());
+        let item = take_item(&mut p);
+        assert_eq!(
+            (item.id, item.library),
+            (online, 1),
+            "never handed to the player"
+        );
+        assert_eq!(lock(&list).queue.order().len(), 26, "kept in the playlist");
+        fx.flush();
+        assert!(fx.query.unreadable().unwrap().is_empty(), "nothing counted");
+        assert_eq!(take(&mut p), None);
+
+        // Nothing answers at all: tracks are handed out as before (the network
+        // may just be back), and fail as network trouble.
+        let list = SharedPlaylist::default();
+        lock(&list).replace(
+            Selection::Manual,
+            smp_core::queue::Queue::fixed(&ids[..2], smp_core::shuffle::entropy_rng()),
+        );
+        let ctx = Playback {
+            libraries: Arc::new(AllDown),
+            ..fx.ctx.clone()
+        };
+        let mut p = CatalogProvider::new(ctx, list);
+        assert_eq!(p.next_track().unwrap().id, ids[0]);
+    }
+
+    #[test]
+    fn an_offline_shuffle_does_not_spin() {
+        let fx = Fx::new();
+        let health = Arc::new(FakeLibraries::default());
+        health
+            .lib2_offline
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let meta = TrackMeta {
+            raw_genre: Some("Rock".into()),
+            ..Default::default()
+        };
+        for i in 0..5 {
+            fx.query
+                .upsert_track(2, &format!("usb/{i}.mp3"), 1, 1, &meta)
+                .unwrap();
+        }
+        fx.query.rebuild_genres().unwrap();
+        let ctx = Playback {
+            libraries: health,
+            ..fx.ctx.clone()
+        };
+        let q = crate::playlist::genres_queue(&fx.query, &[]).unwrap();
+        let list = SharedPlaylist::default();
+        lock(&list).replace(Selection::Genres { keys: vec![] }, q);
+        let mut p = CatalogProvider::new(ctx, list);
+        assert_eq!(
+            p.next_track(),
+            None,
+            "every track offline: nothing, not a loop"
+        );
     }
 
     #[test]

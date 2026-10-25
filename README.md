@@ -88,7 +88,10 @@ server's address), an **On** switch and (except the main one) **Remove**:
   ("Scanned from the backup server, nothing removed: …"), since the backup may
   lag behind. A library whose folder lists no file at all although it has
   tracks (an empty mount point left behind, say) removes nothing either ("The
-  folder looks empty, nothing removed: …"). A disk pulled out during a refresh
+  folder looks empty, nothing removed: …"). If that library's music really is
+  gone, remove the library (Settings → Libraries → Remove); for the main
+  server, use Settings → Clear library (which empties the whole catalog) and
+  refresh. A disk pulled out during a refresh
   stops that library's refresh: its files are not listed as unreadable.
 - A local folder under `/Volumes/<name>` counts as there only while
   `/Volumes/<name>` is a mounted disk: an empty folder left there after an
@@ -99,12 +102,16 @@ server's address), an **On** switch and (except the main one) **Remove**:
   library that is down is checked again every 15 s, so a disk plugged back in
   (or a VPN coming up) recovers on its own.
 - On start, the saved playlist resumes once the library of its current track
-  answers. If that library is offline while another one answers, it does not
-  wait: the track is not resumed where it stopped, and the playlist goes on
-  with what can be played.
+  answers: an SMB server that does not answer yet (a VPN that comes up later
+  at login) is waited for, with the saved track and position. It does not wait
+  for a local folder that is missing (a disk not plugged in) while another
+  library answers: the playlist goes on with what can be played. Pressing Play
+  or Next while it waits, with another library answering, gives up the saved
+  position and plays on at once.
 - A removed library's id is never given to a new library.
-- Each track plays from its own library. While a library is offline its
-  tracks fail as unreachable and are passed over, but they are not counted
+- Each track plays from its own library. While a library is offline (and
+  another one answers) its tracks in the playlist are passed over without
+  being tried, however many come in a row; they are not counted
   towards the 3 failures that leave a track out of the shuffle (an unplugged
   disk does not get its tracks excluded).
 - Local folders: hidden files and the macOS `._*` companion files are skipped,

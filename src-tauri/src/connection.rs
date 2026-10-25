@@ -425,6 +425,75 @@ pub struct LibraryConn {
     pub id: LibraryId,
     pub name: String,
     pub kind: LibraryKind,
+    /// Its check in flight, if any (see [`CheckSlot`]).
+    check: Arc<CheckSlot>,
+}
+
+/// At most one check of a library at a time: a check that hangs (a network volume
+/// whose server stopped answering can block a folder listing for good) is not
+/// joined by a new thread every round.
+#[derive(Default)]
+pub struct CheckSlot {
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl CheckSlot {
+    /// Runs `probe` on its own thread, unless the previous check is still running
+    /// (then `None`). The result comes through the returned channel.
+    pub fn start(
+        self: &Arc<Self>,
+        probe: impl FnOnce() -> ConnStatus + Send + 'static,
+    ) -> Option<Receiver<ConnStatus>> {
+        use std::sync::atomic::Ordering;
+        if self.running.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slot = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("library-check".into())
+            .spawn(move || {
+                let status = probe();
+                slot.running.store(false, Ordering::SeqCst);
+                let _ = tx.send(status);
+            });
+        match spawned {
+            Ok(_) => Some(rx),
+            Err(e) => {
+                log::warn!("cannot start a library check: {e}");
+                self.running.store(false, Ordering::SeqCst);
+                None
+            }
+        }
+    }
+}
+
+/// Waits for a started check until `deadline`, giving up at once when `cancel`
+/// is set; `None` if it did not answer.
+pub fn wait_check(
+    rx: &Receiver<ConnStatus>,
+    deadline: Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<ConnStatus> {
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        // An answer already there counts, even past the deadline (that may have
+        // gone on waiting for another library).
+        if let Ok(status) = rx.try_recv() {
+            return Some(status);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+            Ok(status) => return Some(status),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
 }
 
 impl LibraryConn {
@@ -438,6 +507,7 @@ impl LibraryConn {
                 source: LocalSource::new(root.clone()),
                 root,
             },
+            check: Arc::default(),
         }
     }
 
@@ -458,6 +528,7 @@ impl LibraryConn {
                         secondary.as_ref(),
                         creds,
                     )),
+                    check: Arc::default(),
                 })
             }
             LibrarySource::Local { path } if !path.trim().is_empty() => {
@@ -473,6 +544,12 @@ impl LibraryConn {
             LibraryKind::Smb(s) => &s.failover,
             LibraryKind::Local { source, .. } => source,
         }
+    }
+
+    /// Starts a check on its own thread, unless the previous one still runs.
+    pub fn start_check(self: &Arc<Self>) -> Option<Receiver<ConnStatus>> {
+        let lib = self.clone();
+        self.check.start(move || lib.probe())
     }
 
     /// Checks the library now.
@@ -509,52 +586,38 @@ impl LibraryConn {
     }
 }
 
-/// Longest wait for a library's check; one that has not answered by then counts
-/// as unreachable (its check goes on in the background).
-const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest wait for the libraries' checks: above an SMB library's worst case
+/// (a listing that times out, a reconnect, then the backup's connect). One that
+/// has not answered by then counts as unreachable (its check goes on).
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// A library check.
-pub type Probe = Box<dyn FnOnce() -> ConnStatus + Send>;
-
-/// Runs the checks each on its own thread, so a dead server's connect timeout
-/// does not hold up the others (a disk plugged back in is seen at once). Waits
-/// at most `timeout` in all; a check not done by then is
+/// The libraries' statuses from their started checks (`None`: the previous check
+/// still runs), waiting at most `timeout` in all, so a dead server's connect
+/// timeout does not hold up the others (a disk plugged back in is seen at once).
+/// A check that did not answer, or was still running, is
 /// [`ConnStatus::Unreachable`]. In the given order.
-pub fn probe_all(probes: Vec<(LibraryId, String, Probe)>, timeout: Duration) -> Vec<LibraryStatus> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut statuses: Vec<LibraryStatus> = Vec::with_capacity(probes.len());
-    for (index, (id, name, probe)) in probes.into_iter().enumerate() {
-        statuses.push(LibraryStatus {
-            id,
-            name,
-            status: ConnStatus::Unreachable,
-        });
-        let tx = tx.clone();
-        let spawned = std::thread::Builder::new()
-            .name("library-check".into())
-            .spawn(move || {
-                let _ = tx.send((index, probe()));
-            });
-        if let Err(e) = spawned {
-            log::warn!("cannot check library {id}: {e}");
-        }
-    }
-    drop(tx);
+pub fn probe_all(
+    checks: Vec<(LibraryId, String, Option<Receiver<ConnStatus>>)>,
+    timeout: Duration,
+) -> Vec<LibraryStatus> {
     let deadline = Instant::now() + timeout;
-    let mut pending = statuses.len();
-    while pending > 0 {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok((index, status)) => {
-                statuses[index].status = status;
-                pending -= 1;
-            }
-            Err(_) => break,
-        }
-    }
-    if pending > 0 {
-        log::warn!("{pending} library check(s) did not answer within {timeout:?}");
-    }
-    statuses
+    let never = std::sync::atomic::AtomicBool::new(false);
+    checks
+        .into_iter()
+        .map(|(id, name, rx)| {
+            let status = match rx {
+                Some(rx) => wait_check(&rx, deadline, &never).unwrap_or_else(|| {
+                    log::warn!("library {id}: check did not answer within {timeout:?}");
+                    ConnStatus::Unreachable
+                }),
+                None => {
+                    log::warn!("library {id}: the previous check still runs");
+                    ConnStatus::Unreachable
+                }
+            };
+            LibraryStatus { id, name, status }
+        })
+        .collect()
 }
 
 /// The libraries in use: switched on and set up, in the settings' order.
@@ -596,16 +659,12 @@ impl Libraries {
 
     /// Checks every library at once (see [`probe_all`]).
     pub fn probe(&self) -> Option<StatusPayload> {
-        let probes = self
+        let checks = self
             .list
             .iter()
-            .map(|l| {
-                let lib = l.clone();
-                let probe: Probe = Box::new(move || lib.probe());
-                (l.id, l.name.clone(), probe)
-            })
+            .map(|l| (l.id, l.name.clone(), l.start_check()))
             .collect();
-        StatusPayload::new(probe_all(probes, PROBE_TIMEOUT))
+        StatusPayload::new(probe_all(checks, PROBE_TIMEOUT))
     }
 }
 
@@ -1071,17 +1130,21 @@ mod tests {
 
     #[test]
     fn a_slow_library_does_not_hold_up_the_others() {
-        let slow: Probe = Box::new(|| {
-            std::thread::sleep(Duration::from_secs(3));
-            ConnStatus::Ok
-        });
-        let probes: Vec<(LibraryId, String, Probe)> = vec![
-            (1, "NAS".into(), slow),
-            (2, "USB".into(), Box::new(|| ConnStatus::Missing)),
-            (3, String::new(), Box::new(|| ConnStatus::Ok)),
+        let slot = || Arc::new(CheckSlot::default());
+        let checks = vec![
+            (
+                1,
+                "NAS".to_string(),
+                slot().start(|| {
+                    std::thread::sleep(Duration::from_secs(3));
+                    ConnStatus::Ok
+                }),
+            ),
+            (2, "USB".into(), slot().start(|| ConnStatus::Missing)),
+            (3, String::new(), slot().start(|| ConnStatus::Ok)),
         ];
         let started = Instant::now();
-        let got = probe_all(probes, Duration::from_millis(300));
+        let got = probe_all(checks, Duration::from_millis(300));
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "{:?}",
@@ -1097,6 +1160,47 @@ mod tests {
             ],
             "in order; the one that did not answer in time is unreachable"
         );
+        assert!(
+            PROBE_TIMEOUT >= Duration::from_secs(45),
+            "covers a failover check"
+        );
+    }
+
+    #[test]
+    fn a_hung_check_is_not_joined_by_more_and_waiting_can_be_cancelled() {
+        let slot = Arc::new(CheckSlot::default());
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let rx = slot
+            .start(move || {
+                let _ = hold.recv();
+                ConnStatus::Ok
+            })
+            .unwrap();
+        // The next rounds start no thread while it hangs, and say it is unreachable.
+        assert!(slot.start(|| ConnStatus::Ok).is_none());
+        let got = probe_all(vec![(4, String::new(), None)], Duration::from_secs(1));
+        assert_eq!(got[0].status, ConnStatus::Unreachable);
+        // A refresh waiting on it is let go by Cancel at once.
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let t = Instant::now();
+        assert_eq!(wait_check(&rx, t + Duration::from_secs(30), &cancel), None);
+        assert!(t.elapsed() < Duration::from_millis(500));
+        // It ends: the next round checks again.
+        release.send(()).unwrap();
+        let never = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            wait_check(&rx, Instant::now() + Duration::from_secs(5), &never),
+            Some(ConnStatus::Ok)
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let again = loop {
+            if let Some(rx) = slot.start(|| ConnStatus::Missing) {
+                break rx;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(again.recv().unwrap(), ConnStatus::Missing);
     }
 
     #[test]

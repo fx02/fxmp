@@ -14,8 +14,8 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, Tray
 use tauri::{AppHandle, Listener, Manager, Wry};
 
 use crate::commands::{
-    ban_current_now, play_genres_now, play_pause_now, previous_now, set_device_now, set_volume_now,
-    spawn_action,
+    ban_current_now, next_now, play_genres_now, play_pause_now, previous_now, set_device_now,
+    set_volume_now, spawn_action,
 };
 use crate::i18n::{self, tr, trf};
 use crate::lookup;
@@ -249,7 +249,7 @@ fn on_icon_event(app: &AppHandle, event: TrayIconEvent) {
                     std::thread::sleep(window);
                     if clicks(&handle, |c| c.due(seq, Instant::now())) == Some(true) {
                         log::debug!("tray: single click, next track");
-                        handle.state::<AppState>().player.send(Command::Next);
+                        next_now(&handle.state::<AppState>());
                     }
                 });
             if let Err(e) = spawned {
@@ -448,14 +448,16 @@ pub fn relabel(app: &AppHandle) {
 /// Runs on the main thread: anything that touches the catalog goes to a thread.
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     let id = event.id().as_ref();
-    let st = app.state::<AppState>();
     match id {
         ID_TOGGLE => spawn_action(app, "play/pause", |_, st| {
             play_pause_now(st, Command::TogglePause);
             Ok(())
         }),
         ID_PREVIOUS => spawn_action(app, "previous", |_, st| previous_now(st)),
-        ID_NEXT => st.player.send(Command::Next),
+        ID_NEXT => spawn_action(app, "next", |_, st| {
+            next_now(st);
+            Ok(())
+        }),
         ID_BAN => spawn_action(app, "ban", ban_current_now),
         ID_LOOKUP => spawn_action(app, "look up", lookup::open_current),
         ID_COPY => spawn_action(app, "copy", copy_current),
