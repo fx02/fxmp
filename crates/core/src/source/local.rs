@@ -18,13 +18,16 @@ impl LocalSource {
     }
 
     /// Walks `dir`; a subfolder that cannot be listed is skipped and added to
-    /// `skipped` (the root failing is an error). Linked folders are followed, but a
-    /// folder already walked (`visited`, by its resolved path) is not walked again,
-    /// so a link loop ends.
+    /// `skipped` (the root failing is an error). Linked folders outside the
+    /// library (`root`: its resolved path) are followed; one inside it is not, so
+    /// its tracks keep their real path whatever order the folders are listed
+    /// in. A folder already walked (`visited`, by its resolved path) is not
+    /// walked again, so a link loop ends. Entries are walked in name order.
     fn walk_dir(
         &self,
         dir: &Path,
         rel: &str,
+        root: Option<&Path>,
         visited: &mut HashSet<PathBuf>,
         skipped: &mut Vec<String>,
         on_entry: &mut dyn FnMut(FileEntry),
@@ -52,8 +55,9 @@ impl LocalSource {
             }
             Err(e) => return Err(map_io(e)),
         };
+        let mut items = items.collect::<io::Result<Vec<_>>>().map_err(map_io)?;
+        items.sort_by_key(|i| i.file_name());
         for item in items {
-            let item = item.map_err(map_io)?;
             // Hidden files, including macOS `._*` AppleDouble companions.
             let Some(name) = item.file_name().to_str().map(str::to_string) else {
                 log::warn!(
@@ -77,7 +81,12 @@ impl LocalSource {
                 Err(e) => return Err(map_io(e)),
             };
             if md.is_dir() {
-                self.walk_dir(&item.path(), &rel_path, visited, skipped, on_entry)?;
+                let linked = item.file_type().is_ok_and(|t| t.is_symlink());
+                if linked && Self::inside(root, &item.path()) {
+                    log::debug!("not following '{rel_path}': a link to a folder in the library");
+                    continue;
+                }
+                self.walk_dir(&item.path(), &rel_path, root, visited, skipped, on_entry)?;
             } else if md.is_file() && is_supported(&rel_path) {
                 let mtime = md
                     .modified()
@@ -95,6 +104,16 @@ impl LocalSource {
     }
 }
 
+impl LocalSource {
+    /// `path` resolves to a folder inside `root` (resolved).
+    fn inside(root: Option<&Path>, path: &Path) -> bool {
+        match (root, fs::canonicalize(path)) {
+            (Some(root), Ok(real)) => real.starts_with(root),
+            _ => false,
+        }
+    }
+}
+
 fn map_io(e: io::Error) -> SourceError {
     match e.kind() {
         io::ErrorKind::NotFound => SourceError::NotFound,
@@ -106,9 +125,11 @@ fn map_io(e: io::Error) -> SourceError {
 impl MusicSource for LocalSource {
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
         let mut skipped_dirs = Vec::new();
+        let root = fs::canonicalize(&self.root).ok();
         self.walk_dir(
             &self.root,
             "",
+            root.as_deref(),
             &mut HashSet::new(),
             &mut skipped_dirs,
             on_entry,
@@ -292,5 +313,25 @@ mod tests {
             .unwrap();
         got.sort();
         assert_eq!(got, ["a/b/x.mp3", "ext/o.ogg"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_also_linked_from_inside_the_library_keeps_its_real_path() {
+        for _ in 0..5 {
+            let tmp = tempfile::tempdir().unwrap();
+            let real = tmp.path().join("z/real");
+            fs::create_dir_all(&real).unwrap();
+            fs::copy(fixtures().join("tone.mp3"), real.join("x.mp3")).unwrap();
+            // Links that the walk may meet before the folder itself.
+            std::os::unix::fs::symlink(&real, tmp.path().join("a-link")).unwrap();
+            fs::create_dir(tmp.path().join("m")).unwrap();
+            std::os::unix::fs::symlink(&real, tmp.path().join("m/deep-link")).unwrap();
+            let mut got = Vec::new();
+            LocalSource::new(tmp.path())
+                .walk(&mut |e| got.push(e.rel_path))
+                .unwrap();
+            assert_eq!(got, ["z/real/x.mp3"]);
+        }
     }
 }
