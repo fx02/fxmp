@@ -7,3 +7,17 @@ members = ["crates/core", "src-tauri"]
 [patch.crates-io]
 smb-transport = { path = "vendor/smb-transport" }
 smb = { path = "vendor/smb" }
+
+# Smallest build: symbols stripped, whole-program optimisation, one codegen unit.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+# Kept as unwind (the default) on purpose: the scan catches a panicking tag
+# parser with catch_unwind (and the catalog writer a panicking write), which
+# panic = "abort" would turn into a crash of the whole app.
+panic = "unwind"
+# opt-level 3, not "s": "s" made the universal binary 22 % smaller (27.9 vs
+# 36.0 MB) but cut DSP throughput by 27 % (506x vs 698x realtime in the
+# decode/resample/meter benchmark `dsp_throughput`, Apple Silicon).
+opt-level = 3
