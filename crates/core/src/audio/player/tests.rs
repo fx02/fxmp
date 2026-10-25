@@ -1225,3 +1225,28 @@ fn requeue_wakes_a_provider_that_ran_out() {
     h.wait("idle", 30, |e| *e == Event::Idle);
     assert_eq!(h.started(), [1, 2]);
 }
+
+#[test]
+fn play_after_too_many_failures_tries_again() {
+    for play in [Command::Resume, Command::TogglePause] {
+        let mut h = Harness::new(Opts::default());
+        let broken = |id| PlayItem {
+            id,
+            rel_path: "fixtures/broken.mp3".into(),
+            gain_db: 0.0,
+            start_ms: 0,
+        };
+        let mut items: Vec<PlayItem> = (1..=20).map(broken).collect();
+        items.push(tone(21, 500));
+        h.play(items);
+        h.wait("idle", 10, |e| *e == Event::Idle);
+        let label = format!("{:?}", matches!(play, Command::Resume));
+        h.player.send(play);
+        h.wait(&label, 10, |e| *e == Event::TrackStarted { id: 21 });
+        assert!(
+            !h.seen.contains(&Event::Paused(true)),
+            "play must not pause: {:?}",
+            h.seen
+        );
+    }
+}

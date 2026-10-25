@@ -354,14 +354,22 @@ impl Engine {
                 }
             }
             Command::Pause => self.set_paused(true),
-            Command::Resume => self.set_paused(false),
-            Command::TogglePause => self.set_paused(!self.paused),
+            Command::Resume => {
+                self.retry_feeding();
+                self.set_paused(false);
+            }
+            Command::TogglePause => {
+                // Play on a player that gave up after failures means "try again",
+                // never "pause".
+                if self.retry_feeding() {
+                    self.set_paused(false);
+                } else {
+                    self.set_paused(!self.paused);
+                }
+            }
             Command::Next => {
-                if self.provider.is_some() && self.stopped_feeding && self.nothing_loaded() {
-                    // Give up on waiting after too many failures: try again.
-                    self.stopped_feeding = false;
-                    self.idle_reported = false;
-                    self.failures = 0;
+                if self.retry_feeding() {
+                    // Gave up waiting after too many failures: trying again.
                 } else if !self.nothing_loaded() || self.provider.is_some() {
                     self.pending_skips += 1;
                 }
@@ -398,6 +406,19 @@ impl Engine {
                 self.emit(Event::Idle);
                 self.idle_reported = true;
             }
+        }
+    }
+
+    /// A player that stopped after too many failures in a row (nothing loaded) asks
+    /// its provider again. False if it had not stopped.
+    fn retry_feeding(&mut self) -> bool {
+        if self.provider.is_some() && self.stopped_feeding && self.nothing_loaded() {
+            self.stopped_feeding = false;
+            self.idle_reported = false;
+            self.failures = 0;
+            true
+        } else {
+            false
         }
     }
 
