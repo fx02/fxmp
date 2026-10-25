@@ -164,5 +164,8 @@
   "settings.resume_autoplay": "Resume playing automatically on start",
   "err.playlist_changed": "The playlist changed meanwhile. Try again.",
   "err.filter_empty": "No track matches the filter.",
-  "err.export": "Cannot save the playlist: {error}"
+  "err.export": "Cannot save the playlist: {error}",
+  "playlist.export_title": "Export playlist",
+  "err.lookup_nothing": "There is nothing to look up.",
+  "err.open_browser": "Cannot open the browser: {error}"
 }

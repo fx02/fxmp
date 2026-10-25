@@ -59,6 +59,9 @@ pub struct Settings {
     pub language: String,
     /// A restored playlist plays on start (else it waits, paused, where it stopped).
     pub resume_autoplay: bool,
+    /// Where "Look up" goes by default (a click on the now-playing title, the tray).
+    #[serde(deserialize_with = "crate::lookup::lenient_service")]
+    pub lookup_service: crate::lookup::Service,
 }
 
 impl Default for Settings {
@@ -76,6 +79,7 @@ impl Default for Settings {
             last_selection: Vec::new(),
             language: i18n::DEFAULT_LANGUAGE.into(),
             resume_autoplay: false,
+            lookup_service: crate::lookup::Service::default(),
         }
     }
 }
@@ -303,7 +307,25 @@ mod tests {
             last_selection: vec!["rock".into()],
             language: "hr".into(),
             resume_autoplay: true,
+            lookup_service: crate::lookup::Service::Genius,
         }
+    }
+
+    #[test]
+    fn lookup_defaults_to_last_fm_and_a_bad_value_keeps_the_file() {
+        use crate::lookup::Service;
+        assert_eq!(Settings::default().lookup_service, Service::Lastfm);
+        let old: Settings = serde_json::from_str(r#"{"volume": 0.5}"#).unwrap();
+        assert_eq!(
+            old.lookup_service,
+            Service::Lastfm,
+            "from before the option"
+        );
+        let bad: Settings =
+            serde_json::from_str(r#"{"volume": 0.5, "lookup_service": "nope"}"#).unwrap();
+        assert_eq!((bad.volume, bad.lookup_service), (0.5, Service::Lastfm));
+        let set: Settings = serde_json::from_str(r#"{"lookup_service": "discogs"}"#).unwrap();
+        assert_eq!(set.lookup_service, Service::Discogs);
     }
 
     #[test]

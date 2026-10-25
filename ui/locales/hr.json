@@ -167,5 +167,8 @@
   "settings.resume_autoplay": "Pri pokretanju automatski nastavi svirati",
   "err.playlist_changed": "Popis se u međuvremenu promijenio. Pokušaj ponovno.",
   "err.filter_empty": "Nijedna pjesma ne odgovara filtru.",
-  "err.export": "Ne mogu spremiti popis: {error}"
+  "err.export": "Ne mogu spremiti popis: {error}",
+  "playlist.export_title": "Izvoz popisa",
+  "err.lookup_nothing": "Nema se što potražiti.",
+  "err.open_browser": "Ne mogu otvoriti preglednik: {error}"
 }

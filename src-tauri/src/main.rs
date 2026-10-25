@@ -7,6 +7,7 @@ mod connection;
 mod credentials;
 mod devdata;
 mod i18n;
+mod lookup;
 mod media;
 mod playlist;
 mod provider;
@@ -36,6 +37,8 @@ fn main() {
     }
     builder
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(autostart::plugin())
         .setup(|app| {
             // Menu bar app: no Dock icon.
@@ -114,6 +117,13 @@ fn main() {
             commands::playlist_export_hint,
             commands::list_album_tracks,
             commands::set_resume_autoplay,
+            commands::playlist_export_save,
+            commands::lookup_services,
+            commands::lookup_track,
+            commands::lookup_artist,
+            commands::lookup_current,
+            commands::current_song_text,
+            commands::set_lookup_service,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

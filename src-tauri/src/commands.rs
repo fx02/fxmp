@@ -17,6 +17,7 @@ use crate::autostart;
 use crate::connection::{status_of, test_server, test_target, ConnStatus, StatusPayload};
 use crate::credentials::CredentialStore;
 use crate::i18n;
+use crate::lookup;
 use crate::playlist::{self, PlaylistFacets, PlaylistPage, PreviousAction, QueueFilter, Selection};
 use crate::settings::{ServerConfig, Settings, SettingsStore};
 use crate::state::{
@@ -106,6 +107,10 @@ pub struct UnreadableRow {
     pub at: Option<i64>,
     /// Left out of the shuffle until the next refresh.
     pub excluded: bool,
+    /// For "Copy 'Artist – Title'" and "Look up" (the file name when untitled).
+    pub artist: String,
+    pub title: String,
+    pub year: Option<u16>,
 }
 
 /// Where a track lives, as a readable path and as a URL.
@@ -659,8 +664,32 @@ pub async fn playlist_play_filtered(app: AppHandle, filter: QueueFilter) -> CmdR
     .await
 }
 
-/// Saves the playlist (what `filter` leaves of it) as an `.m3u8` file at `path`
-/// (`.m3u8` is added when it has no extension); returns how many tracks it holds.
+/// Writes the playlist (what `filter` leaves of it) as `.m3u8` to `path` (`.m3u8`
+/// is added when it has no extension); returns how many tracks and where.
+fn export_to(st: &AppState, path: PathBuf, filter: Option<&QueueFilter>) -> CmdResult<Exported> {
+    let mut path = path;
+    if path.extension().is_none() {
+        path.set_extension("m3u8");
+    }
+    let count = playlist::export_m3u8(&st.playlist, &st.query, &path, filter).map_err(|e| {
+        log::warn!("export to {}: {e}", path.display());
+        i18n::tf("err.export", &[("error", &e)])
+    })?;
+    Ok(Exported {
+        count,
+        path: path.display().to_string(),
+    })
+}
+
+/// A finished export.
+#[derive(Debug, Clone, Serialize)]
+pub struct Exported {
+    pub count: usize,
+    pub path: String,
+}
+
+/// Saves the playlist (what `filter` leaves of it) as an `.m3u8` file at `path`;
+/// returns how many tracks it holds.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn playlist_export(
     app: AppHandle,
@@ -668,14 +697,40 @@ pub async fn playlist_export(
     filter: Option<QueueFilter>,
 ) -> CmdResult<usize> {
     run(app, move |_, st| {
-        let mut path = PathBuf::from(path);
-        if path.extension().is_none() {
-            path.set_extension("m3u8");
+        export_to(st, PathBuf::from(path), filter.as_ref()).map(|e| e.count)
+    })
+    .await
+}
+
+/// Asks where to save the playlist (the system's save dialog, suggesting
+/// `file_name` in the mounted music folder when there is one), then saves it as
+/// in [`playlist_export`]. `None` when the dialog was cancelled.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_export_save(
+    app: AppHandle,
+    file_name: String,
+    filter: Option<QueueFilter>,
+) -> CmdResult<Option<Exported>> {
+    use tauri_plugin_dialog::DialogExt;
+    run(app, move |app, st| {
+        let server = st.settings.get().primary;
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title(i18n::t("playlist.export_title"))
+            .set_file_name(&file_name)
+            .add_filter("M3U8", &["m3u8"]);
+        if let Some(dir) = default_export_dir(&server) {
+            dialog = dialog.set_directory(dir);
         }
-        playlist::export_m3u8(&st.playlist, &st.query, &path, filter.as_ref()).map_err(|e| {
-            log::warn!("export to {}: {e}", path.display());
-            i18n::tf("err.export", &[("error", &e)])
-        })
+        // Blocks this command thread only; the dialog itself runs on the main thread.
+        let Some(chosen) = dialog.blocking_save_file() else {
+            return Ok(None);
+        };
+        let path = chosen
+            .into_path()
+            .map_err(|e| i18n::tf("err.export", &[("error", &e.to_string())]))?;
+        export_to(st, path, filter.as_ref()).map(Some)
     })
     .await
 }
@@ -715,6 +770,15 @@ fn mounted_music_folder(server: &ServerConfig, exists: impl Fn(&str) -> bool) ->
     [root, share_dir].into_iter().find(|d| exists(d))
 }
 
+/// The mounted music folder on macOS, if the share is mounted.
+fn default_export_dir(server: &ServerConfig) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        mounted_music_folder(server, |d| std::path::Path::new(d).is_dir())
+    } else {
+        None
+    }
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn playlist_export_hint(app: AppHandle) -> CmdResult<ExportHint> {
     run(app, |_, st| {
@@ -724,11 +788,7 @@ pub async fn playlist_export_hint(app: AppHandle) -> CmdResult<ExportHint> {
         Ok(ExportHint {
             file_stem: playlist::file_stem(&title),
             music_folder: music_folder(&server),
-            default_dir: if cfg!(target_os = "macos") {
-                mounted_music_folder(&server, |d| std::path::Path::new(d).is_dir())
-            } else {
-                None
-            },
+            default_dir: default_export_dir(&server),
         })
     })
     .await
@@ -766,6 +826,72 @@ pub async fn list_album_tracks(
                 duration_ms: r.meta.duration_ms,
             })
             .collect())
+    })
+    .await
+}
+
+/// A lookup site for the window's menus: its id and name.
+#[derive(Debug, Clone, Serialize)]
+pub struct LookupServiceInfo {
+    pub id: lookup::Service,
+    pub name: &'static str,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn lookup_services() -> Vec<LookupServiceInfo> {
+    lookup::Service::ALL
+        .iter()
+        .map(|&id| LookupServiceInfo {
+            id,
+            name: id.name(),
+        })
+        .collect()
+}
+
+/// Opens the search for a track on `service` (the default one when `None`). Only
+/// artist and title leave the app.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn lookup_track(
+    app: AppHandle,
+    service: Option<lookup::Service>,
+    artist: String,
+    title: String,
+) -> CmdResult<()> {
+    run(app, move |app, st| {
+        lookup::open(app, st, service, &artist, Some(&title))
+    })
+    .await
+}
+
+/// Opens the search for an artist on the default service.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn lookup_artist(app: AppHandle, artist: String) -> CmdResult<()> {
+    run(app, move |app, st| {
+        lookup::open(app, st, None, &artist, None)
+    })
+    .await
+}
+
+/// Looks the current song up on the default service (a click on the now-playing
+/// title; the tray uses [`lookup::open_current`] too).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn lookup_current(app: AppHandle) -> CmdResult<()> {
+    run(app, lookup::open_current).await
+}
+
+/// The current song as "Artist – Title (Year)", for copying; `None` when nothing
+/// is loaded.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn current_song_text(app: AppHandle) -> CmdResult<Option<String>> {
+    run(app, |_, st| Ok(lookup::current_text(st))).await
+}
+
+/// "Default lookup service".
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_lookup_service(app: AppHandle, service: lookup::Service) -> CmdResult<()> {
+    run(app, move |_, st| {
+        st.settings.update(|s| s.lookup_service = service, |_| {});
+        Ok(())
     })
     .await
 }
@@ -979,15 +1105,34 @@ pub async fn list_albums(app: AppHandle, artist: String) -> CmdResult<Vec<Album>
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_unreadable(app: AppHandle) -> CmdResult<Vec<UnreadableRow>> {
     run(app, |_, st| {
-        let rows = lock(&st.query).unreadable().map_err(db_err)?;
+        let q = lock(&st.query);
+        let rows = q.unreadable().map_err(db_err)?;
+        let ids: Vec<TrackId> = rows.iter().map(|t| t.id).collect();
+        let tags: std::collections::HashMap<TrackId, (String, String, Option<u16>)> = q
+            .tracks_by_ids(&ids)
+            .map_err(db_err)?
+            .into_iter()
+            .map(|r| {
+                let title = playlist::track_title(&r);
+                (
+                    r.id,
+                    (r.meta.artist.unwrap_or_default(), title, r.meta.year),
+                )
+            })
+            .collect();
+        drop(q);
         let settings = st.settings.get();
         Ok(rows
             .into_iter()
             .map(|t| {
                 let loc = file_location(&settings, t.server, &t.rel_path);
-                (t, loc)
+                let tags = tags.get(&t.id).cloned().unwrap_or_default();
+                (t, loc, tags)
             })
-            .map(|(t, loc)| UnreadableRow {
+            .map(|(t, loc, (artist, title, year))| UnreadableRow {
+                artist,
+                title,
+                year,
                 id: t.id,
                 path: loc.path,
                 url: loc.url,
