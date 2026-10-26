@@ -214,7 +214,15 @@ impl AppState {
         };
         // The first start after SMB Music Player brings its data over (once).
         let dev = dev_dir.is_some();
-        if migrate::migrate_at_start(&config_dir, &data_dir, dev) && !cfg!(debug_assertions) {
+        let debug = cfg!(debug_assertions);
+        let dev_from = if dev {
+            std::env::var_os(migrate::DEV_ENV)
+        } else {
+            None
+        };
+        let migration =
+            migrate::prepare(config_dir, data_dir, &migrate::source(debug, dev, dev_from));
+        if migration.copied && !debug {
             if let Err(e) = migrate::remove_old_login_item() {
                 log::warn!(
                     "cannot remove the login item of {}: {e}",
@@ -222,7 +230,10 @@ impl AppState {
                 );
             }
         }
-        let passwords_pending = migrate::passwords_pending(&data_dir);
+        if migration.failed {
+            migrate::tell_failed(app);
+        }
+        let (config_dir, data_dir) = (migration.config_dir, migration.data_dir);
         let settings_path = config_dir.join(settings::FILE_NAME);
         std::fs::create_dir_all(&data_dir)?;
         let catalog_path = data_dir.join("catalog.db");
@@ -357,11 +368,13 @@ impl AppState {
                 })
             })?;
 
-        if passwords_pending && !configured {
-            // Nothing set up in the old app: no passwords to copy.
-            if let Err(e) = migrate::mark_done(&data_dir) {
-                log::warn!("migration: cannot record it as done: {e}");
-            }
+        if !configured {
+            // Nothing set up in the old app: no server, so no keychain read.
+            let st = app.state::<AppState>();
+            let old = Keychain {
+                service: migrate::old_service(dev),
+            };
+            migrate::passwords_step(&data_dir, &old, st.creds.as_ref(), &st.settings.get());
         }
         if configured {
             // The keychain may ask the user for access (e.g. after an update):
@@ -375,25 +388,11 @@ impl AppState {
                     // One start's reads are remembered: an old entry the user
                     // refused is not asked for twice.
                     let start = credentials::Remembered::new(st.creds.as_ref());
-                    if passwords_pending {
-                        // Each entry of the old app may bring up a keychain prompt.
-                        let old = Keychain {
-                            service: migrate::old_service(dev),
-                        };
-                        let done = migrate::copy_passwords(&old, &start, &settings);
-                        log::info!(
-                            "migration: passwords of {}: {} copied, {} already here, {} not \
-                             read, {} failed",
-                            migrate::OLD_APP_NAME,
-                            done.copied,
-                            done.present,
-                            done.missing,
-                            done.failed
-                        );
-                        if let Err(e) = migrate::mark_done(&data_dir) {
-                            log::warn!("migration: cannot record it as done: {e}");
-                        }
-                    }
+                    // Each entry of the old app may bring up a keychain prompt.
+                    let old = Keychain {
+                        service: migrate::old_service(dev),
+                    };
+                    migrate::passwords_step(&data_dir, &old, &start, &settings);
                     credentials::migrate_legacy(&start, &settings);
                     let libraries = Libraries::from_settings(&settings, &start);
                     if !st.source.set_if_unset(libraries) {

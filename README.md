@@ -54,19 +54,25 @@ the old app had:
   [Where the app keeps its data](#where-the-app-keeps-its-data)). If the old app
   writes meanwhile, the copy is taken again. A file
   `migrated-from-smb-music-player` in fxmp's folder records that this was done,
-  so it happens once.
+  so it happens once. If the copy still fails (usually because SMB Music Player
+  keeps writing), fxmp says so in a message and starts empty: quit SMB Music
+  Player, then quit fxmp and start it again. fxmp tries again on every start
+  until the copy works, and what was set up in an empty start is not kept.
 - **Passwords**: each server's password is read from the old keychain service
   `smb-music-player` and written to `fxmp`, then read back. macOS asks whether
   fxmp may read each of the old app's entries (once per entry): choose
   **Allow** or **Always Allow**. If you refuse, nothing is lost: fxmp asks for
   that password in Settings, as for any password it does not have.
-- **Start at login**: if it was on, fxmp sets up its own login item and removes
-  the old app's (`~/Library/LaunchAgents/SMB Music Player.plist`; on Windows the
+- **Start at login**: fxmp removes the old app's login item if there is one
+  (`~/Library/LaunchAgents/SMB Music Player.plist`; on Windows the
   `SMB Music Player` value under
-  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`), so the old app no
+  longer starts at login. If start at login was on, fxmp sets up its own login
+  item instead.
 
-The old app's folder and keychain entries are not changed or deleted, so SMB
-Music Player keeps working. Once fxmp works, you can remove the old app: drag
+Apart from its login item, nothing of the old app is changed or deleted: its
+folder and keychain entries stay, so SMB Music Player keeps working (start it by
+hand). Once fxmp works, you can remove the old app: drag
 `SMB Music Player.app` to the Bin, delete its folder above, and delete its
 keychain entries (Keychain Access, search for `smb-music-player`, or
 `security delete-generic-password -s smb-music-player` once per entry). If fxmp
@@ -394,10 +400,10 @@ SMP_DATA_DIR=$(mktemp -d) cargo run -p fxmp
 # afterwards: rm -rf that folder; security delete-generic-password -s fxmp-dev
 ```
 
-Such a build migrates from SMB Music Player only from the folder in
+A debug build never migrates from the installed old app's data. Without
+`SMP_DATA_DIR` it does not migrate at all; with it, only from the folder in
 `SMP_MIGRATE_FROM` (and from the old keychain service `smb-music-player-dev`),
-never from the installed old app's data, so the migration can be tried on
-copies:
+so the migration can be tried on copies:
 
 ```sh
 SMP_DATA_DIR=$(mktemp -d) SMP_MIGRATE_FROM=/path/to/a/copy cargo run -p fxmp

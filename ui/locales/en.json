@@ -238,6 +238,7 @@
   "tray.copy_current": "Copy current song",
   "settings.about": "About",
   "about.long_name": "fx music player",
+  "migrate.failed": "Couldn't copy your library and settings from SMB Music Player. Quit SMB Music Player, then quit fxmp and start it again: it tries again on every start until the copy works. Until then fxmp starts empty, and what you set up now is not kept.",
   "about.version": "Version {version}",
   "about.build": "Build {commit}, {date}",
   "about.vibe": "Vibe coded with Claude",

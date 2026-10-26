@@ -1,15 +1,23 @@
 //! The first start of fxmp after SMB Music Player (its old name): the old app's
 //! settings, catalog and playlist are copied from its folder, and its keychain
 //! passwords from its keychain service, once. Nothing of the old app is changed
-//! or deleted, so it keeps working until the owner removes it.
+//! or deleted (but its login item), so it keeps working until the owner removes it.
 //!
-//! Files: when the new folder has neither settings nor a catalog and the old
-//! folder exists, every file of the old folder is copied (`catalog.db-shm`
-//! excepted: SQLite rebuilds it from the database and its log). The copy goes to
-//! a staging folder first and is checked against the old folder afterwards: if
-//! the old app wrote meanwhile, the copy is taken again. A marker file then
-//! records that the files came over and that the passwords are still to copy;
-//! once they are, the marker says so and nothing is done on later starts.
+//! A marker file in the new folder tracks the migration: "copying files", then
+//! "passwords pending", then "done".
+//!
+//! Files: when there is no marker, the new folder has neither settings nor a
+//! catalog (a fresh fxmp user's data is never replaced) and the old folder
+//! exists, the marker is set to "copying files" and every file of the old folder
+//! is copied (`catalog.db-shm` excepted: SQLite rebuilds it from the database
+//! and its log) to a staging folder. The old folder is listed (size and time of
+//! each file) before and after: if the old app wrote meanwhile, or a file could
+//! not be copied, the copy is taken again. The copies are then moved into the
+//! new folder, the settings and the database last. While the marker says
+//! "copying files", whatever is in the new folder is left over from an
+//! interrupted attempt, so the next start copies again. A start whose copy
+//! failed keeps its data in a throwaway folder ([`unmigrated_dir`]), so the
+//! empty catalog it opens never hides the old data from the next attempt.
 //!
 //! Passwords: each server of every library in the copied settings is read from
 //! the old service and written to the new one, then read back. A read the user
@@ -22,7 +30,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::credentials::{self, CredentialStore, Remembered};
+use crate::credentials::{self, CredentialStore};
 use crate::settings::{self, LibrarySource, Settings};
 
 /// The old app's bundle identifier: its folder's name.
@@ -40,14 +48,15 @@ pub const DEV_ENV: &str = "SMP_MIGRATE_FROM";
 
 /// The catalog's file name (see `state.rs`).
 const DATABASE: &str = "catalog.db";
+/// The database's files that must never be mixed with another copy's.
+const DATABASE_FILES: [&str; 3] = ["catalog.db", "catalog.db-wal", "catalog.db-shm"];
+const UNMIGRATED: &str = ".unmigrated-session";
 const STAGING: &str = ".migrating-from-smb-music-player";
+const PENDING: &str = "copying files\n";
 const PASSWORDS_PENDING: &str = "files copied; passwords pending\n";
 const DONE: &str = "done\n";
 /// Not copied: SQLite rebuilds it, and a copy may not match the log.
 const SKIPPED_SUFFIX: &str = "-shm";
-/// How often the copy is taken again while the old app writes.
-const ATTEMPTS: usize = 5;
-const RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// What [`migrate_files`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +65,7 @@ pub enum Files {
     AlreadyMigrated,
     /// There is no old folder.
     NoOldData,
-    /// The new folder already has settings or a catalog: left alone.
+    /// The new folder had settings or a catalog before any attempt: left alone.
     NewHasData,
     /// This many files were copied now.
     Copied(usize),
@@ -75,68 +84,159 @@ pub struct Passwords {
     pub failed: usize,
 }
 
+/// How often copies are taken again.
+struct Retry {
+    /// Copies of the whole folder.
+    attempts: usize,
+    delay: Duration,
+    /// Copies of one file that fails.
+    file_attempts: usize,
+    file_delay: Duration,
+}
+
+/// At most about 0.6 s of waiting, so a start stays quick (see the report of
+/// the measured copy time).
+const RETRY: Retry = Retry {
+    attempts: 4,
+    delay: Duration::from_millis(150),
+    file_attempts: 3,
+    file_delay: Duration::from_millis(25),
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    None,
+    Pending,
+    PasswordsPending,
+    Done,
+}
+
+fn marker(new: &Path) -> Marker {
+    match fs::read_to_string(new.join(MARKER)) {
+        Err(_) => Marker::None,
+        Ok(m) if m == PENDING => Marker::Pending,
+        Ok(m) if m == PASSWORDS_PENDING => Marker::PasswordsPending,
+        // Anything else: done, so nothing is ever copied over the new data.
+        Ok(_) => Marker::Done,
+    }
+}
+
 /// The old app's folder next to `new_dir` (the same parent, the old identifier).
 pub fn old_dir_beside(new_dir: &Path) -> Option<PathBuf> {
     new_dir.parent().map(|p| p.join(OLD_IDENTIFIER))
 }
 
 /// Copies the old app's files from `old` to `new` unless that was done before,
-/// `old` does not exist or `new` already has data. `old` is only read.
+/// `old` does not exist or `new` had data before. `old` is only read.
 pub fn migrate_files(old: &Path, new: &Path) -> io::Result<Files> {
-    if new.join(MARKER).exists() {
-        return Ok(Files::AlreadyMigrated);
+    migrate_files_with(old, new, &RETRY, &mut |_| {})
+}
+
+fn migrate_files_with(
+    old: &Path,
+    new: &Path,
+    retry: &Retry,
+    before_copy: &mut dyn FnMut(&Path),
+) -> io::Result<Files> {
+    match marker(new) {
+        Marker::PasswordsPending | Marker::Done => return Ok(Files::AlreadyMigrated),
+        Marker::Pending if !old.is_dir() => {
+            log::warn!(
+                "migration: {} is gone; the interrupted migration is given up",
+                old.display()
+            );
+            fs::remove_file(new.join(MARKER))?;
+            return Ok(Files::NoOldData);
+        }
+        Marker::Pending => log::info!("migration: an interrupted migration is done again"),
+        Marker::None => {
+            if !old.is_dir() {
+                return Ok(Files::NoOldData);
+            }
+            if new.join(settings::FILE_NAME).exists() || new.join(DATABASE).exists() {
+                return Ok(Files::NewHasData);
+            }
+            fs::create_dir_all(new)?;
+            fs::write(new.join(MARKER), PENDING)?;
+        }
     }
-    if !old.is_dir() {
-        return Ok(Files::NoOldData);
-    }
-    if new.join(settings::FILE_NAME).exists() || new.join(DATABASE).exists() {
-        return Ok(Files::NewHasData);
-    }
-    fs::create_dir_all(new)?;
     let staging = new.join(STAGING);
-    let mut attempt = 0;
-    let copied = loop {
-        attempt += 1;
-        remove_staging(&staging)?;
-        let before = listing(old)?;
-        let copied = copy_tree(old, &staging)?;
-        if listing(old)? == before {
-            break copied;
-        }
-        if attempt == ATTEMPTS {
-            remove_staging(&staging)?;
-            return Err(io::Error::other(
-                "SMB Music Player kept changing its files while they were copied",
-            ));
-        }
-        log::info!("migration: the old app wrote meanwhile; copying again");
-        std::thread::sleep(RETRY_DELAY);
-    };
-    // The settings and the database last: once either is in place the new
-    // folder counts as having data, so the database's log must already be there.
+    let copied = copy_consistent(old, &staging, retry, before_copy)?;
+    // Left over from an interrupted attempt: a log of another copy would
+    // corrupt the database.
+    for name in DATABASE_FILES.iter().copied().chain([settings::FILE_NAME]) {
+        remove_file_if_there(&new.join(name))?;
+    }
+    // The settings and the database last: the log must be in place first.
     let mut names: Vec<_> = fs::read_dir(&staging)?
         .map(|e| e.map(|e| e.file_name()))
         .collect::<io::Result<_>>()?;
     names.sort_by_key(|n| n == DATABASE || n == settings::FILE_NAME);
     for name in names {
         let target = new.join(&name);
-        if target.exists() {
-            log::warn!(
-                "migration: {} is already in the new folder; kept",
-                name.to_string_lossy()
-            );
-            continue;
+        if target.is_dir() {
+            fs::remove_dir_all(&target)?;
+        } else {
+            remove_file_if_there(&target)?;
         }
         fs::rename(staging.join(&name), target)?;
     }
-    remove_staging(&staging)?;
+    remove_dir_if_there(&staging)?;
     fs::write(new.join(MARKER), PASSWORDS_PENDING)?;
     Ok(Files::Copied(copied))
 }
 
+/// Copies `old` to `staging` until a copy matches the old folder before and
+/// after it; gives up after `retry.attempts` copies (and removes `staging`).
+fn copy_consistent(
+    old: &Path,
+    staging: &Path,
+    retry: &Retry,
+    before_copy: &mut dyn FnMut(&Path),
+) -> io::Result<usize> {
+    let mut last_problem = String::new();
+    for attempt in 1..=retry.attempts {
+        if attempt > 1 {
+            std::thread::sleep(retry.delay);
+        }
+        remove_dir_if_there(staging)?;
+        let copy = listing(old).and_then(|before| {
+            let copied = copy_tree(old, staging, retry, before_copy)?;
+            Ok((before, copied))
+        });
+        match copy {
+            Ok((before, copied)) => match listing(old) {
+                Ok(after) if after == before => return Ok(copied),
+                Ok(_) => last_problem = "the old app changed its files meanwhile".into(),
+                Err(e) => last_problem = e.to_string(),
+            },
+            Err(e) => last_problem = e.to_string(),
+        }
+        log::info!("migration: copy {attempt} not usable ({last_problem})");
+    }
+    remove_dir_if_there(staging)?;
+    Err(io::Error::other(format!(
+        "{OLD_APP_NAME}'s files could not be copied: {last_problem}"
+    )))
+}
+
+fn remove_file_if_there(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+fn remove_dir_if_there(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// Whether the files came over but the passwords are still to copy.
 pub fn passwords_pending(new: &Path) -> bool {
-    fs::read_to_string(new.join(MARKER)).is_ok_and(|m| m == PASSWORDS_PENDING)
+    marker(new) == Marker::PasswordsPending
 }
 
 /// Records that the passwords were copied too: the migration is over.
@@ -144,26 +244,23 @@ pub fn mark_done(new: &Path) -> io::Result<()> {
     fs::write(new.join(MARKER), DONE)
 }
 
-fn remove_staging(staging: &Path) -> io::Result<()> {
-    match fs::remove_dir_all(staging) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
-}
-
 /// Whether the file is copied (and compared): not links, not `-shm`.
 fn wanted(name: &std::ffi::OsStr, meta: &fs::Metadata) -> bool {
     !meta.file_type().is_symlink() && !name.to_string_lossy().ends_with(SKIPPED_SUFFIX)
 }
 
-/// Every copied file under `dir` with its size and modification time.
+/// Every copied file under `dir` with its size and modification time. A file
+/// gone meanwhile is left out.
 fn listing(dir: &Path) -> io::Result<Vec<(PathBuf, u64, Option<SystemTime>)>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for entry in fs::read_dir(&d)? {
             let entry = entry?;
-            let meta = fs::symlink_metadata(entry.path())?;
+            let meta = match fs::symlink_metadata(entry.path()) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                other => other?,
+            };
             if !wanted(&entry.file_name(), &meta) {
                 continue;
             }
@@ -178,22 +275,52 @@ fn listing(dir: &Path) -> io::Result<Vec<(PathBuf, u64, Option<SystemTime>)>> {
     Ok(out)
 }
 
-/// Copies the files under `from` to `to`; returns how many.
-fn copy_tree(from: &Path, to: &Path) -> io::Result<usize> {
+/// Copies the files under `from` to `to`; returns how many. A file that fails
+/// is tried again; one that is gone meanwhile is left out (the listing after the
+/// copy then differs, so the copy is taken again).
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+    retry: &Retry,
+    before_copy: &mut dyn FnMut(&Path),
+) -> io::Result<usize> {
     fs::create_dir_all(to)?;
     let mut copied = 0;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
-        let meta = fs::symlink_metadata(entry.path())?;
+        let meta = match fs::symlink_metadata(entry.path()) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            other => other?,
+        };
         if !wanted(&entry.file_name(), &meta) {
             continue;
         }
         let target = to.join(entry.file_name());
         if meta.is_dir() {
-            copied += copy_tree(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), target)?;
-            copied += 1;
+            copied += copy_tree(&entry.path(), &target, retry, before_copy)?;
+            continue;
+        }
+        before_copy(&entry.path());
+        let mut attempt = 1;
+        loop {
+            match fs::copy(entry.path(), &target) {
+                Ok(_) => {
+                    copied += 1;
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                Err(e) if attempt < retry.file_attempts => {
+                    log::info!("migration: copying a file again ({e})");
+                    attempt += 1;
+                    std::thread::sleep(retry.file_delay);
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("{}: {e}", entry.path().display()),
+                    ))
+                }
+            }
         }
     }
     Ok(copied)
@@ -231,14 +358,13 @@ fn accounts(settings: &Settings) -> Vec<String> {
 
 /// Copies the passwords of every server of `settings`' libraries from `old` to
 /// `new`, verifying each by reading it back. Old entries are kept; an entry the
-/// new service already has is not overwritten. Each old entry is read at most
-/// once.
+/// new service already has is not overwritten. Each old entry is read once (the
+/// accounts are distinct).
 pub fn copy_passwords(
     old: &dyn CredentialStore,
     new: &dyn CredentialStore,
     settings: &Settings,
 ) -> Passwords {
-    let old = Remembered::new(old);
     let mut done = Passwords::default();
     for account in accounts(settings) {
         if new.get(&account).is_some() {
@@ -264,18 +390,8 @@ pub fn copy_passwords(
     done
 }
 
-/// The folder to migrate `new_dir` from: the old app's, next to it; in a debug
-/// build with its own data folder (`dev`) only the folder in [`DEV_ENV`], so a
-/// developer build never reads the installed app's data.
-pub fn old_dir(new_dir: &Path, dev: bool, dev_from: Option<OsString>) -> Option<PathBuf> {
-    if dev {
-        dev_from.filter(|v| !v.is_empty()).map(PathBuf::from)
-    } else {
-        old_dir_beside(new_dir)
-    }
-}
-
-/// The old app's keychain service (see [`old_dir`] for `dev`).
+/// The old app's keychain service: a debug build with its own data folder
+/// (`dev`) uses the old app's debug service.
 pub fn old_service(dev: bool) -> &'static str {
     if dev {
         OLD_DEV_SERVICE
@@ -284,39 +400,168 @@ pub fn old_service(dev: bool) -> &'static str {
     }
 }
 
-/// The start's file migration, for the data folder and (if it is another one)
-/// the settings folder. Returns whether files were copied now. A failure is
-/// logged; the app then starts without the old data and tries again next time.
-pub fn migrate_at_start(config_dir: &Path, data_dir: &Path, dev: bool) -> bool {
-    let mut dirs = vec![data_dir];
-    if config_dir != data_dir {
-        dirs.push(config_dir);
+/// Where a start migrates from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// The old app's folder next to the new one (a release build).
+    Beside,
+    /// This folder (a debug build with `SMP_DATA_DIR` and [`DEV_ENV`]).
+    Folder(PathBuf),
+    /// Nowhere.
+    Skip,
+}
+
+impl Source {
+    fn old_dir(&self, new_dir: &Path) -> Option<PathBuf> {
+        match self {
+            Source::Beside => old_dir_beside(new_dir),
+            Source::Folder(dir) => Some(dir.clone()),
+            Source::Skip => None,
+        }
     }
-    let mut copied_now = false;
-    for new in dirs {
-        let dev_from = if dev { std::env::var_os(DEV_ENV) } else { None };
-        let Some(old) = old_dir(new, dev, dev_from) else {
-            continue;
+}
+
+/// Where to migrate from: a release build from the old app's folder; a debug
+/// build never from the installed app's data, so only with its own data folder
+/// (`dev_dir`) and from the folder in [`DEV_ENV`] (`dev_from`).
+pub fn source(debug: bool, dev_dir: bool, dev_from: Option<OsString>) -> Source {
+    if !debug {
+        return Source::Beside;
+    }
+    match dev_from.filter(|v| dev_dir && !v.is_empty()) {
+        Some(dir) => Source::Folder(PathBuf::from(dir)),
+        None => Source::Skip,
+    }
+}
+
+/// The folders a start uses and what its migration did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prepared {
+    pub config_dir: PathBuf,
+    pub data_dir: PathBuf,
+    /// Files were copied now.
+    pub copied: bool,
+    /// The copy failed: this start uses a throwaway folder (see [`unmigrated_dir`]).
+    pub failed: bool,
+    /// The passwords are still to copy (see [`passwords_step`]).
+    pub passwords_pending: bool,
+}
+
+/// Where a start whose migration failed keeps its data, so nothing in the new
+/// folder hides the old data from the next start's attempt.
+pub fn unmigrated_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(UNMIGRATED)
+}
+
+/// The start's migration of the files; returns the folders to use. The settings
+/// go to `config_dir` when it is another folder than `data_dir`.
+pub fn prepare(config_dir: PathBuf, data_dir: PathBuf, source: &Source) -> Prepared {
+    let aside = unmigrated_dir(&data_dir);
+    if let Err(e) = remove_dir_if_there(&aside) {
+        log::warn!("migration: cannot remove {}: {e}", aside.display());
+    }
+    let mut copied = false;
+    let mut failed = false;
+    if let Some(old) = source.old_dir(&data_dir) {
+        let has_own_settings =
+            config_dir != data_dir && config_dir.join(settings::FILE_NAME).exists();
+        let result = if has_own_settings && marker(&data_dir) == Marker::None {
+            Ok(Files::NewHasData)
+        } else {
+            migrate_files(&old, &data_dir)
         };
-        match migrate_files(&old, new) {
+        match result {
             Ok(Files::Copied(n)) => {
                 log::info!(
                     "migration: {n} files of {OLD_APP_NAME} copied from {} to {}",
                     old.display(),
-                    new.display()
+                    data_dir.display()
                 );
-                copied_now = true;
+                copied = true;
+                if config_dir != data_dir {
+                    if let Err(e) = move_settings(&data_dir, &config_dir) {
+                        log::warn!("migration: cannot move the settings: {e}");
+                    }
+                }
             }
             Ok(Files::NewHasData) => log::info!(
                 "migration: {} already has data; {} left alone",
-                new.display(),
+                data_dir.display(),
                 old.display()
             ),
             Ok(Files::AlreadyMigrated | Files::NoOldData) => {}
-            Err(e) => log::warn!("migration from {} failed: {e}", old.display()),
+            Err(e) => {
+                log::warn!("migration from {} failed: {e}", old.display());
+                failed = true;
+            }
         }
     }
-    copied_now
+    if failed {
+        if let Err(e) = fs::create_dir_all(&aside) {
+            log::warn!("migration: cannot create {}: {e}", aside.display());
+        }
+        return Prepared {
+            config_dir: aside.clone(),
+            data_dir: aside,
+            copied,
+            failed,
+            passwords_pending: false,
+        };
+    }
+    Prepared {
+        passwords_pending: passwords_pending(&data_dir),
+        config_dir,
+        data_dir,
+        copied,
+        failed,
+    }
+}
+
+fn move_settings(data_dir: &Path, config_dir: &Path) -> io::Result<()> {
+    let from = data_dir.join(settings::FILE_NAME);
+    if !from.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(config_dir)?;
+    fs::copy(&from, config_dir.join(settings::FILE_NAME))?;
+    fs::remove_file(from)
+}
+
+/// Copies the passwords if the files came over and they are still to copy, and
+/// records the migration as done. `None`: nothing to do.
+pub fn passwords_step(
+    data_dir: &Path,
+    old: &dyn CredentialStore,
+    new: &dyn CredentialStore,
+    settings: &Settings,
+) -> Option<Passwords> {
+    if !passwords_pending(data_dir) {
+        return None;
+    }
+    let done = copy_passwords(old, new, settings);
+    log::info!(
+        "migration: passwords of {OLD_APP_NAME}: {} copied, {} already here, {} not read, {} \
+         failed",
+        done.copied,
+        done.present,
+        done.missing,
+        done.failed
+    );
+    if let Err(e) = mark_done(data_dir) {
+        log::warn!("migration: cannot record it as done: {e}");
+    }
+    Some(done)
+}
+
+/// Tells the user that the copy failed and how to get it to work (a message box
+/// that does not block the start).
+pub fn tell_failed(app: &tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    app.dialog()
+        .message(crate::i18n::t("migrate.failed"))
+        .title("fxmp")
+        .kind(MessageDialogKind::Warning)
+        .show(|_| {});
 }
 
 /// Removes the old app's login item (a LaunchAgent named after it on macOS, a
@@ -343,6 +588,7 @@ mod tests {
     use fxmp_core::catalog::Catalog;
     use fxmp_core::catalog::TrackMeta;
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
 
     /// Every file under `dir`: relative path → (contents, modification time).
     fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
@@ -406,25 +652,6 @@ mod tests {
                 "/Users/u/Library/Application Support/hr.pvt.smb-music-player"
             ))
         );
-    }
-
-    #[test]
-    fn a_developer_build_migrates_only_from_the_folder_it_is_given() {
-        let new = Path::new("/tmp/dev-data");
-        assert_eq!(old_dir(new, true, None), None, "never the real old folder");
-        assert_eq!(old_dir(new, true, Some(OsString::new())), None);
-        assert_eq!(
-            old_dir(new, true, Some(OsString::from("/tmp/old"))),
-            Some(PathBuf::from("/tmp/old"))
-        );
-        assert_eq!(
-            old_dir(new, false, Some(OsString::from("/tmp/old"))),
-            Some(PathBuf::from("/tmp/hr.pvt.smb-music-player")),
-            "a release ignores the variable"
-        );
-        assert_eq!(old_service(true), "smb-music-player-dev");
-        assert_eq!(old_service(false), "smb-music-player");
-        assert_ne!(old_service(false), credentials::SERVICE);
     }
 
     #[test]
@@ -700,5 +927,296 @@ mod tests {
         assert_eq!(done.failed, 1);
         assert_eq!(done.copied, 0);
         assert_eq!(old.accounts().len(), 1);
+    }
+
+    fn quick() -> Retry {
+        Retry {
+            attempts: 3,
+            delay: Duration::from_millis(1),
+            file_attempts: 2,
+            file_delay: Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn an_old_app_writing_all_the_time_fails_the_copy_and_the_next_start_copies() {
+        let old = old_app();
+        let new = tempfile::tempdir().unwrap();
+        let mut writes = 0;
+        let result = migrate_files_with(old.dir.path(), new.path(), &quick(), &mut |_| {
+            writes += 1;
+            fs::write(
+                old.dir.path().join("extra").join("note.txt"),
+                "y".repeat(writes),
+            )
+            .unwrap();
+        });
+        assert!(result.is_err(), "{result:?}");
+        assert!(!new.path().join(STAGING).exists());
+        assert!(!new.path().join(settings::FILE_NAME).exists());
+        assert!(!new.path().join(DATABASE).exists());
+        assert!(!passwords_pending(new.path()));
+        // The next start: the old app is quiet now.
+        assert!(matches!(
+            migrate_files(old.dir.path(), new.path()).unwrap(),
+            Files::Copied(_)
+        ));
+        assert!(passwords_pending(new.path()));
+        assert!(!Catalog::open(&new.path().join(DATABASE))
+            .unwrap()
+            .is_empty()
+            .unwrap());
+    }
+
+    #[test]
+    fn a_log_that_vanishes_during_the_copy_is_copied_again_without_it() {
+        let old = old_app();
+        let Old { dir, _open } = old;
+        let mut open = Some(_open);
+        let new = tempfile::tempdir().unwrap();
+        let result = migrate_files_with(dir.path(), new.path(), &quick(), &mut |path| {
+            // The old app quits just before its log is copied: SQLite moves the
+            // log into the database and deletes it.
+            if path.to_string_lossy().ends_with("-wal") {
+                open.take();
+            }
+        })
+        .unwrap();
+        assert!(matches!(result, Files::Copied(_)), "{result:?}");
+        assert!(!dir.path().join("catalog.db-wal").exists());
+        assert!(!new.path().join("catalog.db-wal").exists());
+        assert!(!Catalog::open(&new.path().join(DATABASE))
+            .unwrap()
+            .is_empty()
+            .unwrap());
+    }
+
+    #[test]
+    fn a_copy_interrupted_between_the_renames_is_redone() {
+        let old = old_app();
+        let new = tempfile::tempdir().unwrap();
+        migrate_files(old.dir.path(), new.path()).unwrap();
+        // As if the last start stopped after moving the log and the settings
+        // but before the database, and the old app has quit since (its log is
+        // in its database now).
+        fs::write(new.path().join(MARKER), PENDING).unwrap();
+        fs::remove_file(new.path().join(DATABASE)).unwrap();
+        fs::create_dir(new.path().join(STAGING)).unwrap();
+        fs::write(new.path().join(STAGING).join(DATABASE), "half").unwrap();
+        let Old { dir, _open } = old;
+        drop(_open);
+        assert!(!dir.path().join("catalog.db-wal").exists());
+
+        assert!(matches!(
+            migrate_files(dir.path(), new.path()).unwrap(),
+            Files::Copied(_)
+        ));
+        assert!(
+            !new.path().join("catalog.db-wal").exists(),
+            "a stale log would corrupt it"
+        );
+        assert!(!new.path().join(STAGING).exists());
+        assert!(passwords_pending(new.path()));
+        assert!(!Catalog::open(&new.path().join(DATABASE))
+            .unwrap()
+            .is_empty()
+            .unwrap());
+    }
+
+    #[test]
+    fn the_source_depends_on_the_build() {
+        let from = || Some(OsString::from("/tmp/old"));
+        assert_eq!(source(false, false, from()), Source::Beside);
+        assert_eq!(
+            source(true, false, from()),
+            Source::Skip,
+            "plain debug build"
+        );
+        assert_eq!(source(true, true, None), Source::Skip);
+        assert_eq!(source(true, true, Some(OsString::new())), Source::Skip);
+        assert_eq!(
+            source(true, true, from()),
+            Source::Folder("/tmp/old".into())
+        );
+        assert_eq!(old_service(true), "smb-music-player-dev");
+        assert_eq!(old_service(false), "smb-music-player");
+        assert_ne!(old_service(false), credentials::SERVICE);
+    }
+
+    /// `parent/hr.pvt.smb-music-player` with the old app's files, and the new
+    /// folder next to it.
+    fn installed() -> (tempfile::TempDir, Old, PathBuf) {
+        let parent = tempfile::tempdir().unwrap();
+        let old = old_app();
+        let old_dir = parent.path().join(OLD_IDENTIFIER);
+        copy_tree(old.dir.path(), &old_dir, &quick(), &mut |_| {}).unwrap();
+        let new = parent.path().join("hr.pvt.fxmp");
+        (parent, old, new)
+    }
+
+    #[test]
+    fn a_release_start_migrates_once_and_leaves_the_passwords_pending() {
+        let (_parent, _old, new) = installed();
+        let first = prepare(new.clone(), new.clone(), &Source::Beside);
+        assert_eq!(
+            first,
+            Prepared {
+                config_dir: new.clone(),
+                data_dir: new.clone(),
+                copied: true,
+                failed: false,
+                passwords_pending: true
+            }
+        );
+        let second = prepare(new.clone(), new.clone(), &Source::Beside);
+        assert!(!second.copied && !second.failed && second.passwords_pending);
+    }
+
+    #[test]
+    fn a_plain_debug_build_does_not_migrate() {
+        let (_parent, _old, new) = installed();
+        let p = prepare(new.clone(), new.clone(), &Source::Skip);
+        assert!(!p.copied && !p.failed && !p.passwords_pending);
+        assert!(!new.join(settings::FILE_NAME).exists());
+    }
+
+    #[test]
+    fn settings_go_to_their_own_folder_when_it_is_another_one() {
+        let (parent, _old, new) = installed();
+        let config = parent.path().join("config");
+        let p = prepare(config.clone(), new.clone(), &Source::Beside);
+        assert!(p.copied);
+        assert!(config.join(settings::FILE_NAME).exists());
+        assert!(!new.join(settings::FILE_NAME).exists());
+        assert!(new.join(DATABASE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_start_keeps_its_data_aside_and_the_next_start_migrates() {
+        use std::os::unix::fs::PermissionsExt;
+        let (parent, _old, new) = installed();
+        let locked = parent
+            .path()
+            .join(OLD_IDENTIFIER)
+            .join("extra")
+            .join("note.txt");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let failed = prepare(new.clone(), new.clone(), &Source::Beside);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(failed.failed && !failed.copied && !failed.passwords_pending);
+        assert_eq!(failed.data_dir, unmigrated_dir(&new));
+        assert_eq!(failed.config_dir, unmigrated_dir(&new));
+        // That start opens its (empty) catalog and saves settings aside.
+        drop(Catalog::open(&failed.data_dir.join(DATABASE)).unwrap());
+        fs::write(failed.config_dir.join(settings::FILE_NAME), "{}").unwrap();
+        assert!(!new.join(DATABASE).exists());
+
+        let next = prepare(new.clone(), new.clone(), &Source::Beside);
+        assert!(next.copied && !next.failed && next.passwords_pending);
+        assert_eq!(next.data_dir, new);
+        assert!(
+            !unmigrated_dir(&new).exists(),
+            "the throwaway folder is gone"
+        );
+        assert!(!Catalog::open(&new.join(DATABASE))
+            .unwrap()
+            .is_empty()
+            .unwrap());
+        assert_eq!(
+            Settings::load(&new.join(settings::FILE_NAME))
+                .unwrap()
+                .primary
+                .host,
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn the_password_step_runs_once_after_the_files() {
+        let (_parent, _old, new) = installed();
+        let old = MemoryStore::default();
+        old.put(1, "10.0.0.1", "music", "pw1");
+        let keychain = MemoryStore::default();
+        let s = settings_with_libraries();
+        assert_eq!(
+            passwords_step(&new, &old, &keychain, &s),
+            None,
+            "no files yet"
+        );
+        prepare(new.clone(), new.clone(), &Source::Beside);
+        let done = passwords_step(&new, &old, &keychain, &s).unwrap();
+        assert_eq!(done.copied, 1);
+        assert!(!passwords_pending(&new));
+        assert_eq!(passwords_step(&new, &old, &keychain, &s), None);
+        assert_eq!(keychain.accounts(), ["library-1/10.0.0.1/music"]);
+    }
+
+    #[test]
+    fn with_nothing_set_up_the_password_step_reads_no_keychain() {
+        let (_parent, _old, new) = installed();
+        prepare(new.clone(), new.clone(), &Source::Beside);
+        let old = Refusing::default();
+        let keychain = MemoryStore::default();
+        let done = passwords_step(&new, &old, &keychain, &Settings::default()).unwrap();
+        assert_eq!(done, Passwords::default());
+        assert!(old.prompts.lock().unwrap().is_empty());
+        assert_eq!(keychain.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!passwords_pending(&new));
+    }
+
+    /// The copy of a library the size of the owner's (59,000 tracks), in a
+    /// release build: `cargo test --release -p fxmp copy_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn copy_time_of_a_large_library() {
+        let old = tempfile::tempdir().unwrap();
+        fs::write(old.path().join(settings::FILE_NAME), "{}").unwrap();
+        let mut catalog = Catalog::open(&old.path().join(DATABASE)).unwrap();
+        catalog
+            .transaction(|c| {
+                for i in 0..59_000 {
+                    let meta = TrackMeta {
+                        artist: Some(format!("Some Artist Name {}", i / 120)),
+                        album: Some(format!("A Fairly Long Album Title {}", i / 12)),
+                        title: Some(format!("The Title Of Track Number {i}")),
+                        raw_genre: Some("Progressive Trance".into()),
+                        duration_ms: Some(240_000),
+                        year: Some(1990 + (i % 30) as u16),
+                        ..Default::default()
+                    };
+                    let path = format!(
+                        "MP3/Some Artist Name {}/A Fairly Long Album Title {} ({})/{:02} - The \
+                         Title Of Track Number {i}.mp3",
+                        i / 120,
+                        i / 12,
+                        1990 + i % 30,
+                        i % 12
+                    );
+                    c.upsert_track(fxmp_core::DEFAULT_LIBRARY, &path, 9_000_000, 1, &meta)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let size = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let (db, wal) = (
+            size(&old.path().join(DATABASE)),
+            size(&old.path().join("catalog.db-wal")),
+        );
+        for run in 1..=3 {
+            let new = tempfile::tempdir().unwrap();
+            let started = std::time::Instant::now();
+            let files = migrate_files(old.path(), new.path()).unwrap();
+            let copy = started.elapsed();
+            let started = std::time::Instant::now();
+            assert!(!Catalog::open(&new.path().join(DATABASE))
+                .unwrap()
+                .is_empty()
+                .unwrap());
+            println!(
+                "run {run}: db {db} B + wal {wal} B, {files:?}: copy {copy:?}, first open {:?}",
+                started.elapsed()
+            );
+        }
     }
 }
