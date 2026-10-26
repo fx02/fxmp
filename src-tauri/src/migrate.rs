@@ -631,10 +631,20 @@ mod tests {
                 if meta.is_dir() {
                     stack.push(e.path());
                 } else {
-                    out.insert(
-                        e.path().strip_prefix(dir).unwrap().to_path_buf(),
-                        (fs::read(e.path()).unwrap(), meta.modified().unwrap()),
-                    );
+                    let name = e.path().strip_prefix(dir).unwrap().to_path_buf();
+                    // The fixture's still-open SQLite connection owns -shm, and on
+                    // Windows NTFS updates the times of its open WAL/shm files
+                    // lazily. Compare those by content only.
+                    let live = name.to_string_lossy().ends_with("-shm")
+                        || name.to_string_lossy().ends_with("-wal");
+                    let time = if live {
+                        SystemTime::UNIX_EPOCH
+                    } else {
+                        meta.modified().unwrap()
+                    };
+                    if !name.to_string_lossy().ends_with("-shm") {
+                        out.insert(name, (fs::read(e.path()).unwrap(), time));
+                    }
                 }
             }
         }
