@@ -41,6 +41,51 @@ up in `target/universal-apple-darwin/release/bundle/dmg/`. The Rust version is
 pinned in `rust-toolchain.toml`. The icons are generated with
 `src-tauri/icons/gen_app_icon.py` + `cargo tauri icon`.
 
+## Moving from SMB Music Player
+
+fxmp was called SMB Music Player before. Quit SMB Music Player (menu bar menu →
+Quit) before the first start of fxmp. On its first start fxmp brings over what
+the old app had:
+
+- **Files**: when fxmp has no settings and no library yet and the old app's
+  folder (`~/Library/Application Support/hr.pvt.smb-music-player`, on Windows
+  `%APPDATA%\hr.pvt.smb-music-player`) exists, fxmp copies everything in it
+  (settings, library, playlist, bans) into its own folder (see
+  [Where the app keeps its data](#where-the-app-keeps-its-data)). If the old app
+  writes meanwhile, the copy is taken again. A file
+  `migrated-from-smb-music-player` in fxmp's folder records that this was done,
+  so it happens once.
+- **Passwords**: each server's password is read from the old keychain service
+  `smb-music-player` and written to `fxmp`, then read back. macOS asks whether
+  fxmp may read each of the old app's entries (once per entry): choose
+  **Allow** or **Always Allow**. If you refuse, nothing is lost: fxmp asks for
+  that password in Settings, as for any password it does not have.
+- **Start at login**: if it was on, fxmp sets up its own login item and removes
+  the old app's (`~/Library/LaunchAgents/SMB Music Player.plist`; on Windows the
+  `SMB Music Player` value under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+
+The old app's folder and keychain entries are not changed or deleted, so SMB
+Music Player keeps working. Once fxmp works, you can remove the old app: drag
+`SMB Music Player.app` to the Bin, delete its folder above, and delete its
+keychain entries (Keychain Access, search for `smb-music-player`, or
+`security delete-generic-password -s smb-music-player` once per entry). If fxmp
+already had data of its own when it first started, nothing is copied; to copy
+anyway, quit fxmp, delete its folder and start it again.
+
+## Where the app keeps its data
+
+| What | macOS | Windows |
+| --- | --- | --- |
+| Settings (`settings.json`) | `~/Library/Application Support/hr.pvt.fxmp/` | `%APPDATA%\hr.pvt.fxmp\` |
+| Library, playlist, bans, play history (`catalog.db`, with `catalog.db-wal`/`-shm`) | the same folder | the same folder |
+| Passwords | keychain, service `fxmp` | Credential Manager (Windows credentials), service `fxmp` |
+| Window cache (WebView) | `~/Library/WebKit/hr.pvt.fxmp/`, `~/Library/Caches/hr.pvt.fxmp/` | `%LOCALAPPDATA%\hr.pvt.fxmp\` |
+| Log | no file: written to the standard error output; to see it, start the app from Terminal: `/Applications/fxmp.app/Contents/MacOS/fxmp` (`RUST_LOG=debug` for more) | no file, and a release build has no console, so the log is not visible |
+
+A debug build with `SMP_DATA_DIR` keeps everything in that folder instead (see
+[Live tests and testing](#live-tests-and-testing)).
+
 ## First setup
 
 On first launch a window opens. In **Settings** enter:
@@ -299,6 +344,8 @@ The language then appears in Settings → Language.
 
 ## Known limitations
 
+Planned work is listed in [docs/ROADMAP.md](docs/ROADMAP.md).
+
 - The app is not signed (see `xattr` above).
 - Gapless is not sample-accurate (the handover between tracks is not exact to the sample).
 - Listing the folder on the server takes 15–40 s and shows no progress.
@@ -345,6 +392,15 @@ Release builds ignore the variable.
 ```sh
 SMP_DATA_DIR=$(mktemp -d) cargo run -p fxmp
 # afterwards: rm -rf that folder; security delete-generic-password -s fxmp-dev
+```
+
+Such a build migrates from SMB Music Player only from the folder in
+`SMP_MIGRATE_FROM` (and from the old keychain service `smb-music-player-dev`),
+never from the installed old app's data, so the migration can be tried on
+copies:
+
+```sh
+SMP_DATA_DIR=$(mktemp -d) SMP_MIGRATE_FROM=/path/to/a/copy cargo run -p fxmp
 ```
 CI (`.github/workflows/build.yml`, on push to `main` and `feat/**` branches,
 and manually) runs the tests and builds the macOS `.dmg` and the Windows
