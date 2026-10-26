@@ -1,7 +1,7 @@
 //! Manual smoke test: plays the first three audio files of a folder through the default
 //! output device with a 5 s crossfade.
 //!
-//! cargo run -p smp-core --example play_local -- <dir> [max_secs]
+//! cargo run -p fxmp-core --example play_local -- <dir> [max_secs]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,11 +9,11 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use smp_core::audio::output::{CpalSink, Sink, SinkFactory};
-use smp_core::audio::player::{Command, Event, PlayItem, Player, PlayerConfig, TrackProvider};
-use smp_core::failure::Failure;
-use smp_core::source::{LocalSource, MusicSource};
-use smp_core::{Result, TrackId};
+use fxmp_core::audio::output::{CpalSink, Sink, SinkFactory};
+use fxmp_core::audio::player::{Command, Event, PlayItem, Player, PlayerConfig, TrackProvider};
+use fxmp_core::failure::Failure;
+use fxmp_core::source::{LocalSource, MusicSource};
+use fxmp_core::{Result, TrackId};
 
 struct Queue(VecDeque<PlayItem>);
 
@@ -55,7 +55,7 @@ fn main() {
         .enumerate()
         .map(|(i, rel_path)| PlayItem {
             id: i as TrackId + 1,
-            library: smp_core::DEFAULT_LIBRARY,
+            library: fxmp_core::DEFAULT_LIBRARY,
             rel_path,
             gain_db: 0.0,
             start_ms: 0,

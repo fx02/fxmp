@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
-use smp_core::audio::player::Command;
-use smp_core::TrackId;
+use fxmp_core::audio::player::Command;
+use fxmp_core::TrackId;
 #[cfg(target_os = "macos")]
 use souvlaki::{MediaControlEvent, PlatformConfig};
 use souvlaki::{MediaControls, MediaMetadata, MediaPlayback};
@@ -54,8 +54,8 @@ fn create_controls(_app: &AppHandle) -> Result<MediaControls, String> {
 #[cfg(target_os = "macos")]
 fn create_controls(app: &AppHandle) -> Result<MediaControls, String> {
     let mut controls = MediaControls::new(PlatformConfig {
-        display_name: "SMB Music Player",
-        dbus_name: "hr.pvt.smb_music_player",
+        display_name: "fxmp",
+        dbus_name: "hr.pvt.fxmp",
         hwnd: None,
     })
     .map_err(|e| format!("{e:?}"))?;

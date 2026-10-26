@@ -5,12 +5,12 @@
 
 use std::sync::mpsc::{self, Sender};
 
-use smp_core::catalog::Catalog;
+use fxmp_core::catalog::Catalog;
 
 type Job = Box<dyn FnOnce(&mut Catalog) + Send>;
 
-fn writer_gone() -> smp_core::Error {
-    smp_core::Error::Other("catalog writer stopped".into())
+fn writer_gone() -> fxmp_core::Error {
+    fxmp_core::Error::Other("catalog writer stopped".into())
 }
 
 #[derive(Clone)]
@@ -40,7 +40,7 @@ impl CatalogWriter {
     pub fn send(
         &self,
         what: &'static str,
-        f: impl FnOnce(&mut Catalog) -> smp_core::Result<()> + Send + 'static,
+        f: impl FnOnce(&mut Catalog) -> fxmp_core::Result<()> + Send + 'static,
     ) {
         let job: Job = Box::new(move |c| {
             if let Err(e) = f(c) {
@@ -56,8 +56,8 @@ impl CatalogWriter {
     /// the audio engine thread.
     pub fn call<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Catalog) -> smp_core::Result<T> + Send + 'static,
-    ) -> smp_core::Result<T> {
+        f: impl FnOnce(&mut Catalog) -> fxmp_core::Result<T> + Send + 'static,
+    ) -> fxmp_core::Result<T> {
         let rx = self.queue_call(f)?;
         rx.recv().map_err(|_| writer_gone())?
     }
@@ -66,13 +66,13 @@ impl CatalogWriter {
     pub fn call_timeout<T: Send + 'static>(
         &self,
         wait: std::time::Duration,
-        f: impl FnOnce(&mut Catalog) -> smp_core::Result<T> + Send + 'static,
-    ) -> smp_core::Result<T> {
+        f: impl FnOnce(&mut Catalog) -> fxmp_core::Result<T> + Send + 'static,
+    ) -> fxmp_core::Result<T> {
         let rx = self.queue_call(f)?;
         match rx.recv_timeout(wait) {
             Ok(r) => r,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err(smp_core::Error::Other("the catalog writer is busy".into()))
+                Err(fxmp_core::Error::Other("the catalog writer is busy".into()))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(writer_gone()),
         }
@@ -80,8 +80,8 @@ impl CatalogWriter {
 
     fn queue_call<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Catalog) -> smp_core::Result<T> + Send + 'static,
-    ) -> smp_core::Result<mpsc::Receiver<smp_core::Result<T>>> {
+        f: impl FnOnce(&mut Catalog) -> fxmp_core::Result<T> + Send + 'static,
+    ) -> fxmp_core::Result<mpsc::Receiver<fxmp_core::Result<T>>> {
         let (tx, rx) = mpsc::channel();
         let job: Job = Box::new(move |c| {
             let _ = tx.send(f(c));
@@ -97,14 +97,14 @@ mod tests {
 
     #[test]
     fn clearing_through_the_writer_empties_what_readers_see() {
-        use smp_core::catalog::TrackMeta;
+        use fxmp_core::catalog::TrackMeta;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("catalog.db");
         let reader = Catalog::open(&path).unwrap();
         let w = CatalogWriter::spawn(Catalog::open(&path).unwrap()).unwrap();
         w.call(|c| {
             let id = c.upsert_track(
-                smp_core::DEFAULT_LIBRARY,
+                fxmp_core::DEFAULT_LIBRARY,
                 "a.mp3",
                 1,
                 1,
@@ -145,11 +145,11 @@ mod tests {
         w.call(|c| {
             for p in ["1.mp3", "2.mp3"] {
                 c.upsert_track(
-                    smp_core::DEFAULT_LIBRARY,
+                    fxmp_core::DEFAULT_LIBRARY,
                     p,
                     1,
                     1,
-                    &smp_core::catalog::TrackMeta::default(),
+                    &fxmp_core::catalog::TrackMeta::default(),
                 )?;
             }
             Ok(())
@@ -165,14 +165,14 @@ mod tests {
         let w = CatalogWriter::spawn(Catalog::open_in_memory().unwrap()).unwrap();
         w.call(|c| {
             for p in ["1.mp3", "2.mp3"] {
-                c.upsert_track(1, p, 1, 1, &smp_core::catalog::TrackMeta::default())?;
+                c.upsert_track(1, p, 1, 1, &fxmp_core::catalog::TrackMeta::default())?;
             }
             Ok(())
         })
         .unwrap();
         w.send("bug", |_| panic!("a bug in a write"));
         // One that panics inside a transaction leaves none open behind it.
-        let r: smp_core::Result<()> = w.call(|c| {
+        let r: fxmp_core::Result<()> = w.call(|c| {
             c.transaction(|c| {
                 c.set_last_first("k", 1)?;
                 panic!("a bug mid-transaction")

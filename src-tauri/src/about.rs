@@ -8,7 +8,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::i18n;
 
 /// The project page; the only non-lookup URL the app opens.
-pub const PROJECT_URL: &str = "https://github.com/fx02/smb-music-player";
+pub const PROJECT_URL: &str = "https://github.com/fx02/fxmp";
 /// Short commit hash, or "unknown" when built without git.
 pub const COMMIT: &str = env!("SMP_GIT_HASH");
 /// UTC build date, `YYYY-MM-DD`.
@@ -21,11 +21,11 @@ pub struct About {
     pub commit: String,
     pub build_date: String,
     pub url: &'static str,
-    /// "SMB Music Player 0.1.0 (abc1234, 2026-10-25)": "Copy version", the tray.
+    /// "fxmp 0.1.0 (abc1234, 2026-10-25)": "Copy version", the tray.
     pub text: String,
 }
 
-/// "SMB Music Player 0.1.0 (abc1234, 2026-10-25)".
+/// "fxmp 0.1.0 (abc1234, 2026-10-25)".
 pub fn version_text(name: &str, version: &str, commit: &str, date: &str) -> String {
     format!("{name} {version} ({commit}, {date})")
 }
@@ -63,8 +63,8 @@ mod tests {
     #[test]
     fn the_version_line_names_the_commit_and_the_date() {
         assert_eq!(
-            version_text("SMB Music Player", "0.1.0", "abc1234", "2026-10-25"),
-            "SMB Music Player 0.1.0 (abc1234, 2026-10-25)"
+            version_text("fxmp", "0.1.0", "abc1234", "2026-10-25"),
+            "fxmp 0.1.0 (abc1234, 2026-10-25)"
         );
     }
 
@@ -90,12 +90,12 @@ mod tests {
         for url in [
             "https://github.com/",
             "https://github.com/fx02",
-            "https://github.com/fx02/smb-music-player/releases",
-            "https://github.com/fx02/smb-music-player-evil",
-            "http://github.com/fx02/smb-music-player",
-            "https://github.com:443/fx02/smb-music-player?x=1",
-            "https://github.com/fx02/smb-music-player#x",
-            "https://gist.github.com/fx02/smb-music-player",
+            "https://github.com/fx02/fxmp/releases",
+            "https://github.com/fx02/fxmp-evil",
+            "http://github.com/fx02/fxmp",
+            "https://github.com:443/fx02/fxmp?x=1",
+            "https://github.com/fx02/fxmp#x",
+            "https://gist.github.com/fx02/fxmp",
         ] {
             assert!(!crate::lookup::is_allowed(url), "{url}");
         }

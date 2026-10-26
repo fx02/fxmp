@@ -13,7 +13,7 @@ use crate::credentials;
 pub const ENV: &str = "SMP_DATA_DIR";
 
 /// The keychain service used with a data folder override.
-pub const DEV_SERVICE: &str = "smb-music-player-dev";
+pub const DEV_SERVICE: &str = "fxmp-dev";
 
 /// The folder to use instead of the app's own: only in a debug build and only for
 /// a non-empty `value`.
@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn an_override_keeps_passwords_apart_from_the_real_ones() {
         assert_eq!(keychain_service(false), credentials::SERVICE);
-        assert_eq!(keychain_service(true), "smb-music-player-dev");
+        assert_eq!(keychain_service(true), "fxmp-dev");
         assert_ne!(keychain_service(true), credentials::SERVICE);
     }
 }

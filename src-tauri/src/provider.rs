@@ -8,12 +8,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use smp_core::audio::dsp::track_gain_db;
-use smp_core::audio::player::{PlayItem, TrackProvider};
-use smp_core::catalog::{selection_key, Catalog};
-use smp_core::failure::{FailCode, Failure};
-use smp_core::source::Which;
-use smp_core::{LibraryId, TrackId};
+use fxmp_core::audio::dsp::track_gain_db;
+use fxmp_core::audio::player::{PlayItem, TrackProvider};
+use fxmp_core::catalog::{selection_key, Catalog};
+use fxmp_core::failure::{FailCode, Failure};
+use fxmp_core::source::Which;
+use fxmp_core::{LibraryId, TrackId};
 
 use crate::playlist::{Selection, SharedPlaylist, RESUME_RETRIES};
 use crate::state::lock;
@@ -209,8 +209,8 @@ impl TrackProvider for CatalogProvider {
 mod tests {
     use super::*;
     use crate::playlist::{album_queue, genres_queue};
-    use smp_core::catalog::TrackMeta;
-    use smp_core::failure::FailCode;
+    use fxmp_core::catalog::TrackMeta;
+    use fxmp_core::failure::FailCode;
     use std::time::{Duration, Instant};
 
     /// As the player does: ask for the next track, then start it.
@@ -239,7 +239,7 @@ mod tests {
             raw_genre: Some(genre.into()),
             ..Default::default()
         };
-        cat.upsert_track(smp_core::DEFAULT_LIBRARY, path, 1, 1, &meta)
+        cat.upsert_track(fxmp_core::DEFAULT_LIBRARY, path, 1, 1, &meta)
             .unwrap()
     }
 
@@ -304,17 +304,17 @@ mod tests {
     #[derive(Default)]
     struct FakeLibraries {
         lib2_offline: std::sync::atomic::AtomicBool,
-        rechecks: Mutex<Vec<smp_core::LibraryId>>,
+        rechecks: Mutex<Vec<fxmp_core::LibraryId>>,
     }
 
     impl LibraryHealth for FakeLibraries {
-        fn active_server(&self, _: smp_core::LibraryId) -> Option<Which> {
+        fn active_server(&self, _: fxmp_core::LibraryId) -> Option<Which> {
             Some(Which::Secondary)
         }
-        fn offline(&self, library: smp_core::LibraryId) -> bool {
+        fn offline(&self, library: fxmp_core::LibraryId) -> bool {
             library == 2 && self.lib2_offline.load(std::sync::atomic::Ordering::SeqCst)
         }
-        fn recheck(&self, library: smp_core::LibraryId) {
+        fn recheck(&self, library: fxmp_core::LibraryId) {
             lock(&self.rechecks).push(library);
         }
         fn any_online(&self) -> bool {
@@ -325,10 +325,10 @@ mod tests {
     /// Nothing answers at all.
     struct AllDown;
     impl LibraryHealth for AllDown {
-        fn active_server(&self, _: smp_core::LibraryId) -> Option<Which> {
+        fn active_server(&self, _: fxmp_core::LibraryId) -> Option<Which> {
             None
         }
-        fn offline(&self, _: smp_core::LibraryId) -> bool {
+        fn offline(&self, _: fxmp_core::LibraryId) -> bool {
             true
         }
         fn any_online(&self) -> bool {
@@ -358,7 +358,7 @@ mod tests {
         let list = SharedPlaylist::default();
         lock(&list).replace(
             Selection::Manual,
-            smp_core::queue::Queue::fixed(&ids, smp_core::shuffle::entropy_rng()),
+            fxmp_core::queue::Queue::fixed(&ids, fxmp_core::shuffle::entropy_rng()),
         );
         let ctx = Playback {
             libraries: health.clone(),
@@ -381,7 +381,7 @@ mod tests {
         let list = SharedPlaylist::default();
         lock(&list).replace(
             Selection::Manual,
-            smp_core::queue::Queue::fixed(&ids[..2], smp_core::shuffle::entropy_rng()),
+            fxmp_core::queue::Queue::fixed(&ids[..2], fxmp_core::shuffle::entropy_rng()),
         );
         let ctx = Playback {
             libraries: Arc::new(AllDown),
@@ -441,7 +441,7 @@ mod tests {
         let list = SharedPlaylist::default();
         lock(&list).replace(
             Selection::Manual,
-            smp_core::queue::Queue::fixed(&[on_disk, on_nas], smp_core::shuffle::entropy_rng()),
+            fxmp_core::queue::Queue::fixed(&[on_disk, on_nas], fxmp_core::shuffle::entropy_rng()),
         );
         let mut p = CatalogProvider::new(ctx, list.clone());
         // The disk is unplugged: its file is "not found", but that is not the file's fault.
@@ -493,7 +493,7 @@ mod tests {
         let list = SharedPlaylist::default();
         lock(&list).replace(
             Selection::Manual,
-            smp_core::queue::Queue::fixed(&[off, on], smp_core::shuffle::entropy_rng()),
+            fxmp_core::queue::Queue::fixed(&[off, on], fxmp_core::shuffle::entropy_rng()),
         );
         let mut p = CatalogProvider::new(fx.ctx.clone(), list);
         let item = take_item(&mut p);
@@ -606,7 +606,7 @@ mod tests {
         };
         let rg = fx
             .query
-            .upsert_track(smp_core::DEFAULT_LIBRARY, "a.mp3", 1, 1, &meta)
+            .upsert_track(fxmp_core::DEFAULT_LIBRARY, "a.mp3", 1, 1, &meta)
             .unwrap();
         let measured = track(&fx.query, "b.mp3", "Pop", None);
         fx.query.set_measured_lufs(measured, -24.0).unwrap();

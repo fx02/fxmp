@@ -7,8 +7,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use fxmp_core::{LibraryId, DEFAULT_LIBRARY};
 use serde::{Deserialize, Deserializer, Serialize};
-use smp_core::{LibraryId, DEFAULT_LIBRARY};
 
 use crate::i18n;
 
@@ -603,7 +603,7 @@ mod tests {
         let s = Settings::default();
         let libs = s.all_libraries();
         assert_eq!(libs.len(), 1);
-        assert_eq!(libs[0].id, smp_core::DEFAULT_LIBRARY);
+        assert_eq!(libs[0].id, fxmp_core::DEFAULT_LIBRARY);
         assert!(libs[0].enabled);
         assert_eq!(
             libs[0].source,

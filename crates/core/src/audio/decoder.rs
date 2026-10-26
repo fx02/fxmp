@@ -595,7 +595,7 @@ mod tests {
     }
 
     /// The per-track DSP path at release speed (decode, resample 44.1 → 48 kHz,
-    /// loudness meter, gain, ceiling): `cargo test --release -p smp-core
+    /// loudness meter, gain, ceiling): `cargo test --release -p fxmp-core
     /// dsp_throughput -- --ignored --nocapture`. Prints the median of 5 runs.
     #[test]
     #[ignore = "benchmark; run in release"]

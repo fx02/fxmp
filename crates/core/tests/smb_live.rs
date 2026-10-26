@@ -6,7 +6,7 @@
 //! `SMB_TEST2_HOST` is set, also against the secondary one (`SMB_TEST2_*`, blank
 //! values fall back to the primary's).
 //!
-//! Run with: `cargo test -p smp-core --test smb_live -- --ignored --test-threads=1`
+//! Run with: `cargo test -p fxmp-core --test smb_live -- --ignored --test-threads=1`
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -14,11 +14,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use smp_core::catalog::Catalog;
-use smp_core::scan::{scan, scan_with, ScanOptions};
-use smp_core::source::smb::{SmbConfig, SmbSource};
-use smp_core::source::{FileEntry, MusicSource, SourceError, WalkReport};
-use smp_core::Error;
+use fxmp_core::catalog::Catalog;
+use fxmp_core::scan::{scan, scan_with, ScanOptions};
+use fxmp_core::source::smb::{SmbConfig, SmbSource};
+use fxmp_core::source::{FileEntry, MusicSource, SourceError, WalkReport};
+use fxmp_core::Error;
 
 const CHUNK: usize = 64 * 1024;
 
@@ -74,7 +74,7 @@ fn sample_file(src: &SmbSource, min_size: u64) -> FileEntry {
         .expect("no audio file found")
 }
 
-fn read_exact_at(r: &mut dyn smp_core::source::ReadSeek, pos: u64, len: usize) -> Vec<u8> {
+fn read_exact_at(r: &mut dyn fxmp_core::source::ReadSeek, pos: u64, len: usize) -> Vec<u8> {
     assert_eq!(r.seek(SeekFrom::Start(pos)).unwrap(), pos);
     let mut buf = vec![0; len];
     r.read_exact(&mut buf).unwrap();
@@ -169,7 +169,7 @@ fn live_scan_reads_tags_sample() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
         let report = scan(
-            smp_core::DEFAULT_LIBRARY,
+            fxmp_core::DEFAULT_LIBRARY,
             &src,
             &mut cat,
             &mut |p| {
@@ -238,7 +238,7 @@ impl MusicSource for Sample<'_> {
         self.files.iter().cloned().for_each(on_entry);
         Ok(WalkReport::default())
     }
-    fn open(&self, rel_path: &str) -> Result<Box<dyn smp_core::source::ReadSeek>, SourceError> {
+    fn open(&self, rel_path: &str) -> Result<Box<dyn fxmp_core::source::ReadSeek>, SourceError> {
         self.src.open(rel_path)
     }
     fn describe(&self) -> String {
@@ -266,7 +266,7 @@ fn live_scan_timing() {
         let mut cat = Catalog::open_in_memory().unwrap();
         let started = Instant::now();
         let report = scan_with(
-            smp_core::DEFAULT_LIBRARY,
+            fxmp_core::DEFAULT_LIBRARY,
             &sample,
             &mut cat,
             &mut |_| {},

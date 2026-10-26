@@ -6,12 +6,12 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use fxmp_core::audio::output::list_output_devices;
+use fxmp_core::audio::player::Command;
+use fxmp_core::genre::{known_genre, known_genre_names};
+use fxmp_core::source::Which;
+use fxmp_core::{LibraryId, TrackId, DEFAULT_LIBRARY};
 use serde::{Deserialize, Serialize};
-use smp_core::audio::output::list_output_devices;
-use smp_core::audio::player::Command;
-use smp_core::genre::{known_genre, known_genre_names};
-use smp_core::source::Which;
-use smp_core::{LibraryId, TrackId, DEFAULT_LIBRARY};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::about;
@@ -69,7 +69,7 @@ pub fn spawn_action(
     }
 }
 
-fn db_err(e: smp_core::Error) -> String {
+fn db_err(e: fxmp_core::Error) -> String {
     log::warn!("catalog: {e}");
     i18n::tf("err.database", &[("error", &e.to_string())])
 }
@@ -1137,7 +1137,7 @@ pub async fn playlist_move(app: AppHandle, from: usize, to: usize, id: TrackId) 
 pub async fn playlist_new(app: AppHandle) -> CmdResult<()> {
     run(app, |app, st| {
         edit_playlist(app, st, |l| {
-            let empty = smp_core::queue::Queue::fixed(&[], smp_core::shuffle::entropy_rng());
+            let empty = fxmp_core::queue::Queue::fixed(&[], fxmp_core::shuffle::entropy_rng());
             l.replace(Selection::Manual, empty);
             Ok(())
         })
@@ -1778,7 +1778,7 @@ mod tests {
 
     use crate::credentials::{CredentialStore, MemoryStore};
     use crate::settings::SettingsStore;
-    use smp_core::source::Which;
+    use fxmp_core::source::Which;
 
     fn two_servers() -> Settings {
         Settings {
@@ -2000,11 +2000,11 @@ mod tests {
     use crate::state::{resume_with, start_with};
 
     struct NoTracks;
-    impl smp_core::audio::player::TrackProvider for NoTracks {
-        fn next_track(&mut self) -> Option<smp_core::audio::player::PlayItem> {
+    impl fxmp_core::audio::player::TrackProvider for NoTracks {
+        fn next_track(&mut self) -> Option<fxmp_core::audio::player::PlayItem> {
             None
         }
-        fn on_failed(&mut self, _: TrackId, _: &smp_core::failure::Failure) {}
+        fn on_failed(&mut self, _: TrackId, _: &fxmp_core::failure::Failure) {}
         fn on_played(&mut self, _: TrackId, _: Option<f32>) {}
     }
 

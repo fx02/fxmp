@@ -2003,6 +2003,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "fxmp"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "fxmp-core",
+ "keyring",
+ "log",
+ "objc2-app-kit",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "souvlaki",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-clipboard-manager",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "fxmp-core"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "ebur128",
+ "futures-util",
+ "lofty",
+ "log",
+ "rand 0.8.8",
+ "rtrb",
+ "rubato",
+ "rusqlite",
+ "smb",
+ "symphonia",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "gdk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5558,32 +5604,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smb-music-player"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "keyring",
- "log",
- "objc2-app-kit",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "smp-core",
- "souvlaki",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-clipboard-manager",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-opener",
- "tauri-plugin-single-instance",
- "tempfile",
- "tokio",
- "windows-sys 0.60.2",
-]
-
-[[package]]
 name = "smb-rpc"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5608,26 +5628,6 @@ dependencies = [
  "log",
  "maybe-async",
  "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
-name = "smp-core"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "ebur128",
- "futures-util",
- "lofty",
- "log",
- "rand 0.8.8",
- "rtrb",
- "rubato",
- "rusqlite",
- "smb",
- "symphonia",
- "tempfile",
- "thiserror 1.0.69",
  "tokio",
 ]
 

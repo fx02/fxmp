@@ -11,16 +11,16 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use rand::rngs::StdRng;
-use serde::{Deserialize, Serialize};
-use smp_core::catalog::{
+use fxmp_core::catalog::{
     selection_key, Catalog, PlaylistCursor, SavedPlaylist, TrackFilter, TrackRow, YearCount,
 };
-use smp_core::genre::UNKNOWN_KEY;
-use smp_core::m3u::{M3uTrack, M3uWriter};
-use smp_core::queue::{Entry, Queue, QueueState};
-use smp_core::shuffle::entropy_rng;
-use smp_core::TrackId;
+use fxmp_core::genre::UNKNOWN_KEY;
+use fxmp_core::m3u::{M3uTrack, M3uWriter};
+use fxmp_core::queue::{Entry, Queue, QueueState};
+use fxmp_core::shuffle::entropy_rng;
+use fxmp_core::TrackId;
+use rand::rngs::StdRng;
+use serde::{Deserialize, Serialize};
 
 use crate::i18n;
 use crate::state::lock;
@@ -144,14 +144,14 @@ impl Playlist {
 
 /// A fresh shuffle of the playable tracks in `keys` (empty = everything), not
 /// starting with the first track of the last run of the same selection.
-pub fn genres_queue(query: &Catalog, keys: &[String]) -> smp_core::Result<Queue<StdRng>> {
+pub fn genres_queue(query: &Catalog, keys: &[String]) -> fxmp_core::Result<Queue<StdRng>> {
     let pool = query.playable_tracks(keys)?;
     let avoid = query.last_first(&selection_key(keys))?;
     Ok(Queue::shuffled(&pool, avoid, entropy_rng()))
 }
 
 /// An album in track order, without banned tracks.
-pub fn album_queue(query: &Catalog, artist: &str, album: &str) -> smp_core::Result<Queue<StdRng>> {
+pub fn album_queue(query: &Catalog, artist: &str, album: &str) -> fxmp_core::Result<Queue<StdRng>> {
     let banned: HashSet<TrackId> = query.banned()?.into_iter().map(|t| t.id).collect();
     let tracks: Vec<TrackId> = query
         .album_tracks(artist, album)?
@@ -165,7 +165,7 @@ pub fn album_queue(query: &Catalog, artist: &str, album: &str) -> smp_core::Resu
 fn matching(
     query: &Catalog,
     filter: Option<&QueueFilter>,
-) -> smp_core::Result<Option<HashSet<TrackId>>> {
+) -> fxmp_core::Result<Option<HashSet<TrackId>>> {
     match filter.filter(|f| !f.is_empty()) {
         None => Ok(None),
         Some(f) => Ok(Some(
@@ -183,7 +183,7 @@ pub fn filtered_queue(
     query: &Catalog,
     list: &SharedPlaylist,
     filter: &QueueFilter,
-) -> smp_core::Result<(Selection, Queue<StdRng>)> {
+) -> fxmp_core::Result<(Selection, Queue<StdRng>)> {
     let (order, base, current) = {
         let l = lock(list);
         (
@@ -312,7 +312,7 @@ pub fn page(
     offset: usize,
     limit: usize,
     filter: Option<&QueueFilter>,
-) -> smp_core::Result<PlaylistPage> {
+) -> fxmp_core::Result<PlaylistPage> {
     let limit = limit.min(MAX_PAGE);
     let filtered = filter.is_some_and(|f| !f.is_empty());
     let (entries, count, cursor, current_index, current_id, selection, shuffle, version) = {
@@ -427,7 +427,7 @@ pub fn facets(
     list: &SharedPlaylist,
     query: &Mutex<Catalog>,
     lang: &str,
-) -> smp_core::Result<PlaylistFacets> {
+) -> fxmp_core::Result<PlaylistFacets> {
     let ids: Vec<TrackId> = lock(list).queue.order().iter().map(|e| e.id).collect();
     let f = lock(query).facets(&ids)?;
     Ok(PlaylistFacets {
@@ -548,7 +548,7 @@ pub struct SaveJob {
 impl SaveJob {
     /// Writes the order (if any) and the cursor together; the order counts as
     /// saved only once this succeeded.
-    pub fn run(self, c: &Catalog) -> smp_core::Result<()> {
+    pub fn run(self, c: &Catalog) -> fxmp_core::Result<()> {
         let order = self
             .order
             .as_ref()
@@ -594,7 +594,7 @@ pub fn save_job(list: &SharedPlaylist, position: Option<(TrackId, u64)>) -> Save
 /// The saved playlist as it was, without tracks that are gone or banned meanwhile,
 /// or left out of the shuffle (unless added by hand). Its current track is due again at its position, unless the playlist
 /// had ended or that track is gone (then the next one is due, from its start).
-pub fn restore(query: &Catalog, saved: SavedPlaylist) -> smp_core::Result<Playlist> {
+pub fn restore(query: &Catalog, saved: SavedPlaylist) -> fxmp_core::Result<Playlist> {
     let selection = serde_json::from_str(&saved.selection).unwrap_or(Selection::Manual);
     let resume = saved.cursor.resume;
     let state = QueueState {
@@ -648,10 +648,10 @@ mod tests {
     /// Every library reachable, read from its primary server.
     struct AllOnline;
     impl crate::provider::LibraryHealth for AllOnline {
-        fn active_server(&self, _: smp_core::LibraryId) -> Option<Which> {
+        fn active_server(&self, _: fxmp_core::LibraryId) -> Option<Which> {
             Some(Which::Primary)
         }
-        fn offline(&self, _: smp_core::LibraryId) -> bool {
+        fn offline(&self, _: fxmp_core::LibraryId) -> bool {
             false
         }
         fn any_online(&self) -> bool {
@@ -662,9 +662,9 @@ mod tests {
     use super::*;
     use crate::provider::{BannedSet, CatalogProvider, Playback};
     use crate::writer::CatalogWriter;
-    use smp_core::audio::player::TrackProvider;
-    use smp_core::catalog::TrackMeta;
-    use smp_core::source::Which;
+    use fxmp_core::audio::player::TrackProvider;
+    use fxmp_core::catalog::TrackMeta;
+    use fxmp_core::source::Which;
 
     struct Fx {
         _dir: tempfile::TempDir,
@@ -682,7 +682,7 @@ mod tests {
             year,
             ..Default::default()
         };
-        c.upsert_track(smp_core::DEFAULT_LIBRARY, path, 1, 1, &meta)
+        c.upsert_track(fxmp_core::DEFAULT_LIBRARY, path, 1, 1, &meta)
             .unwrap()
     }
 
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn three_failures_or_a_bad_file_drop_the_track_network_trouble_does_not() {
-        use smp_core::failure::{FailCode, Failure};
+        use fxmp_core::failure::{FailCode, Failure};
         let fx = Fx::new();
         let mut p = fx.play_genres(&["jazz"]);
         let ids = row_ids(&fx.page(0, 100, None));
@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn the_resume_track_survives_two_network_failures_then_the_next_one_plays() {
-        use smp_core::failure::{FailCode, Failure};
+        use fxmp_core::failure::{FailCode, Failure};
         for saved_ms in [42_000, 0] {
             let fx = Fx::new();
             let mut p = fx.play_genres(&["jazz"]);
@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn a_started_track_resets_the_resume_retries() {
-        use smp_core::failure::{FailCode, Failure};
+        use fxmp_core::failure::{FailCode, Failure};
         let fx = Fx::new();
         let mut p = fx.play_genres(&["jazz"]);
         let current = take(&mut p).unwrap();
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[test]
     fn restore_keeps_hand_added_tracks_that_failed() {
-        use smp_core::failure::{FailCode, Failure};
+        use fxmp_core::failure::{FailCode, Failure};
         let fx = Fx::new();
         let mut p = fx.play_genres(&["jazz"]);
         let current = take(&mut p).unwrap();
@@ -1056,7 +1056,7 @@ mod tests {
     #[test]
     fn a_restored_playlist_leaves_out_libraries_that_are_off_or_gone() {
         let fx = Fx::new();
-        let meta = smp_core::catalog::TrackMeta::default();
+        let meta = fxmp_core::catalog::TrackMeta::default();
         let (usb, lost) = {
             let q = lock(&fx.query);
             (

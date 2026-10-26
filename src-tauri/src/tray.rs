@@ -4,10 +4,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use smp_core::audio::output::list_output_devices;
-use smp_core::audio::player::Command;
-use smp_core::catalog::GenreCount;
-use smp_core::genre::UNKNOWN_KEY;
+use fxmp_core::audio::output::list_output_devices;
+use fxmp_core::audio::player::Command;
+use fxmp_core::catalog::GenreCount;
+use fxmp_core::genre::UNKNOWN_KEY;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -25,7 +25,7 @@ use crate::tray_click::{self, ClickAction, ClickClassifier};
 /// Genres change in bursts (every few seconds during a scan): the submenu is rebuilt
 /// once they settle for this long.
 const GENRE_MENU_DEBOUNCE: Duration = Duration::from_secs(1);
-const TOOLTIP_IDLE: &str = "SMB Music Player";
+const TOOLTIP_IDLE: &str = "fxmp";
 const ID_TOGGLE: &str = "toggle";
 const ID_PREVIOUS: &str = "previous";
 const ID_NEXT: &str = "next";

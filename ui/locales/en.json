@@ -237,6 +237,7 @@
   "tray.lookup_current": "Look up current song",
   "tray.copy_current": "Copy current song",
   "settings.about": "About",
+  "about.long_name": "fx music player",
   "about.version": "Version {version}",
   "about.build": "Build {commit}, {date}",
   "about.vibe": "Vibe coded with Claude",

@@ -7,14 +7,14 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use fxmp_core::audio::output::CpalSinkFactory;
+use fxmp_core::audio::player::{Command, Event, Player, PlayerConfig, TrackProvider};
+use fxmp_core::catalog::Catalog;
+use fxmp_core::genre::{migrate_selection, UNKNOWN_DISPLAY};
+use fxmp_core::scan::{scan_with, ScanOptions, ScanProgress};
+use fxmp_core::source::{MusicSource, SourceError, Which};
+use fxmp_core::{LibraryId, TrackId};
 use serde::{Deserialize, Serialize};
-use smp_core::audio::output::CpalSinkFactory;
-use smp_core::audio::player::{Command, Event, Player, PlayerConfig, TrackProvider};
-use smp_core::catalog::Catalog;
-use smp_core::genre::{migrate_selection, UNKNOWN_DISPLAY};
-use smp_core::scan::{scan_with, ScanOptions, ScanProgress};
-use smp_core::source::{MusicSource, SourceError, Which};
-use smp_core::{LibraryId, TrackId};
 use tauri::{AppHandle, Emitter, Listener, Manager};
 
 use crate::connection::{monitor, AppSource, ConnStatus, Libraries, StatusPayload};
@@ -762,7 +762,7 @@ pub fn apply_player_settings(player: &Player, s: &Settings) {
     player.send(Command::SetDevice(s.device.clone()));
 }
 
-fn now_playing_of(catalog: &Catalog, id: TrackId, paused: bool) -> smp_core::Result<NowPlaying> {
+fn now_playing_of(catalog: &Catalog, id: TrackId, paused: bool) -> fxmp_core::Result<NowPlaying> {
     let row = catalog.track(id)?;
     let title = playlist::track_title(&row);
     Ok(NowPlaying {
@@ -937,17 +937,17 @@ pub fn cancel_scan(st: &AppState, reason: Option<&str>) -> bool {
 
 /// Text for a failed scan, in `lang`: connection problems in the words the status
 /// uses, anything else translated around its (English) detail.
-fn scan_error_message(lang: &str, e: &smp_core::Error) -> String {
+fn scan_error_message(lang: &str, e: &fxmp_core::Error) -> String {
     match e {
-        smp_core::Error::Source(SourceError::Auth) => i18n::tr(lang, ConnStatus::Auth.text_key()),
-        smp_core::Error::Source(_) => i18n::tr(lang, ConnStatus::Unreachable.text_key()),
-        smp_core::Error::Db(_) => i18n::trf(lang, "err.database", &[("error", &e.to_string())]),
+        fxmp_core::Error::Source(SourceError::Auth) => i18n::tr(lang, ConnStatus::Auth.text_key()),
+        fxmp_core::Error::Source(_) => i18n::tr(lang, ConnStatus::Unreachable.text_key()),
+        fxmp_core::Error::Db(_) => i18n::trf(lang, "err.database", &[("error", &e.to_string())]),
         other => i18n::trf(lang, "scan.failed", &[("error", &other.to_string())]),
     }
 }
 
 /// What one library's scan added up to (see [`add_up_scans`]).
-type LibraryScan = (LibraryRef, smp_core::Result<smp_core::scan::ScanReport>);
+type LibraryScan = (LibraryRef, fxmp_core::Result<fxmp_core::scan::ScanReport>);
 
 /// The `scan-done` payload of a refresh of several libraries: the reports added up,
 /// libraries that could not be read listed (their tracks were kept), and an error
@@ -996,7 +996,7 @@ fn not_scannable(
     cancel: &AtomicBool,
 ) -> Option<String> {
     use crate::connection::{wait_check, LibraryKind, PROBE_TIMEOUT};
-    if !ready && lib.id != smp_core::DEFAULT_LIBRARY {
+    if !ready && lib.id != fxmp_core::DEFAULT_LIBRARY {
         return Some(i18n::t("err.catalog_pending"));
     }
     if !matches!(lib.kind, LibraryKind::Local { .. }) {
@@ -1055,7 +1055,7 @@ fn run_scan(app: &AppHandle) {
         progress(&ScanProgress::default());
         if let Some(reason) = not_scannable(lib, ready, &st.cancel_scan) {
             log::warn!("library {} not scanned: {reason}", lib.id);
-            scans.push((library, Err(smp_core::Error::Other(reason))));
+            scans.push((library, Err(fxmp_core::Error::Other(reason))));
             continue;
         }
         let result = Catalog::open(&st.catalog_path).and_then(|mut catalog| {
@@ -1168,7 +1168,7 @@ pub fn clear_library(app: &AppHandle) -> Result<(), String> {
     // Replaced, not reset: its version keeps counting up.
     lock(&st.playlist).replace(
         playlist::Selection::Manual,
-        smp_core::queue::Queue::fixed(&[], smp_core::shuffle::entropy_rng()),
+        fxmp_core::queue::Queue::fixed(&[], fxmp_core::shuffle::entropy_rng()),
     );
     *lock(&st.position) = None;
     let _ = app.emit(PLAYLIST_EVENT, ());
@@ -1191,7 +1191,7 @@ pub fn clear_library(app: &AppHandle) -> Result<(), String> {
 
 /// Takes out of the playlist the tracks that are gone or whose library is off;
 /// if that changed the track due next, the player drops the one it prepared.
-pub fn prune_playlist(app: &AppHandle, st: &AppState) -> smp_core::Result<()> {
+pub fn prune_playlist(app: &AppHandle, st: &AppState) -> fxmp_core::Result<()> {
     let ids: Vec<TrackId> = lock(&st.playlist)
         .queue
         .order()
@@ -1244,7 +1244,7 @@ pub fn delete_library_tracks(st: &AppState, ids: &[LibraryId]) -> Result<(), Str
 }
 
 /// Drops from the bans of this run the tracks no longer in the catalog.
-pub fn forget_deleted_bans(banned: &BannedSet, catalog: &Catalog) -> smp_core::Result<()> {
+pub fn forget_deleted_bans(banned: &BannedSet, catalog: &Catalog) -> fxmp_core::Result<()> {
     let ids: Vec<TrackId> = lock(banned).iter().copied().collect();
     let known: std::collections::HashSet<TrackId> = catalog
         .tracks_by_ids(&ids)?
@@ -1260,7 +1260,7 @@ pub fn forget_deleted_bans(banned: &BannedSet, catalog: &Catalog) -> smp_core::R
 /// them out of the playlist, and forgets its passwords.
 pub fn remove_library(app: &AppHandle, id: LibraryId) -> Result<(), String> {
     let st = app.state::<AppState>();
-    if id == smp_core::DEFAULT_LIBRARY {
+    if id == fxmp_core::DEFAULT_LIBRARY {
         return Err(i18n::t("err.remove_default"));
     }
     let Some(library) = st.settings.get().library(id) else {
@@ -1313,7 +1313,7 @@ pub fn remove_library(app: &AppHandle, id: LibraryId) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smp_core::catalog::TrackMeta;
+    use fxmp_core::catalog::TrackMeta;
 
     #[test]
     fn now_playing_falls_back_to_file_name_and_lists_genres() {
@@ -1325,7 +1325,7 @@ mod tests {
             ..Default::default()
         };
         let id = c
-            .upsert_track(smp_core::DEFAULT_LIBRARY, "x/Some Song.mp3", 1, 1, &meta)
+            .upsert_track(fxmp_core::DEFAULT_LIBRARY, "x/Some Song.mp3", 1, 1, &meta)
             .unwrap();
         c.rebuild_genres().unwrap();
         let np = now_playing_of(&c, id, true).unwrap();
@@ -1339,11 +1339,11 @@ mod tests {
     }
 
     struct Nothing;
-    impl smp_core::audio::player::TrackProvider for Nothing {
-        fn next_track(&mut self) -> Option<smp_core::audio::player::PlayItem> {
+    impl fxmp_core::audio::player::TrackProvider for Nothing {
+        fn next_track(&mut self) -> Option<fxmp_core::audio::player::PlayItem> {
             None
         }
-        fn on_failed(&mut self, _: TrackId, _: &smp_core::failure::Failure) {}
+        fn on_failed(&mut self, _: TrackId, _: &fxmp_core::failure::Failure) {}
         fn on_played(&mut self, _: TrackId, _: Option<f32>) {}
     }
 
@@ -1489,7 +1489,7 @@ mod tests {
     /// `start_scan`/`run_scan` do.
     #[test]
     fn taking_the_scan_slot_cancels_a_running_scan_and_keeps_new_ones_out() {
-        use smp_core::source::{FileEntry, ReadSeek, WalkReport};
+        use fxmp_core::source::{FileEntry, ReadSeek, WalkReport};
         use std::sync::atomic::AtomicUsize;
 
         struct Slow {
@@ -1538,7 +1538,7 @@ mod tests {
                     ..ScanOptions::default()
                 };
                 let r = scan_with(
-                    smp_core::DEFAULT_LIBRARY,
+                    fxmp_core::DEFAULT_LIBRARY,
                     &src,
                     &mut cat,
                     &mut |_| {},
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn scan_errors_use_the_matching_status_text() {
-        let auth = smp_core::Error::Source(SourceError::Auth);
+        let auth = fxmp_core::Error::Source(SourceError::Auth);
         assert_eq!(
             scan_error_message("en", &auth),
             "Wrong username or password"
@@ -1583,19 +1583,19 @@ mod tests {
             "Pogrešno korisničko ime ili lozinka"
         );
         for e in [SourceError::Unreachable, SourceError::Timeout] {
-            let e = smp_core::Error::Source(e);
+            let e = fxmp_core::Error::Source(e);
             assert_eq!(
                 scan_error_message("en", &e),
                 i18n::tr("en", "conn.unreachable")
             );
         }
-        let other = smp_core::Error::Other("disk full".into());
+        let other = fxmp_core::Error::Other("disk full".into());
         assert_eq!(scan_error_message("en", &other), "Scan failed: disk full");
         let dir = tempfile::tempdir().unwrap();
         let db = Catalog::open(&dir.path().join("no/such/dir/c.db"))
             .err()
             .unwrap();
-        assert!(matches!(db, smp_core::Error::Db(_)));
+        assert!(matches!(db, fxmp_core::Error::Db(_)));
         assert_eq!(
             scan_error_message("hr", &db),
             i18n::trf("hr", "err.database", &[("error", &db.to_string())])
@@ -1731,11 +1731,11 @@ mod tests {
             id,
             name: String::new(),
         };
-        let empty = smp_core::scan::ScanReport {
+        let empty = fxmp_core::scan::ScanReport {
             looks_empty: true,
             ..Default::default()
         };
-        let fine = smp_core::scan::ScanReport {
+        let fine = fxmp_core::scan::ScanReport {
             total: 3,
             ..Default::default()
         };
@@ -1808,7 +1808,7 @@ mod tests {
     #[test]
     fn bans_of_deleted_tracks_are_forgotten() {
         let c = Catalog::open_in_memory().unwrap();
-        let m = smp_core::catalog::TrackMeta::default();
+        let m = fxmp_core::catalog::TrackMeta::default();
         let keep = c.upsert_track(1, "a.mp3", 1, 1, &m).unwrap();
         let gone = c.upsert_track(2, "b.mp3", 1, 1, &m).unwrap();
         let banned = BannedSet::default();

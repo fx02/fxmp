@@ -1,6 +1,8 @@
-# SMB music player
+# fxmp — fx music player
 
 Vibe coded with Claude
+
+Formerly SMB Music Player.
 
 A macOS-first Tauri 2 player that plays music straight from an SMB share
 (MP3, FLAC, OGG Vorbis). Design: `docs/superpowers/specs/2026-10-24-smb-music-player-design.md`.
@@ -21,13 +23,13 @@ A macOS-first Tauri 2 player that plays music straight from an SMB share
 
 ## Installation (macOS 12+, Apple Silicon and Intel)
 
-1. Download the `.dmg` (`SMB Music Player_0.1.0_universal.dmg`), open it and
+1. Download the `.dmg` (`fxmp_0.1.0_universal.dmg`), open it and
    drag the app into `Applications`.
 2. The app is neither signed nor notarized, so macOS blocks it on first launch.
    Remove the quarantine flag:
 
    ```sh
-   xattr -dr com.apple.quarantine "/Applications/SMB Music Player.app"
+   xattr -dr com.apple.quarantine "/Applications/fxmp.app"
    ```
 
 3. Start the app. Its icon (a white play triangle over "SMB") appears in the
@@ -49,7 +51,7 @@ On first launch a window opens. In **Settings** enter:
 - optionally turn on **Backup server** and enter its details.
 
 Click "Test connection", then "Save" and "Refresh library". Passwords are kept
-only in the macOS keychain (service `smb-music-player`, one entry per server of
+only in the macOS keychain (service `fxmp`, one entry per server of
 each library: account `library-{id}/{host}/{username}`), never in a file or a
 log. macOS will ask whether the app may read the keychain: choose **Always Allow**.
 Versions before libraries stored the account as `{host}/{username}`; on the
@@ -138,7 +140,7 @@ server's address), an **On** switch and (except the main one) **Remove**:
   library's root, so a playlist mixing libraries only resolves for the tracks
   of the library whose folder it is saved in.
 - Android is a separate project; the core library's local-folder source
-  (`LocalSource` in `smp-core`) is what it will use to read music on the device.
+  (`LocalSource` in `fxmp-core`) is what it will use to read music on the device.
 
 ## Usage
 
@@ -267,8 +269,8 @@ server's address), an **On** switch and (except the main one) **Remove**:
   in the Dock as usual. **Cmd+Q** (or Quit in the menu bar menu) quits.
 - **Version**: Settings → **About** (at the bottom) shows the version, the
   commit it was built from and the build date, with a link to the source code
-  on GitHub (https://github.com/fx02/smb-music-player) and **Copy version**,
-  which copies e.g. "SMB Music Player 0.1.0 (abc1234, 2026-10-25)" for bug
+  on GitHub (https://github.com/fx02/fxmp) and **Copy version**,
+  which copies e.g. "fxmp 0.1.0 (abc1234, 2026-10-25)" for bug
   reports. The same line is the last (greyed-out) item of the menu bar menu. A
   build without git (a source tarball) shows "unknown" as the commit.
 
@@ -327,22 +329,22 @@ The language then appears in Settings → Language.
 cargo test --workspace            # without the live tests
 node --test ui/*.test.mjs
 cp .env.test.example .env.test    # fill in the details; the file is in .gitignore
-cargo test -p smp-core --test smb_live -- --ignored --test-threads=1
-cargo test -p smb-music-player live_ -- --ignored
+cargo test -p fxmp-core --test smb_live -- --ignored --test-threads=1
+cargo test -p fxmp live_ -- --ignored
 ```
 
 Live tests (`cargo test -- --ignored`) only read from the server; nothing is written.
 
 **Running a development build next to the installed app.** A debug build reads
 `SMP_DATA_DIR`: when it is set, settings, the library and the playlist live in
-that folder, passwords go to the keychain service `smb-music-player-dev`
-instead of `smb-music-player`, and the build does not hand over to (or block) a
+that folder, passwords go to the keychain service `fxmp-dev`
+instead of `fxmp`, and the build does not hand over to (or block) a
 running installed app. Nothing of the installed app is read or written.
 Release builds ignore the variable.
 
 ```sh
-SMP_DATA_DIR=$(mktemp -d) cargo run -p smb-music-player
-# afterwards: rm -rf that folder; security delete-generic-password -s smb-music-player-dev
+SMP_DATA_DIR=$(mktemp -d) cargo run -p fxmp
+# afterwards: rm -rf that folder; security delete-generic-password -s fxmp-dev
 ```
 CI (`.github/workflows/build.yml`, on push to `main` and `feat/**` branches,
 and manually) runs the tests and builds the macOS `.dmg` and the Windows
@@ -483,7 +485,7 @@ Live tests (read-only, nothing is written to the servers):
 
 ```sh
 cp .env.test.example .env.test   # fill in the details; the file is in .gitignore
-cargo test -p smp-core --test smb_live -- --ignored --test-threads=1
+cargo test -p fxmp-core --test smb_live -- --ignored --test-threads=1
 ```
 
 The tests go to the main server and, if `SMB_TEST2_HOST` is set, also to the backup.

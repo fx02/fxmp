@@ -245,6 +245,7 @@
   "tray.lookup_current": "Potraži trenutnu pjesmu",
   "tray.copy_current": "Kopiraj trenutnu pjesmu",
   "settings.about": "O aplikaciji",
+  "about.long_name": "fx music player",
   "about.version": "Verzija {version}",
   "about.build": "Verzija koda {commit}, {date}",
   "about.vibe": "Vibe coded with Claude",

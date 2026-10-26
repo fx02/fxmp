@@ -20,9 +20,8 @@ mod writer;
 
 use tauri::{Manager, WindowEvent};
 
-/// Default log filter (`RUST_LOG` overrides it). The `smb` crate is noisy at info,
-/// but its directive also prefix-matches this crate, so ours is named explicitly.
-const LOG_FILTER: &str = "info,smb=warn,smb_music_player=info";
+/// Default log filter (`RUST_LOG` overrides it). The `smb` crate is noisy at info.
+const LOG_FILTER: &str = "info,smb=warn";
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(LOG_FILTER)).init();
@@ -169,9 +168,9 @@ mod tests {
 
     #[test]
     fn log_filter_shows_app_info_but_keeps_smb_at_warn() {
-        assert!(enabled("smb_music_player::state", Level::Info));
-        assert!(enabled("smb_music_player", Level::Info));
-        assert!(enabled("smp_core::scan", Level::Info));
+        assert!(enabled("fxmp::state", Level::Info));
+        assert!(enabled("fxmp", Level::Info));
+        assert!(enabled("fxmp_core::scan", Level::Info));
         assert!(!enabled("smb::session::setup", Level::Info));
         assert!(enabled("smb::session::setup", Level::Warn));
     }

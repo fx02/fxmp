@@ -9,12 +9,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
-use smp_core::source::{
+use fxmp_core::source::{
     FailoverSource, FileEntry, LocalSource, MusicSource, ReadSeek, SmbConfig, SmbSource,
     SourceError, WalkReport, Which,
 };
-use smp_core::{LibraryId, DEFAULT_LIBRARY};
+use fxmp_core::{LibraryId, DEFAULT_LIBRARY};
+use serde::Serialize;
 
 use crate::credentials::{server_password, CredentialStore};
 use crate::i18n;
@@ -177,9 +177,9 @@ pub fn unmounted_volume(path: &std::path::Path, volumes: &std::path::Path) -> bo
     }
 }
 
-fn source_error(e: smp_core::Error) -> SourceError {
+fn source_error(e: fxmp_core::Error) -> SourceError {
     match e {
-        smp_core::Error::Source(e) => e,
+        fxmp_core::Error::Source(e) => e,
         other => SourceError::Io(other.to_string()),
     }
 }
@@ -1374,7 +1374,7 @@ mod tests {
         (settings, creds)
     }
 
-    /// Read-only. Run with `cargo test -p smb-music-player live_ -- --ignored`.
+    /// Read-only. Run with `cargo test -p fxmp live_ -- --ignored`.
     #[test]
     #[ignore]
     fn live_probe_reports_ok_secondary_and_auth() {
@@ -1403,7 +1403,7 @@ mod tests {
             servers.failover.open(&entry.rel_path).unwrap();
             assert_eq!(
                 servers.failover.active(),
-                smp_core::source::Which::Secondary
+                fxmp_core::source::Which::Secondary
             );
         }
 

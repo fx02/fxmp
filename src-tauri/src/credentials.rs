@@ -1,4 +1,4 @@
-//! SMB passwords in the OS keychain (service `smb-music-player`), one per server of
+//! SMB passwords in the OS keychain (service `fxmp`), one per server of
 //! a library: account `library-{id}/{host}/{username}` (see [`account`]). Passwords
 //! are never written to files or logs. A debug build with `SMP_DATA_DIR` set uses
 //! another service (see `devdata`). Local-folder libraries have no password and
@@ -7,11 +7,11 @@
 //! Before libraries, the account was `{host}/{username}`; [`migrate_legacy`] moves
 //! those entries to the first library's accounts.
 
-use smp_core::{LibraryId, DEFAULT_LIBRARY};
+use fxmp_core::{LibraryId, DEFAULT_LIBRARY};
 
 use crate::settings::{ServerConfig, Settings};
 
-pub const SERVICE: &str = "smb-music-player";
+pub const SERVICE: &str = "fxmp";
 
 /// The keychain account of server `host`/`username` of library `library`. The
 /// host and user are part of it so a password is never sent to another server.
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn accounts_are_per_library_host_and_user() {
-        assert_eq!(SERVICE, "smb-music-player");
+        assert_eq!(SERVICE, "fxmp");
         assert_eq!(
             account(1, " 10.111.100.2 ", "music "),
             "library-1/10.111.100.2/music"
