@@ -10,6 +10,7 @@ mod devdata;
 mod i18n;
 mod lookup;
 mod media;
+mod migrate;
 mod playlist;
 mod provider;
 mod settings;

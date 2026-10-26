@@ -20,7 +20,7 @@ pub fn account(library: LibraryId, host: &str, username: &str) -> String {
 }
 
 /// The account a server's password had before libraries.
-fn legacy_account(host: &str, username: &str) -> String {
+pub fn legacy_account(host: &str, username: &str) -> String {
     format!("{}/{}", host.trim(), username.trim())
 }
 
