@@ -165,6 +165,18 @@ test("locales: en and hr exist and have exactly the same keys", () => {
   }
 });
 
+test("locales: no text is double-encoded UTF-8 (mojibake) or holds control characters", () => {
+  // UTF-8 read as Latin-1 turns "š" into "Å¡", "ć" into "Ä\u0087", "é" into "Ã©".
+  const mojibake = /[ÃÅÄ][\u0080-\u00bf]|[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
+  for (const [lang, dict] of Object.entries(LOCALES)) {
+    for (const [key, value] of Object.entries(dict)) {
+      for (const text of typeof value === "string" ? [value] : Object.values(value)) {
+        assert.ok(!mojibake.test(text), `${lang} ${key}: ${text}`);
+      }
+    }
+  }
+});
+
 test("locales: plural forms match the language's categories, placeholders match en", () => {
   const placeholders = (v) =>
     [...new Set([...(typeof v === "string" ? v : Object.values(v).join(" ")).matchAll(/\{(\w+)\}/g)].map((m) => m[1]))].sort();

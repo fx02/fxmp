@@ -230,8 +230,8 @@ impl AppState {
                 );
             }
         }
-        if migration.failed {
-            migrate::tell_failed(app);
+        if let Some(language) = &migration.message_language {
+            migrate::tell_failed(app, language);
         }
         let (config_dir, data_dir) = (migration.config_dir, migration.data_dir);
         let settings_path = config_dir.join(settings::FILE_NAME);

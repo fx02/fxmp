@@ -114,7 +114,8 @@ enum Marker {
 fn marker(new: &Path) -> Marker {
     match fs::read_to_string(new.join(MARKER)) {
         Err(_) => Marker::None,
-        Ok(m) if m == PENDING => Marker::Pending,
+        // Empty: torn while "copying files" was written.
+        Ok(m) if m == PENDING || m.is_empty() => Marker::Pending,
         Ok(m) if m == PASSWORDS_PENDING => Marker::PasswordsPending,
         // Anything else: done, so nothing is ever copied over the new data.
         Ok(_) => Marker::Done,
@@ -145,6 +146,10 @@ fn migrate_files_with(
                 "migration: {} is gone; the interrupted migration is given up",
                 old.display()
             );
+            // What the interrupted attempt left must not pass for the user's own:
+            // a log without its database would corrupt the next one.
+            remove_leftovers(new)?;
+            remove_dir_if_there(&new.join(STAGING))?;
             fs::remove_file(new.join(MARKER))?;
             return Ok(Files::NoOldData);
         }
@@ -164,9 +169,7 @@ fn migrate_files_with(
     let copied = copy_consistent(old, &staging, retry, before_copy)?;
     // Left over from an interrupted attempt: a log of another copy would
     // corrupt the database.
-    for name in DATABASE_FILES.iter().copied().chain([settings::FILE_NAME]) {
-        remove_file_if_there(&new.join(name))?;
-    }
+    remove_leftovers(new)?;
     // The settings and the database last: the log must be in place first.
     let mut names: Vec<_> = fs::read_dir(&staging)?
         .map(|e| e.map(|e| e.file_name()))
@@ -218,6 +221,14 @@ fn copy_consistent(
     Err(io::Error::other(format!(
         "{OLD_APP_NAME}'s files could not be copied: {last_problem}"
     )))
+}
+
+/// Removes the database and settings files an interrupted attempt left in `new`.
+fn remove_leftovers(new: &Path) -> io::Result<()> {
+    for name in DATABASE_FILES.iter().copied().chain([settings::FILE_NAME]) {
+        remove_file_if_there(&new.join(name))?;
+    }
+    Ok(())
 }
 
 fn remove_file_if_there(path: &Path) -> io::Result<()> {
@@ -445,6 +456,8 @@ pub struct Prepared {
     pub failed: bool,
     /// The passwords are still to copy (see [`passwords_step`]).
     pub passwords_pending: bool,
+    /// The failure message's language (see [`message_language`]) when `failed`.
+    pub message_language: Option<String>,
 }
 
 /// Where a start whose migration failed keeps its data, so nothing in the new
@@ -462,13 +475,14 @@ pub fn prepare(config_dir: PathBuf, data_dir: PathBuf, source: &Source) -> Prepa
     }
     let mut copied = false;
     let mut failed = false;
-    if let Some(old) = source.old_dir(&data_dir) {
+    let old_dir = source.old_dir(&data_dir);
+    if let Some(old) = &old_dir {
         let has_own_settings =
             config_dir != data_dir && config_dir.join(settings::FILE_NAME).exists();
         let result = if has_own_settings && marker(&data_dir) == Marker::None {
             Ok(Files::NewHasData)
         } else {
-            migrate_files(&old, &data_dir)
+            migrate_files(old, &data_dir)
         };
         match result {
             Ok(Files::Copied(n)) => {
@@ -501,6 +515,7 @@ pub fn prepare(config_dir: PathBuf, data_dir: PathBuf, source: &Source) -> Prepa
             log::warn!("migration: cannot create {}: {e}", aside.display());
         }
         return Prepared {
+            message_language: Some(message_language(&config_dir, old_dir.as_deref())),
             config_dir: aside.clone(),
             data_dir: aside,
             copied,
@@ -510,6 +525,7 @@ pub fn prepare(config_dir: PathBuf, data_dir: PathBuf, source: &Source) -> Prepa
     }
     Prepared {
         passwords_pending: passwords_pending(&data_dir),
+        message_language: None,
         config_dir,
         data_dir,
         copied,
@@ -553,12 +569,26 @@ pub fn passwords_step(
     Some(done)
 }
 
+/// The language of the failure message: the new settings', else the old
+/// settings', else English (a shipped language only).
+pub fn message_language(new_config_dir: &Path, old_dir: Option<&Path>) -> String {
+    let language_in = |dir: &Path| -> Option<String> {
+        let text = fs::read_to_string(dir.join(settings::FILE_NAME)).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        value.get("language")?.as_str().map(str::to_string)
+    };
+    language_in(new_config_dir)
+        .or_else(|| old_dir.and_then(language_in))
+        .filter(|l| crate::i18n::is_supported(l))
+        .unwrap_or_else(|| "en".into())
+}
+
 /// Tells the user that the copy failed and how to get it to work (a message box
 /// that does not block the start).
-pub fn tell_failed(app: &tauri::AppHandle) {
+pub fn tell_failed(app: &tauri::AppHandle, language: &str) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
     app.dialog()
-        .message(crate::i18n::t("migrate.failed"))
+        .message(crate::i18n::tr(language, "migrate.failed"))
         .title("fxmp")
         .kind(MessageDialogKind::Warning)
         .show(|_| {});
@@ -1065,7 +1095,8 @@ mod tests {
                 data_dir: new.clone(),
                 copied: true,
                 failed: false,
-                passwords_pending: true
+                passwords_pending: true,
+                message_language: None
             }
         );
         let second = prepare(new.clone(), new.clone(), &Source::Beside);
@@ -1106,6 +1137,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(failed.failed && !failed.copied && !failed.passwords_pending);
         assert_eq!(failed.data_dir, unmigrated_dir(&new));
+        assert_eq!(failed.message_language.as_deref(), Some("en"));
         assert_eq!(failed.config_dir, unmigrated_dir(&new));
         // That start opens its (empty) catalog and saves settings aside.
         drop(Catalog::open(&failed.data_dir.join(DATABASE)).unwrap());
@@ -1163,6 +1195,93 @@ mod tests {
         assert!(old.prompts.lock().unwrap().is_empty());
         assert_eq!(keychain.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!passwords_pending(&new));
+    }
+
+    #[test]
+    fn an_empty_marker_counts_as_copying() {
+        let old = old_app();
+        let new = tempfile::tempdir().unwrap();
+        // Power lost while the marker was written: an empty file.
+        fs::write(new.path().join(MARKER), "").unwrap();
+        fs::write(new.path().join("catalog.db-wal"), "stale").unwrap();
+        assert!(matches!(
+            migrate_files(old.dir.path(), new.path()).unwrap(),
+            Files::Copied(_)
+        ));
+        assert!(!Catalog::open(&new.path().join(DATABASE))
+            .unwrap()
+            .is_empty()
+            .unwrap());
+    }
+
+    #[test]
+    fn giving_up_an_interrupted_copy_removes_its_leftovers() {
+        let parent = tempfile::tempdir().unwrap();
+        let new = parent.path().join("new");
+        fs::create_dir(&new).unwrap();
+        fs::write(new.join(MARKER), PENDING).unwrap();
+        for name in [
+            "catalog.db-wal",
+            "catalog.db-shm",
+            "catalog.db",
+            "settings.json",
+        ] {
+            fs::write(new.join(name), "left over").unwrap();
+        }
+        fs::create_dir(new.join(STAGING)).unwrap();
+        assert_eq!(
+            migrate_files(&parent.path().join("gone"), &new).unwrap(),
+            Files::NoOldData
+        );
+        let names: Vec<_> = fs::read_dir(&new)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn the_failure_message_is_in_the_users_language() {
+        let new = tempfile::tempdir().unwrap();
+        let old = tempfile::tempdir().unwrap();
+        let write =
+            |dir: &Path, text: &str| fs::write(dir.join(settings::FILE_NAME), text).unwrap();
+        assert_eq!(
+            message_language(new.path(), Some(old.path())),
+            "en",
+            "nothing to go by"
+        );
+        assert_eq!(message_language(new.path(), None), "en");
+        write(old.path(), r#"{"language":"hr"}"#);
+        assert_eq!(
+            message_language(new.path(), Some(old.path())),
+            "hr",
+            "the old app's"
+        );
+        write(new.path(), "{ not json");
+        assert_eq!(
+            message_language(new.path(), Some(old.path())),
+            "hr",
+            "unreadable new"
+        );
+        write(new.path(), r#"{"language":"en"}"#);
+        assert_eq!(
+            message_language(new.path(), Some(old.path())),
+            "en",
+            "the new one first"
+        );
+        write(new.path(), r#"{"volume":0.5}"#);
+        assert_eq!(
+            message_language(new.path(), Some(old.path())),
+            "hr",
+            "no language in new"
+        );
+        write(old.path(), r#"{"language":"xx"}"#);
+        assert_eq!(
+            message_language(new.path(), Some(old.path())),
+            "en",
+            "not shipped"
+        );
     }
 
     /// The copy of a library the size of the owner's (59,000 tracks), in a

@@ -58,6 +58,21 @@ the old app had:
   keeps writing), fxmp says so in a message and starts empty: quit SMB Music
   Player, then quit fxmp and start it again. fxmp tries again on every start
   until the copy works, and what was set up in an empty start is not kept.
+  If it keeps failing for another reason (for example a file in the old folder
+  that cannot be read), stop the attempts in one of two ways, with fxmp quit:
+  - move the old folder away, e.g. rename
+    `~/Library/Application Support/hr.pvt.smb-music-player` to
+    `hr.pvt.smb-music-player.bak` (Windows: `%APPDATA%\hr.pvt.smb-music-player`
+    to `hr.pvt.smb-music-player.bak`): fxmp then gives up the migration,
+    clears what the failed attempts left and starts empty (rename the folder
+    back to use SMB Music Player again);
+  - or write `done` into the marker file
+    `~/Library/Application Support/hr.pvt.fxmp/migrated-from-smb-music-player`
+    (Windows: `%APPDATA%\hr.pvt.fxmp\migrated-from-smb-music-player`), e.g.
+    `echo done > ~/Library/Application\ Support/hr.pvt.fxmp/migrated-from-smb-music-player`.
+
+  Deleting the marker file does not stop the attempts: without it, fxmp
+  migrates as on a first start.
 - **Passwords**: each server's password is read from the old keychain service
   `smb-music-player` and written to `fxmp`, then read back. macOS asks whether
   fxmp may read each of the old app's entries (once per entry): choose

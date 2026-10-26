@@ -246,7 +246,7 @@
   "tray.copy_current": "Kopiraj trenutnu pjesmu",
   "settings.about": "O aplikaciji",
   "about.long_name": "fx music player",
-  "migrate.failed": "Kopiranje kataloga i postavki iz aplikacije SMB Music Player nije uspjelo. Zatvori SMB Music Player, zatim zatvori fxmp i ponovno ga pokreni: pokuÅ¡ava ponovno pri svakom pokretanju dok kopiranje ne uspije. Dotad fxmp kreÄe prazan, a ono Å¡to sada postaviÅ¡ ne ostaje.",
+  "migrate.failed": "Kopiranje kataloga i postavki iz aplikacije SMB Music Player nije uspjelo. Zatvori SMB Music Player, zatim zatvori fxmp i ponovno ga pokreni: pokušava ponovno pri svakom pokretanju dok kopiranje ne uspije. Dotad fxmp kreće prazan, a ono što sada postaviš ne ostaje.",
   "about.version": "Verzija {version}",
   "about.build": "Verzija koda {commit}, {date}",
   "about.vibe": "Vibe coded with Claude",
