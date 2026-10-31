@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates app-icon-source.png (1024x1024): a blue rounded square with a white
-play triangle and, below it, "SMB" in bold blocky white letters (rectangles and
-rounded corners, readable down to 32x32). Standard library only. Then run:
+play triangle and, below it, "fxmp" in bold blocky white lowercase letters
+(strokes and rounded corners). Standard library only. Then run:
   python3 src-tauri/icons/gen_app_icon.py && cargo tauri icon src-tauri/icons/app-icon-source.png
 """
 import os
@@ -12,11 +12,12 @@ N, SS = 1024, 3
 MARGIN, RADIUS = 100, 180  # macOS-style inset rounded square
 
 # Triangle above the text; the pair is centred in the square.
-TRI_LEFT, TRI_TIP, TRI_TOP, TRI_BOTTOM = 398, 642, 206, 486
-# Letters: height, stroke, widths (S, M, B), gap; baseline below the triangle.
-TEXT_TOP, TEXT_H, STROKE = 586, 236, 46
-WIDTHS, GAP = (150, 196, 150), 34
-CORNER = 66  # outer radius of the S and B curves
+TRI_LEFT, TRI_TIP, TRI_TOP, TRI_BOTTOM = 398, 642, 196, 466
+# Lowercase letters: ascender top, x-height top, baseline, descender bottom.
+ASC, XTOP, BASE, DESC = 560, 640, 780, 846
+STROKE = 42
+WIDTHS, GAP = (112, 136, 196, 142), 28  # f, x, m, p
+CORNER = 62  # outer radius of the curves
 
 
 def inside_round_rect(x, y):
@@ -53,11 +54,11 @@ def in_rounded(x, y, x0, y0, x1, y1, r, corners="tl tr bl br"):
     return True
 
 
-def in_ring(x, y, x0, y0, x1, y1, corners):
+def in_ring(x, y, x0, y0, x1, y1, corners, r=CORNER):
     """A stroke-wide outline of a box with rounded `corners`."""
     s = STROKE
-    return in_rounded(x, y, x0, y0, x1, y1, CORNER, corners) and not in_rounded(
-        x, y, x0 + s, y0 + s, x1 - s, y1 - s, CORNER - s, corners)
+    return in_rounded(x, y, x0, y0, x1, y1, r, corners) and not in_rounded(
+        x, y, x0 + s, y0 + s, x1 - s, y1 - s, max(r - s, 0), corners)
 
 
 def near_segment(x, y, ax, ay, bx, by, half):
@@ -67,45 +68,55 @@ def near_segment(x, y, ax, ay, bx, by, half):
     return (x - px) ** 2 + (y - py) ** 2 <= half * half
 
 
-def letter_s(x, y, x0, y0, x1, y1):
-    s, mid, xc = STROKE, (y0 + y1) / 2, (x0 + x1) / 2
-    all4 = "tl tr bl br"
-    upper = in_ring(x, y, x0, y0, x1, mid + s / 2, all4) and not (x > xc and y > y0 + CORNER)
-    lower = in_ring(x, y, x0, mid - s / 2, x1, y1, all4) and not (x < xc and y < y1 - CORNER)
-    return upper or lower
+def letter_f(x, y, x0, x1):
+    s = STROKE
+    stem = x0 + 26
+    # Stem with a hook to the right at the top: the top and left edges of a ring.
+    hook = in_ring(x, y, stem, ASC, x1, BASE + CORNER, "tl") and (
+        y <= ASC + s or x <= stem + s) and y <= BASE
+    bar = x0 <= x <= x1 - 18 and XTOP <= y <= XTOP + s
+    return hook or bar
 
 
-def letter_m(x, y, x0, y0, x1, y1):
-    s, xc = STROKE, (x0 + x1) / 2
-    if x0 <= x <= x0 + s or x1 - s <= x <= x1:
-        return y0 <= y <= y1
-    if y < y0:
+def letter_x(x, y, x0, x1):
+    """Two crossing strokes, cut flat at the x-height and the baseline."""
+    if not (XTOP <= y <= BASE and x0 <= x <= x1):
         return False
-    vy = y0 + 0.64 * (y1 - y0)
-    half = s * 0.46
-    return (near_segment(x, y, x0 + s / 2, y0 + half, xc, vy, half)
-            or near_segment(x, y, x1 - s / 2, y0 + half, xc, vy, half))
+    half = STROKE * 0.56
+    w = (x1 - x0) - 2 * half
+    return (near_segment(x, y, x0 + half, XTOP, x0 + half + w, BASE, half)
+            or near_segment(x, y, x1 - half, XTOP, x1 - half - w, BASE, half))
 
 
-def letter_b(x, y, x0, y0, x1, y1):
-    s, mid = STROKE, (y0 + y1) / 2
-    if x0 <= x <= x0 + s and y0 <= y <= y1:
-        return True
-    return (in_ring(x, y, x0, y0, x1 - 14, mid + s / 2, "tr br")
-            or in_ring(x, y, x0, mid - s / 2, x1, y1, "tr br"))
+def letter_m(x, y, x0, x1):
+    s, xc = STROKE, (x0 + x1) / 2
+    if y > BASE:
+        return False
+    stem = x0 <= x <= x0 + s and XTOP <= y <= BASE
+    r = 50
+    arch1 = in_ring(x, y, x0, XTOP, xc + s / 2, BASE + r, "tl tr", r)
+    arch2 = in_ring(x, y, xc - s / 2, XTOP, x1, BASE + r, "tl tr", r)
+    return stem or arch1 or arch2
+
+
+def letter_p(x, y, x0, x1):
+    s = STROKE
+    stem = x0 <= x <= x0 + s and XTOP <= y <= DESC
+    bowl = in_ring(x, y, x0, XTOP, x1, BASE, "tl tr bl br")
+    return stem or bowl
 
 
 LETTERS = []
 _x = (N - sum(WIDTHS) - GAP * (len(WIDTHS) - 1)) / 2
-for _f, _w in zip((letter_s, letter_m, letter_b), WIDTHS):
-    LETTERS.append((_f, _x, TEXT_TOP, _x + _w, TEXT_TOP + TEXT_H))
+for _f, _w in zip((letter_f, letter_x, letter_m, letter_p), WIDTHS):
+    LETTERS.append((_f, _x, _x + _w))
     _x += _w + GAP
 
 
 def in_text(x, y):
-    if not (TEXT_TOP <= y <= TEXT_TOP + TEXT_H):
+    if not (ASC <= y <= DESC):
         return False
-    return any(x0 <= x <= x1 and f(x, y, x0, y0, x1, y1) for f, x0, y0, x1, y1 in LETTERS)
+    return any(x0 <= x <= x1 and f(x, y, x0, x1) for f, x0, x1 in LETTERS)
 
 
 def color(x, y):

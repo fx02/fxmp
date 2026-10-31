@@ -36,7 +36,7 @@ A macOS-first Tauri 2 player that plays music straight from an SMB share
    xattr -dr com.apple.quarantine "/Applications/fxmp.app"
    ```
 
-3. Start the app. Its icon (a white play triangle over "SMB") appears in the
+3. Start the app. Its icon (a white play triangle over "fxmp") appears in the
    Dock, and the ⏭ glyph in the menu bar.
 
 Building from source: `cargo tauri build --target universal-apple-darwin`
@@ -461,8 +461,8 @@ These cannot be checked automatically (they need listening or clicking):
       bottom matches Settings → About.
 - [ ] Settings → About: the GitHub link opens the browser on the project page;
       Copy version puts the version line on the clipboard.
-- [ ] The new app icon (play triangle over "SMB", no sound arcs) in the Dock,
-      Finder, the app switcher (Cmd+Tab) and the notification picture; "SMB" is
+- [ ] The new app icon (play triangle over "fxmp", no sound arcs) in the Dock,
+      Finder, the app switcher (Cmd+Tab) and the notification picture; "fxmp" is
       readable in small sizes (Finder list view).
 - [ ] Right click: the menu opens, the track name updates, picking a genre plays that genre.
 - [ ] Right-click on a genre in the window opens the app's own menu (not WebKit's),
