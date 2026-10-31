@@ -94,6 +94,7 @@ fn main() {
             commands::toggle_pause,
             commands::next,
             commands::set_volume,
+            commands::seek,
             commands::list_devices,
             commands::set_device,
             commands::set_crossfade,

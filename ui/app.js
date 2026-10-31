@@ -25,6 +25,8 @@ import {
   formatTime,
   positionText,
   progressFraction,
+  seekTarget,
+  SEEK_STEPS,
   queueFilter,
   exportFileName,
   windowRange,
@@ -203,10 +205,36 @@ function renderPosition() {
   const p = state.position && state.position.id === np.id ? state.position : null;
   const ms = p ? p.position_ms : 0;
   const total = (p && p.duration_ms) || np.duration_ms || null;
+  const f = progressFraction(ms, total);
+  const slider = $("np-seek");
+  slider.disabled = f === null;
+  // While dragged (and just after), the slider shows where it was let go.
+  if (state.seekDragging || !sliderFollows(state.seekTouched, Date.now())) return;
   $("np-time").textContent = positionText(ms, total);
   $("np-time").title = total ? "" : t("player.no_length");
-  const f = progressFraction(ms, total);
-  $("np-fill").style.width = `${((f === null ? 0 : f) * 100).toFixed(2)}%`;
+  slider.value = Math.round((f === null ? 0 : f) * SEEK_STEPS);
+}
+
+/** The length of the playing track, if known. */
+function trackLength() {
+  const np = state.nowPlaying;
+  const p = np && state.position && state.position.id === np.id ? state.position : null;
+  return (p && p.duration_ms) || (np && np.duration_ms) || null;
+}
+
+function onSeekInput(e) {
+  const total = trackLength();
+  if (!total) return;
+  state.seekDragging = true;
+  $("np-time").textContent = positionText(seekTarget(Number(e.target.value), total), total);
+}
+
+function onSeekChange(e) {
+  state.seekDragging = false;
+  const total = trackLength();
+  if (!total) return;
+  state.seekTouched = Date.now();
+  run("seek", { ms: seekTarget(Number(e.target.value), total) });
 }
 
 function onPosition(p) {
@@ -2006,6 +2034,8 @@ function wire() {
   });
   $("btn-next").addEventListener("click", () => run("next"));
   $("btn-ban").addEventListener("click", onBan);
+  $("np-seek").addEventListener("input", onSeekInput);
+  $("np-seek").addEventListener("change", onSeekChange);
   $("volume").addEventListener("input", (e) => {
     state.volumeTouched = Date.now();
     sendVolume(Number(e.target.value) / 100);

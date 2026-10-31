@@ -1440,6 +1440,16 @@ pub fn switch_device(
     store.update(|s| s.device = name, |s| send(s.device.clone()))
 }
 
+/// Jumps to `ms` into the current track (the position slider).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn seek(app: AppHandle, ms: u64) -> CmdResult<()> {
+    run(app, move |_, st| {
+        st.player.send(Command::Seek(ms));
+        Ok(())
+    })
+    .await
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn set_volume(app: AppHandle, v: f32) -> CmdResult<()> {
     run(app, move |app, st| {

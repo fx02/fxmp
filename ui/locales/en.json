@@ -10,6 +10,7 @@
   "player.ban_confirm": "Sure?",
   "player.banned": "Banned: {track}",
   "player.volume": "Volume",
+  "player.seek": "Position: drag to jump in the track",
   "conn.checking": "Checking connection…",
   "conn.not_set_up": "No server set up",
   "conn.ok": "Connected",

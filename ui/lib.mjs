@@ -323,6 +323,14 @@ export function positionText(positionMs, durationMs) {
   return `${formatTime(Math.min(positionMs, durationMs), hours)} / ${formatTime(durationMs, hours)}`;
 }
 
+/** Steps of the position slider (its `max`). */
+export const SEEK_STEPS = 1000;
+
+/** The ms the position slider's `value` stands for in a track of `durationMs`. */
+export function seekTarget(value, durationMs) {
+  return Math.round((Math.min(Math.max(value, 0), SEEK_STEPS) / SEEK_STEPS) * (durationMs || 0));
+}
+
 /** How far into the track (0..1); null when its length is unknown. */
 export function progressFraction(positionMs, durationMs) {
   if (!durationMs) return null;

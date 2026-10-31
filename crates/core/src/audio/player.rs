@@ -36,6 +36,10 @@ const IDLE_WAIT: Duration = Duration::from_millis(500);
 const POSITION_EVERY: Duration = Duration::from_millis(250);
 /// Fade-in of a track that starts part way in (resuming where it stopped).
 const RESUME_FADE_SECS: f32 = 0.5;
+/// Fade out of the old position and into the new one on a seek.
+const SEEK_FADE_SECS: f32 = 0.08;
+/// A seek lands at least this long before the end of a track of known length.
+const SEEK_END_MARGIN_MS: u64 = 1_000;
 
 /// A track to play, as handed out by a [`TrackProvider`].
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +90,9 @@ pub enum Command {
         secs: u8,
     },
     SetNormalize(bool),
+    /// Jumps to this many ms into the current track (to just before its end at
+    /// most). The jump fades out and back in; paused stays paused.
+    Seek(u64),
     Stop,
 }
 
@@ -402,6 +409,7 @@ impl Engine {
                 self.crossfade_secs = enabled.then(|| secs.clamp(1, 10));
             }
             Command::SetNormalize(b) => self.normalize = b,
+            Command::Seek(ms) => self.seek(ms),
             Command::Stop => {
                 self.out = None;
                 self.cur = None;
@@ -418,6 +426,37 @@ impl Engine {
                 self.idle_reported = true;
             }
         }
+    }
+
+    /// Reopens the current track at `ms`: the old position fades out quickly while
+    /// the new one loads and fades in. Its loudness is not measured (part of the
+    /// track would be missing).
+    fn seek(&mut self, ms: u64) {
+        if self.rate == 0 {
+            return;
+        }
+        let Some(mut old) = self.cur.take() else {
+            return;
+        };
+        let ms = match old.status().duration_ms {
+            Some(d) => ms.min(d.saturating_sub(SEEK_END_MARGIN_MS)),
+            None => ms,
+        };
+        let item = PlayItem {
+            start_ms: ms,
+            ..old.item.clone()
+        };
+        self.drop_outgoing();
+        // Paused, nothing is heard: the old position is not kept for a fade.
+        if !self.paused {
+            old.fade_out = Some(Ramp::new(self.secs_to_frames(SEEK_FADE_SECS)));
+            self.out = Some(old);
+        }
+        let mut deck = Deck::load(&self.load, item, self.rate);
+        deck.meter = None;
+        deck.fade_in = Some(Ramp::new(self.secs_to_frames(SEEK_FADE_SECS)));
+        self.cur = Some(deck);
+        self.report_position(true);
     }
 
     /// A player that stopped after too many failures in a row (nothing loaded) asks

@@ -1385,3 +1385,87 @@ fn play_after_too_many_failures_tries_again() {
         );
     }
 }
+
+#[test]
+fn seek_jumps_forward_and_back_in_the_current_track() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    h.play(vec![tone(1, 500), tone(2, 1500)]);
+    h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    h.player.send(Command::Seek(12_000));
+    h.wait(
+        "forward",
+        5,
+        |e| matches!(e, Event::Position { id: 1, ms, .. } if (12_000..12_600).contains(ms)),
+    );
+    h.player.send(Command::Seek(3_000));
+    h.wait(
+        "back",
+        5,
+        |e| matches!(e, Event::Position { id: 1, ms, .. } if (3_000..3_600).contains(ms)),
+    );
+    assert_eq!(h.started(), [1], "a seek is not a new track");
+    let after: Vec<u64> = h
+        .positions()
+        .iter()
+        .rev()
+        .take_while(|p| p.1 < 12_000)
+        .map(|p| p.1)
+        .collect();
+    assert!(
+        after.windows(2).all(|w| w[0] >= w[1]),
+        "position moves on from the new place: {after:?}"
+    );
+}
+
+#[test]
+fn a_seek_past_the_end_lands_just_before_it() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    h.play(vec![tone(1, 500), tone(2, 1500)]);
+    h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    h.player.send(Command::Seek(600_000));
+    h.wait(
+        "near the end",
+        5,
+        |e| matches!(e, Event::Position { id: 1, ms, .. } if (18_900..19_500).contains(ms)),
+    );
+    h.wait("next track", 10, |e| *e == Event::TrackStarted { id: 2 });
+    assert!(
+        !h.calls().iter().any(|c| matches!(c, Call::Failed(..))),
+        "{:?}",
+        h.calls()
+    );
+}
+
+#[test]
+fn a_seek_while_paused_stays_paused() {
+    let mut h = Harness::new(Opts {
+        paced: true,
+        ..Default::default()
+    });
+    h.play(vec![tone(1, 500)]);
+    h.wait("start", 5, |e| *e == Event::TrackStarted { id: 1 });
+    h.player.send(Command::Pause);
+    h.wait("paused", 5, |e| *e == Event::Paused(true));
+    let written = h.output().len();
+    h.player.send(Command::Seek(8_000));
+    h.wait(
+        "moved",
+        5,
+        |e| matches!(e, Event::Position { id: 1, ms, .. } if (8_000..8_300).contains(ms)),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(h.output().len(), written, "nothing played while paused");
+    h.player.send(Command::Resume);
+    h.wait("resumed", 5, |e| *e == Event::Paused(false));
+    h.wait(
+        "playing from there",
+        5,
+        |e| matches!(e, Event::Position { id: 1, ms, .. } if (8_100..9_000).contains(ms)),
+    );
+}

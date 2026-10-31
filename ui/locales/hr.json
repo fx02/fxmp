@@ -10,6 +10,7 @@
   "player.ban_confirm": "Sigurno?",
   "player.banned": "Zabranjeno: {track}",
   "player.volume": "Glasnoća",
+  "player.seek": "Pozicija: povuci za skok unutar pjesme",
   "conn.checking": "Provjeravam vezu…",
   "conn.not_set_up": "Server nije postavljen",
   "conn.ok": "Spojeno",

@@ -76,7 +76,8 @@ fn spawn_deck_thread(
             phase: Phase::Loading,
             decoded_any: false,
             duration_ms: None,
-            start_ms: 0,
+            // Until the decoder says where it landed.
+            start_ms,
             cancelled: false,
         }),
         space: Condvar::new(),

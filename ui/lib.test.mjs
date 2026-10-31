@@ -12,6 +12,8 @@ import {
   scanDoneText,
   connMessage,
   serverFromForm,
+  seekTarget,
+  SEEK_STEPS,
   noServerOn,
   missingUsername,
   passwordRequired,
@@ -539,4 +541,13 @@ test("scan texts name the library when several are scanned", () => {
     scanDoneText({ ...done, from_backup: [{ id: 1, name: "" }] }, hr),
     "Katalog osvježen: 2 datoteke. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0. Skenirano s rezervnog servera, ništa nije uklonjeno: Glavni server.",
   );
+});
+
+test("seekTarget maps the slider onto the track", () => {
+  assert.equal(seekTarget(0, 200_000), 0);
+  assert.equal(seekTarget(SEEK_STEPS / 2, 200_000), 100_000);
+  assert.equal(seekTarget(SEEK_STEPS, 200_000), 200_000);
+  assert.equal(seekTarget(SEEK_STEPS + 5, 200_000), 200_000);
+  assert.equal(seekTarget(-1, 200_000), 0);
+  assert.equal(seekTarget(500, null), 0);
 });

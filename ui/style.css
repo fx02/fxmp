@@ -110,8 +110,7 @@ button.np-label:hover:not(:disabled) { background: none; color: var(--accent); }
 button.np-label:disabled { opacity: 1; }
 
 .np-progress { display: flex; align-items: center; gap: 8px; }
-.np-bar { flex: 1; height: 3px; border-radius: 2px; background: var(--border); overflow: hidden; }
-.np-fill { height: 100%; width: 0; background: var(--accent); }
+.seek { flex: 1; min-width: 60px; margin: 0; }
 .np-time { flex: none; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .chip {
   flex: none;

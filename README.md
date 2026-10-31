@@ -294,7 +294,9 @@ server's address), an **On** switch and (except the main one) **Remove**:
   A refresh that fails or is cancelled leaves the library as it was.
 - Now-playing bar: "Artist – Title (Year)", the elapsed and total time
   (`m:ss / m:ss`, `h:mm:ss` for an hour or longer; only the elapsed time when
-  the length is unknown) with a thin progress bar. ⏮ previous (more than 3 s
+  the length is unknown) with a position slider: drag it to jump forward or
+  back in the track (FLAC/OGG land within 0.1 s, MP3 within about a second; the
+  slider is off when the length is unknown). ⏮ previous (more than 3 s
   into a track it starts the track again), ⏯ pause, ⏭ next, 🚫 "never play this
   track again" (asks for confirmation: click again within 3 s), and a volume
   slider. Banned tracks come
@@ -445,6 +447,8 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] Look in light and dark mode (420×640, long titles, genre chip, ⋯).
 - [ ] Left click on the menu bar icon reliably pauses / resumes, after the
       system double-click interval, max 0.4 s (0.4 s on a default Mac).
+- [ ] Dragging the position slider jumps there without a click in the sound,
+      also while paused (it stays paused); the time follows the slider.
 - [ ] Double click on the menu bar icon skips the track and does not pause;
       three quick clicks skip once (and then pause once).
 - [ ] Menu bar menu → Volume: the checked step follows the window's slider, and
