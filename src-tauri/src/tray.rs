@@ -207,8 +207,8 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Left clicks: one is "Next" (after the double-click window), two are
-/// "Play/Pause". A right click opens the menu; the device list is read again for
+/// Left clicks: one is "Play/Pause" (after the double-click window), two are
+/// "Next". A right click opens the menu; the device list is read again for
 /// the next time.
 fn on_icon_event(app: &AppHandle, event: TrayIconEvent) {
     let now = Instant::now();
@@ -233,10 +233,10 @@ fn on_icon_event(app: &AppHandle, event: TrayIconEvent) {
         _ => None,
     };
     match action {
-        Some(ClickAction::Toggle) => {
-            log::debug!("tray: double click, play/pause");
-            spawn_action(app, "play/pause", |app, st| {
-                play_pause_now(app, st, Command::TogglePause);
+        Some(ClickAction::Double) => {
+            log::debug!("tray: double click, next track");
+            spawn_action(app, "next", |app, st| {
+                next_now(app, st);
                 Ok(())
             });
         }
@@ -248,8 +248,11 @@ fn on_icon_event(app: &AppHandle, event: TrayIconEvent) {
                 .spawn(move || {
                     std::thread::sleep(window);
                     if clicks(&handle, |c| c.due(seq, Instant::now())) == Some(true) {
-                        log::debug!("tray: single click, next track");
-                        next_now(&handle, &handle.state::<AppState>());
+                        log::debug!("tray: single click, play/pause");
+                        spawn_action(&handle, "play/pause", |app, st| {
+                            play_pause_now(app, st, Command::TogglePause);
+                            Ok(())
+                        });
                     }
                 });
             if let Err(e) = spawned {

@@ -39,8 +39,6 @@ What the owner asked for that is not done yet. The order is not a priority.
     after an automatic pause, after a 2–3 s delay so short mute toggles don't
     pump the volume. Music that was already paused before the call is never
     started.
-- **Swap the tray clicks** (owner, 2026-10-31): a single click on the tray icon
-  toggles play/pause, a double click skips to the next track.
 - **Seek slider** (owner, 2026-10-31): the position bar becomes a slider like
   the volume one, to jump forward/back in the track. The engine's `seek_to`
   (used for resume) already exists; mp3 seeks are coarse (about 1 s).

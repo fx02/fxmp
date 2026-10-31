@@ -319,8 +319,8 @@ server's address), an **On** switch and (except the main one) **Remove**:
   picture. macOS always draws the app's icon on a notification; an app cannot
   remove it.
 - Menu bar icon:
-  - **one left click = next track**, **double click = pause/resume** (a double
-    click never also skips). To tell the two apart, "next" waits for the
+  - **one left click = pause/resume**, **double click = next track** (a double
+    click never also pauses). To tell the two apart, the pause waits for the
     double-click time to pass: the system double-click interval, max 0.4 s
     (0.4 s on a default Mac; shorter if System Settings → Mouse/Trackpad →
     Double-click speed is faster; on Windows the system double-click time,
@@ -443,11 +443,10 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] Volume normalization: tracks are about equally loud (on/off).
 - [ ] Five starts of the same genre give five different first tracks.
 - [ ] Look in light and dark mode (420×640, long titles, genre chip, ⋯).
-- [ ] Left click on the menu bar icon reliably skips the track (if the click does
-      not arrive reliably: move "Next" to the first menu item), after the
+- [ ] Left click on the menu bar icon reliably pauses / resumes, after the
       system double-click interval, max 0.4 s (0.4 s on a default Mac).
-- [ ] Double click on the menu bar icon pauses / resumes and does not skip;
-      three quick clicks pause once (and then skip once).
+- [ ] Double click on the menu bar icon skips the track and does not pause;
+      three quick clicks skip once (and then pause once).
 - [ ] Menu bar menu → Volume: the checked step follows the window's slider, and
       picking a step changes the volume and moves the slider.
 - [ ] Menu bar menu → Output: lists the devices (a newly plugged-in device shows
