@@ -18,7 +18,7 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// One SMB server. `root` is the music folder inside the share. Blank by default
 /// (the form shows examples).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
     pub host: String,
@@ -26,6 +26,21 @@ pub struct ServerConfig {
     pub root: String,
     pub username: String,
     pub domain: Option<String>,
+    /// Off: the library reads only from its other server (the two are mirrors).
+    pub enabled: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            share: String::new(),
+            root: String::new(),
+            username: String::new(),
+            domain: None,
+            enabled: true,
+        }
+    }
 }
 
 /// Where a library's music is.

@@ -49,6 +49,8 @@
   "albums.year": "{name} ({year})",
   "settings.main_server": "Glavni server",
   "settings.backup_server": "Rezervni server",
+  "settings.server_on": "Koristi ovaj server",
+  "settings.no_server_on": "Uključi barem jedan server: biblioteka nema odakle čitati.",
   "settings.server": "Server",
   "settings.share": "Share",
   "settings.path": "Putanja",

@@ -246,7 +246,16 @@ export function serverFromForm(f) {
     root: (f.root || "").trim(),
     username: (f.username || "").trim(),
     domain: domain || null,
+    enabled: f.enabled !== false,
   };
+}
+
+/**
+ * Whether neither server of an SMB library is switched on (`secondary` null:
+ * none set up): it would have nothing to read from.
+ */
+export function noServerOn(primary, secondary) {
+  return !primary.enabled && !(secondary && secondary.enabled);
 }
 
 export function missingUsername(server) {

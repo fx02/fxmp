@@ -12,6 +12,7 @@ import {
   scanDoneText,
   connMessage,
   serverFromForm,
+  noServerOn,
   missingUsername,
   passwordRequired,
   mergeChoices,
@@ -316,9 +317,21 @@ test("mergeChoices: genres with tracks first; other known genres only when searc
 test("serverFromForm trims fields and turns an empty domain into null", () => {
   assert.deepEqual(
     serverFromForm({ host: " 10.111.100.2 ", share: "F", root: "/MP3 ", username: " music ", domain: " " }),
-    { host: "10.111.100.2", share: "F", root: "/MP3", username: "music", domain: null },
+    { host: "10.111.100.2", share: "F", root: "/MP3", username: "music", domain: null, enabled: true },
   );
   assert.equal(serverFromForm({ host: "h", share: "s", root: "", username: "u", domain: "WG" }).domain, "WG");
+  assert.equal(serverFromForm({ host: "h", enabled: false }).enabled, false);
+  assert.equal(serverFromForm(serverFromForm({ host: "h", enabled: false })).enabled, false);
+});
+
+test("noServerOn: a library needs one of its servers switched on", () => {
+  const on = { enabled: true };
+  const off = { enabled: false };
+  assert.equal(noServerOn(on, null), false);
+  assert.equal(noServerOn(off, null), true);
+  assert.equal(noServerOn(off, on), false);
+  assert.equal(noServerOn(on, off), false);
+  assert.equal(noServerOn(off, off), true);
 });
 
 test("missingUsername", () => {
@@ -475,7 +488,7 @@ test("libraryFromForm builds the backend's library", () => {
       id: 0,
       name: "NAS",
       enabled: true,
-      source: { type: "smb", primary: { host: "h", share: "F", root: "MP3", username: "u", domain: null }, secondary: null },
+      source: { type: "smb", primary: { host: "h", share: "F", root: "MP3", username: "u", domain: null, enabled: true }, secondary: null },
     },
   );
   assert.deepEqual(

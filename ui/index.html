@@ -110,6 +110,7 @@
     <form id="servers-form" autocomplete="off">
       <fieldset data-server="primary">
         <legend data-i18n="settings.main_server"></legend>
+        <label class="check"><input name="enabled" type="checkbox" checked> <span data-i18n="settings.server_on"></span></label>
         <label><span data-i18n="settings.server"></span> <input name="host" data-i18n-placeholder="settings.host_example" spellcheck="false"></label>
         <label><span data-i18n="settings.share"></span> <input name="share" data-i18n-placeholder="settings.share_example" spellcheck="false"></label>
         <label><span data-i18n="settings.path"></span> <input name="root" data-i18n-placeholder="settings.root_example" spellcheck="false"></label>
@@ -125,6 +126,7 @@
       <label class="check"><input id="use-secondary" type="checkbox"> <span data-i18n="settings.backup_server"></span></label>
       <fieldset data-server="secondary" hidden>
         <legend data-i18n="settings.backup_server"></legend>
+        <label class="check"><input name="enabled" type="checkbox" checked> <span data-i18n="settings.server_on"></span></label>
         <label><span data-i18n="settings.server"></span> <input name="host" data-i18n-placeholder="settings.host_example" spellcheck="false"></label>
         <label><span data-i18n="settings.share"></span> <input name="share" data-i18n-placeholder="settings.share_example" spellcheck="false"></label>
         <label><span data-i18n="settings.path"></span> <input name="root" data-i18n-placeholder="settings.root_example" spellcheck="false"></label>
@@ -171,6 +173,7 @@
       <div id="library-smb">
         <fieldset data-libserver="primary">
           <legend data-i18n="settings.main_server"></legend>
+          <label class="check"><input name="enabled" type="checkbox" checked> <span data-i18n="settings.server_on"></span></label>
           <label><span data-i18n="settings.server"></span> <input name="host" data-i18n-placeholder="settings.host_example" spellcheck="false"></label>
           <label><span data-i18n="settings.share"></span> <input name="share" data-i18n-placeholder="settings.share_example" spellcheck="false"></label>
           <label><span data-i18n="settings.path"></span> <input name="root" data-i18n-placeholder="settings.root_example" spellcheck="false"></label>
@@ -185,6 +188,7 @@
         <label class="check"><input id="lib-use-secondary" type="checkbox"> <span data-i18n="settings.backup_server"></span></label>
         <fieldset data-libserver="secondary" hidden>
           <legend data-i18n="settings.backup_server"></legend>
+          <label class="check"><input name="enabled" type="checkbox" checked> <span data-i18n="settings.server_on"></span></label>
           <label><span data-i18n="settings.server"></span> <input name="host" data-i18n-placeholder="settings.host_example" spellcheck="false"></label>
           <label><span data-i18n="settings.share"></span> <input name="share" data-i18n-placeholder="settings.share_example" spellcheck="false"></label>
           <label><span data-i18n="settings.path"></span> <input name="root" data-i18n-placeholder="settings.root_example" spellcheck="false"></label>

@@ -17,7 +17,11 @@ A macOS-first Tauri 2 player that plays music straight from an SMB share
   fade; volume normalization (ReplayGain or measured loudness, target -18 LUFS).
 - Lives in the Dock and in the menu bar, with media keys and Now Playing,
   optional notifications and start at login.
-- Optional backup server: if the main server does not answer, the backup is used.
+- Optional backup server (a mirror with the same paths): if the main server does
+  not answer, the backup is used. The app sticks with whichever server answered
+  last, so a day on the backup never waits for the main server's timeouts; it
+  goes back to the main server as soon as that answers again. Each server has a
+  **Use this server** switch to read only from the other one.
 - More music sources ("libraries"): further SMB servers and local folders (an
   external disk, a mounted network volume) play together with the main server.
 
@@ -471,6 +475,10 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] A full first scan to the end, with genres appearing along the way.
 - [ ] The keychain prompt ("Always Allow"), and tracks play normally afterwards.
 - [ ] Switching to the backup server when the main one is unreachable.
+- [ ] With only the backup reachable, the next tracks start without a pause; when
+  the main server is back, playback returns to it within about 15 s.
+- [ ] Unticking **Use this server** on the main server plays everything from the
+  backup, with a green status dot.
 - [ ] Libraries: add a local folder on a USB disk with "Choose folder…", refresh,
       and play; unplug the disk (the dot turns red, the tooltip names it, its
       tracks are passed over and not listed as unreadable), plug it back in (green

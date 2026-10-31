@@ -12,6 +12,7 @@ import {
   libraryFromForm,
   statusTooltip,
   serverFromForm,
+  noServerOn,
   missingUsername,
   passwordRequired,
   mergeChoices,
@@ -1453,6 +1454,7 @@ function updatePasswordHint(which) {
 function fillServer(which, cfg) {
   const fs = fieldset(which);
   for (const f of serverFields) fs.elements[f].value = cfg[f] || "";
+  fs.elements.enabled.checked = cfg.enabled !== false;
   fs.elements.password.value = "";
   fs.querySelector(".test-result").textContent = "";
   updatePasswordHint(which);
@@ -1460,7 +1462,7 @@ function fillServer(which, cfg) {
 
 function readServer(which) {
   const fs = fieldset(which);
-  const values = {};
+  const values = { enabled: fs.elements.enabled.checked };
   for (const f of serverFields) values[f] = fs.elements[f].value;
   return serverFromForm(values);
 }
@@ -1524,6 +1526,11 @@ async function onSave(e) {
   result.className = "result bad";
   const primary = readServer("primary");
   const secondary = $("use-secondary").checked ? readServer("secondary") : null;
+  if (noServerOn(primary, secondary)) {
+    result.textContent = t("settings.no_server_on");
+    fieldset("primary").elements.enabled.focus();
+    return;
+  }
   for (const [which, srv] of [["primary", primary], ["secondary", secondary]]) {
     if (!srv) continue;
     const els = fieldset(which).elements;
@@ -1677,7 +1684,7 @@ function libFieldset(which) {
 
 function readLibServer(which) {
   const fs = libFieldset(which);
-  const values = {};
+  const values = { enabled: fs.elements.enabled.checked };
   for (const f of serverFields) values[f] = fs.elements[f].value;
   return serverFromForm(values);
 }
@@ -1699,6 +1706,7 @@ function updateLibPasswordHint(which) {
 function fillLibServer(which, cfg) {
   const fs = libFieldset(which);
   for (const f of serverFields) fs.elements[f].value = (cfg && cfg[f]) || "";
+  fs.elements.enabled.checked = !cfg || cfg.enabled !== false;
   fs.elements.password.value = "";
   fs.querySelector(".test-result").textContent = "";
   updateLibPasswordHint(which);
@@ -1813,6 +1821,11 @@ async function onLibrarySave(e) {
   if (ed.type === "smb" && !main) {
     primary = readLibServer("primary");
     secondary = $("lib-use-secondary").checked ? readLibServer("secondary") : null;
+    if (noServerOn(primary, secondary)) {
+      result.textContent = t("settings.no_server_on");
+      libFieldset("primary").elements.enabled.focus();
+      return;
+    }
     for (const [which, srv] of [["primary", primary], ["secondary", secondary]]) {
       if (!srv) continue;
       const els = libFieldset(which).elements;

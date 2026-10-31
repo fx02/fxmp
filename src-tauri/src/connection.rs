@@ -368,50 +368,167 @@ impl MusicSource for LazySmb {
 }
 
 /// One SMB library's servers: primary, optional secondary, and the failover pair
-/// over them.
+/// over them. A server switched off in the settings is left out.
 pub struct Servers {
-    pub primary: LazySmb,
+    /// `None`: switched off.
+    pub primary: Option<LazySmb>,
     pub secondary: Option<LazySmb>,
-    pub failover: FailoverSource,
+    pub failover: Arc<FailoverSource>,
 }
+
+/// Once the secondary answers, how much longer a check waits for the primary
+/// before it reports the backup: a working primary is usually that quick, a dead
+/// one takes its whole connect timeout. A primary answering later (a disk that
+/// had to spin up) still takes over at once.
+pub const PRIMARY_GRACE: Duration = Duration::from_secs(3);
 
 impl Servers {
     /// Builds the servers of library `library`, with passwords from `creds`. Does
-    /// not connect.
+    /// not connect. `None` when both are switched off.
     pub fn new(
         library: LibraryId,
         primary: &ServerConfig,
         secondary: Option<&ServerConfig>,
         creds: &dyn CredentialStore,
-    ) -> Self {
+    ) -> Option<Self> {
         let lazy = |s: &ServerConfig| {
             let password = server_password(creds, library, s).unwrap_or_default();
             LazySmb::new(smb_config(s, password))
         };
-        let primary = lazy(primary);
-        let secondary = secondary.map(lazy);
-        let failover = FailoverSource::new(
-            Box::new(primary.clone()),
-            secondary
-                .clone()
-                .map(|s| Box::new(s) as Box<dyn MusicSource>),
-        );
-        Self {
+        let primary = Some(primary).filter(|s| s.enabled).map(lazy);
+        let secondary = secondary.filter(|s| s.enabled).map(lazy);
+        let boxed = |s: &LazySmb| Box::new(s.clone()) as Box<dyn MusicSource>;
+        let failover = match (&primary, &secondary) {
+            (Some(p), s) => FailoverSource::new(boxed(p), s.as_ref().map(boxed)),
+            (None, Some(s)) => FailoverSource::backup_only(boxed(s)),
+            (None, None) => return None,
+        };
+        Some(Self {
             primary,
             secondary,
-            failover,
-        }
+            failover: Arc::new(failover),
+        })
     }
 
-    /// Checks the primary and, if it fails, the secondary.
+    /// Checks both servers at once, so a dead primary's connect timeout does not
+    /// hold up the backup (see [`check_pair`]), and opens files from the one that
+    /// answered from now on: the primary whenever it does. A library whose primary
+    /// is switched off is [`ConnStatus::Ok`] while its backup answers: that is the
+    /// owner's choice, not a fault.
     pub fn probe(&self) -> ConnStatus {
-        let primary = self.primary.check();
-        let secondary = match (&primary, &self.secondary) {
-            (Err(_), Some(s)) => Some(s.check()),
-            _ => None,
+        let (primary, secondary) = match (&self.primary, &self.secondary) {
+            (Some(p), Some(s)) => {
+                let (p, s) = check_pair(p.clone(), s.clone(), &self.failover, PRIMARY_GRACE);
+                (Some(p), s)
+            }
+            (Some(p), None) => (Some(p.check()), None),
+            (None, Some(s)) => (None, Some(s.check())),
+            (None, None) => (None, None),
         };
-        status_of(primary, secondary)
+        if let Some(which) = answered(primary.as_ref(), secondary.as_ref()) {
+            self.failover.prefer(which);
+        }
+        match primary {
+            Some(primary) => status_of(primary, secondary),
+            None => status_of(secondary.unwrap_or(Err(SourceError::Unreachable)), None),
+        }
     }
+}
+
+/// The server to open files from after a check: the primary whenever it answered.
+fn answered(
+    primary: Option<&Result<(), SourceError>>,
+    secondary: Option<&Result<(), SourceError>>,
+) -> Option<Which> {
+    if primary.is_some_and(Result::is_ok) {
+        Some(Which::Primary)
+    } else if secondary.is_some_and(Result::is_ok) {
+        Some(Which::Secondary)
+    } else {
+        None
+    }
+}
+
+/// Checks `primary` and `secondary` on their own threads. Waits for the primary;
+/// the secondary's answer counts only when the primary fails (`None` otherwise).
+/// Once the secondary works, the primary gets `grace` more to answer, after which
+/// it counts as timed out. Its check goes on: when it answers, `failover` opens
+/// files from it again.
+pub fn check_pair(
+    primary: LazySmb,
+    secondary: LazySmb,
+    failover: &Arc<FailoverSource>,
+    grace: Duration,
+) -> (Result<(), SourceError>, Option<Result<(), SourceError>>) {
+    let failover = failover.clone();
+    let primary = move || {
+        let r = primary.check();
+        if r.is_ok() {
+            failover.prefer(Which::Primary);
+        }
+        r
+    };
+    check_pair_with(primary, move || secondary.check(), grace)
+}
+
+fn check_pair_with(
+    primary: impl FnOnce() -> Result<(), SourceError> + Send + 'static,
+    secondary: impl FnOnce() -> Result<(), SourceError> + Send + 'static,
+    grace: Duration,
+) -> (Result<(), SourceError>, Option<Result<(), SourceError>>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (which, check) in [
+        (
+            Which::Primary,
+            Box::new(primary) as Box<dyn FnOnce() -> _ + Send>,
+        ),
+        (Which::Secondary, Box::new(secondary)),
+    ] {
+        let thread_tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("server-check".into())
+            .spawn(move || {
+                let _ = thread_tx.send((which, check()));
+            });
+        if let Err(e) = spawned {
+            log::warn!("cannot start a server check: {e}");
+            let _ = tx.send((which, Err(SourceError::Unreachable)));
+        }
+    }
+    drop(tx);
+    let mut primary = None;
+    let mut secondary: Option<Result<(), SourceError>> = None;
+    let mut deadline: Option<Instant> = None;
+    loop {
+        let got = match deadline {
+            Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
+                Ok(got) => got,
+                Err(_) => break,
+            },
+            None => match rx.recv() {
+                Ok(got) => got,
+                Err(_) => break,
+            },
+        };
+        match got {
+            (Which::Primary, Ok(())) => return (Ok(()), None),
+            (Which::Primary, Err(SourceError::Auth)) => return (Err(SourceError::Auth), None),
+            (Which::Primary, r) => primary = Some(r),
+            (Which::Secondary, r) => {
+                if r.is_ok() {
+                    deadline = Some(Instant::now() + grace);
+                }
+                secondary = Some(r);
+            }
+        }
+        if primary.is_some() && secondary.is_some() {
+            break;
+        }
+    }
+    (
+        primary.unwrap_or(Err(SourceError::Timeout)),
+        Some(secondary.unwrap_or(Err(SourceError::Unreachable))),
+    )
 }
 
 /// A library's source.
@@ -521,7 +638,7 @@ impl LibraryConn {
     }
 
     /// The library as set in `library`, if it is set up: an SMB server with a
-    /// user, or a folder. Only an SMB library reads `creds`.
+    /// user and at least one server switched on, or a folder. Only an SMB library reads `creds`.
     pub fn from_library(library: &Library, creds: &dyn CredentialStore) -> Option<Self> {
         match &library.source {
             LibrarySource::Smb { primary, secondary } => {
@@ -536,7 +653,7 @@ impl LibraryConn {
                         primary,
                         secondary.as_ref(),
                         creds,
-                    )),
+                    )?),
                     check: Arc::default(),
                 })
             }
@@ -550,7 +667,7 @@ impl LibraryConn {
     /// What the scanner and the player read.
     pub fn source(&self) -> &dyn MusicSource {
         match &self.kind {
-            LibraryKind::Smb(s) => &s.failover,
+            LibraryKind::Smb(s) => s.failover.as_ref(),
             LibraryKind::Local { source, .. } => source,
             #[cfg(test)]
             LibraryKind::Fake { source, .. } => source,
@@ -811,7 +928,13 @@ mod tests {
     fn primary_host(src: &AppSource) -> String {
         let libs = src.libraries().unwrap();
         let lib = libs.get(DEFAULT_LIBRARY).unwrap();
-        lib.servers().unwrap().primary.host().to_string()
+        lib.servers()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .host()
+            .to_string()
     }
 
     #[test]
@@ -833,6 +956,129 @@ mod tests {
         src.set(Some(Libraries::from_settings(&host("b"), &creds)));
         assert!(!src.set_if_unset(Libraries::from_settings(&host("a"), &creds)));
         assert_eq!(primary_host(&src), "b");
+    }
+
+    fn after(
+        delay_ms: u64,
+        r: Result<(), SourceError>,
+    ) -> impl FnOnce() -> Result<(), SourceError> + Send + 'static {
+        move || {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            r
+        }
+    }
+
+    #[test]
+    fn a_dead_primary_does_not_hold_up_a_working_backup() {
+        let start = Instant::now();
+        let got = check_pair_with(
+            after(5_000, Err(SourceError::Timeout)),
+            after(0, Ok(())),
+            Duration::from_millis(100),
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(got, (Err(SourceError::Timeout), Some(Ok(()))));
+        assert_eq!(status_of(got.0, got.1), ConnStatus::Secondary);
+    }
+
+    #[test]
+    fn a_primary_answering_within_the_grace_wins() {
+        let got = check_pair_with(after(50, Ok(())), after(0, Ok(())), Duration::from_secs(2));
+        assert_eq!(got, (Ok(()), None));
+    }
+
+    #[test]
+    fn a_failed_primary_waits_for_the_backup() {
+        let got = check_pair_with(
+            after(0, Err(SourceError::Unreachable)),
+            after(100, Ok(())),
+            Duration::from_millis(10),
+        );
+        assert_eq!(got, (Err(SourceError::Unreachable), Some(Ok(()))));
+    }
+
+    #[test]
+    fn a_failed_backup_waits_for_the_primary() {
+        let got = check_pair_with(
+            after(100, Ok(())),
+            after(0, Err(SourceError::Unreachable)),
+            Duration::from_millis(10),
+        );
+        assert_eq!(got, (Ok(()), None));
+        let got = check_pair_with(
+            after(100, Err(SourceError::Timeout)),
+            after(0, Err(SourceError::Unreachable)),
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            got,
+            (
+                Err(SourceError::Timeout),
+                Some(Err(SourceError::Unreachable))
+            )
+        );
+    }
+
+    #[test]
+    fn a_rejected_primary_password_is_reported_at_once() {
+        let got = check_pair_with(
+            after(0, Err(SourceError::Auth)),
+            after(5_000, Ok(())),
+            Duration::from_millis(10),
+        );
+        assert_eq!(got, (Err(SourceError::Auth), None));
+    }
+
+    #[test]
+    fn files_come_from_the_server_that_answered() {
+        let (ok, down) = (Ok(()), Err(SourceError::Timeout));
+        assert_eq!(answered(Some(&ok), None), Some(Which::Primary));
+        assert_eq!(answered(Some(&ok), Some(&ok)), Some(Which::Primary));
+        assert_eq!(answered(Some(&down), Some(&ok)), Some(Which::Secondary));
+        assert_eq!(answered(None, Some(&ok)), Some(Which::Secondary));
+        assert_eq!(answered(Some(&down), Some(&down)), None, "keep the last");
+        assert_eq!(answered(Some(&down), None), None);
+    }
+
+    fn mirrors(primary_on: bool, secondary_on: bool) -> (ServerConfig, ServerConfig) {
+        let server = |host: &str, enabled| ServerConfig {
+            host: host.into(),
+            username: "music".into(),
+            enabled,
+            ..ServerConfig::default()
+        };
+        (server("a", primary_on), server("b", secondary_on))
+    }
+
+    #[test]
+    fn a_switched_off_server_is_left_out() {
+        let creds = MemoryStore::default();
+        let (p, s) = mirrors(false, true);
+        let servers = Servers::new(1, &p, Some(&s), &creds).unwrap();
+        assert!(servers.primary.is_none());
+        assert_eq!(servers.secondary.as_ref().unwrap().host(), "b");
+        assert_eq!(servers.failover.active(), Which::Secondary);
+
+        let (p, s) = mirrors(true, false);
+        let servers = Servers::new(1, &p, Some(&s), &creds).unwrap();
+        assert_eq!(servers.primary.as_ref().unwrap().host(), "a");
+        assert!(servers.secondary.is_none());
+        assert_eq!(servers.failover.active(), Which::Primary);
+
+        let (p, s) = mirrors(false, false);
+        assert!(Servers::new(1, &p, Some(&s), &creds).is_none());
+        // Without a backup, a switched-off primary leaves nothing to read.
+        assert!(Servers::new(1, &p, None, &creds).is_none());
+    }
+
+    #[test]
+    fn old_settings_have_their_servers_switched_on() {
+        let s: ServerConfig = serde_json::from_str(r#"{"host":"h","username":"u"}"#).unwrap();
+        assert!(s.enabled);
     }
 
     #[test]
@@ -948,6 +1194,7 @@ mod tests {
             root: "MP3".into(),
             username: "backup".into(),
             domain: None,
+            enabled: true,
         };
         let t = test_target(
             &settings,
@@ -1007,6 +1254,7 @@ mod tests {
                 root: "MP3".into(),
                 username: " music ".into(),
                 domain: Some("  ".into()),
+                enabled: true,
             },
             secondary: Some(ServerConfig {
                 host: "10.111.0.2".into(),
@@ -1014,12 +1262,13 @@ mod tests {
                 root: "/MP3".into(),
                 username: "backup".into(),
                 domain: Some("WORKGROUP".into()),
+                enabled: true,
             }),
             ..Settings::default()
         };
         let libs = Libraries::from_settings(&settings, &creds);
         let servers = libs.get(1).unwrap().servers().unwrap();
-        let p = servers.primary.config();
+        let p = servers.primary.as_ref().unwrap().config();
         assert_eq!(
             (p.host.as_str(), p.username.as_str()),
             ("10.111.100.2", "music")
@@ -1321,7 +1570,7 @@ mod tests {
 
     /// The first library's servers.
     fn smb_servers(settings: &Settings, creds: &MemoryStore) -> Servers {
-        Servers::new(1, &settings.primary, settings.secondary.as_ref(), creds)
+        Servers::new(1, &settings.primary, settings.secondary.as_ref(), creds).unwrap()
     }
 
     /// Settings and a credential store from `.env.test` (primary `SMB_TEST_*`,
@@ -1354,6 +1603,7 @@ mod tests {
             root: p("PATH"),
             username: p("USER"),
             domain: env.get("SMB_TEST_DOMAIN").cloned(),
+            enabled: true,
         };
         creds.put(1, &primary.host, &primary.username, &p("PASS"));
         let secondary = env.get("SMB_TEST2_HOST").map(|host| ServerConfig {
@@ -1362,6 +1612,7 @@ mod tests {
             root: s("PATH"),
             username: s("USER"),
             domain: env.get("SMB_TEST2_DOMAIN").cloned(),
+            enabled: true,
         });
         if let Some(sec) = &secondary {
             creds.put(1, &sec.host, &sec.username, &s("PASS"));
@@ -1380,19 +1631,28 @@ mod tests {
     fn live_probe_reports_ok_secondary_and_auth() {
         let (settings, creds) = live_settings();
         let servers = smb_servers(&settings, &creds);
-        assert_eq!(servers.probe(), ConnStatus::Ok);
+        // A primary whose disk has to spin up may answer after the backup's grace.
+        assert!(servers.probe().reachable());
         assert_eq!(
             servers.probe(),
             ConnStatus::Ok,
             "probe on a live connection"
         );
+        assert_eq!(servers.failover.active(), fxmp_core::source::Which::Primary);
 
         // Primary unreachable (TEST-NET-1, like a VPN that is down): the secondary takes over.
         if let Some(sec) = &settings.secondary {
             let mut down = settings.clone();
             down.primary.host = "192.0.2.1".into();
             let servers = smb_servers(&down, &creds);
+            let start = Instant::now();
             assert_eq!(servers.probe(), ConnStatus::Secondary);
+            // The dead primary's connect timeout is not waited for.
+            assert!(
+                start.elapsed() < PRIMARY_GRACE + Duration::from_secs(5),
+                "{:?}",
+                start.elapsed()
+            );
             let pw = server_password(&creds, 1, sec).unwrap();
             let entry = SmbSource::connect(smb_config(sec, pw))
                 .unwrap()
@@ -1400,6 +1660,23 @@ mod tests {
                 .unwrap()
                 .pop()
                 .expect("secondary has files");
+            let start = Instant::now();
+            servers.failover.open(&entry.rel_path).unwrap();
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                start.elapsed()
+            );
+            assert_eq!(
+                servers.failover.active(),
+                fxmp_core::source::Which::Secondary
+            );
+
+            // The primary switched off: only the backup is read, and that is fine.
+            let mut off = settings.clone();
+            off.primary.enabled = false;
+            let servers = smb_servers(&off, &creds);
+            assert_eq!(servers.probe(), ConnStatus::Ok);
             servers.failover.open(&entry.rel_path).unwrap();
             assert_eq!(
                 servers.failover.active(),

@@ -13,7 +13,8 @@ pub enum Which {
 }
 
 pub struct FailoverSource {
-    primary: Box<dyn MusicSource>,
+    /// `None`: switched off, everything is read from the secondary.
+    primary: Option<Box<dyn MusicSource>>,
     secondary: Option<Box<dyn MusicSource>>,
     on_secondary: AtomicBool,
 }
@@ -31,13 +32,23 @@ fn open_falls_back(e: &SourceError) -> bool {
 impl FailoverSource {
     pub fn new(primary: Box<dyn MusicSource>, secondary: Option<Box<dyn MusicSource>>) -> Self {
         Self {
-            primary,
+            primary: Some(primary),
             secondary,
             on_secondary: AtomicBool::new(false),
         }
     }
 
-    /// The source that served the most recent successful operation.
+    /// A pair whose primary is switched off: only `secondary` is read, and its
+    /// listings count as the backup's.
+    pub fn backup_only(secondary: Box<dyn MusicSource>) -> Self {
+        Self {
+            primary: None,
+            secondary: Some(secondary),
+            on_secondary: AtomicBool::new(true),
+        }
+    }
+
+    /// The server that answered last: the one files are opened from first.
     pub fn active(&self) -> Which {
         if self.on_secondary.load(Ordering::Relaxed) {
             Which::Secondary
@@ -46,35 +57,66 @@ impl FailoverSource {
         }
     }
 
-    fn mark(&self, which: Which) {
-        self.on_secondary
-            .store(which == Which::Secondary, Ordering::Relaxed);
+    /// Opens files from `which` first from now on (a check found it answering).
+    /// Ignored for a server that is not there.
+    pub fn prefer(&self, which: Which) {
+        let there = match which {
+            Which::Primary => self.primary.is_some(),
+            Which::Secondary => self.secondary.is_some(),
+        };
+        if there {
+            self.on_secondary
+                .store(which == Which::Secondary, Ordering::Relaxed);
+        }
+    }
+
+    fn server(&self, which: Which) -> Option<&dyn MusicSource> {
+        match which {
+            Which::Primary => self.primary.as_deref(),
+            Which::Secondary => self.secondary.as_deref(),
+        }
+    }
+}
+
+fn other(which: Which) -> Which {
+    match which {
+        Which::Primary => Which::Secondary,
+        Which::Secondary => Which::Primary,
     }
 }
 
 impl MusicSource for FailoverSource {
-    /// Walks the primary; entries are buffered so a mid-walk failure never
-    /// delivers a partial listing before the secondary's full one. A listing by the
-    /// secondary is reported as [`WalkReport::from_backup`].
+    /// Walks the primary first, whichever server answered last: only its listing
+    /// may sweep files that are gone. Entries are buffered so a mid-walk failure
+    /// never delivers a partial listing before the secondary's full one. A listing
+    /// by the secondary is reported as [`WalkReport::from_backup`].
     /// On failure the primary's error is returned if the secondary fails too.
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
-        let mut buf = Vec::new();
-        let err = match self.primary.walk(&mut |e| buf.push(e)) {
-            Ok(report) => {
-                self.mark(Which::Primary);
-                buf.into_iter().for_each(on_entry);
-                return Ok(report);
+        let err = match &self.primary {
+            Some(primary) => {
+                let mut buf = Vec::new();
+                match primary.walk(&mut |e| buf.push(e)) {
+                    Ok(report) => {
+                        self.prefer(Which::Primary);
+                        buf.into_iter().for_each(on_entry);
+                        return Ok(report);
+                    }
+                    Err(e) => Some(e),
+                }
             }
-            Err(e) => e,
+            None => None,
         };
-        let Some(secondary) = self.secondary.as_ref().filter(|_| walk_falls_back(&err)) else {
-            return Err(err);
+        let secondary = match (&self.secondary, &err) {
+            (Some(s), None) => s,
+            (Some(s), Some(e)) if walk_falls_back(e) => s,
+            _ => return Err(err.unwrap_or(SourceError::Unreachable)),
         };
         let mut buf = Vec::new();
-        let Ok(report) = secondary.walk(&mut |e| buf.push(e)) else {
-            return Err(err);
+        let report = match secondary.walk(&mut |e| buf.push(e)) {
+            Ok(report) => report,
+            Err(e) => return Err(err.unwrap_or(e)),
         };
-        self.mark(Which::Secondary);
+        self.prefer(Which::Secondary);
         buf.into_iter().for_each(on_entry);
         Ok(WalkReport {
             from_backup: true,
@@ -82,30 +124,38 @@ impl MusicSource for FailoverSource {
         })
     }
 
+    /// Opens from the server that answered last, then from the other one. A day
+    /// on the backup thus never waits on a dead primary for each track.
+    /// On failure the primary's error is returned if the secondary fails too.
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
-        let err = match self.primary.open(rel_path) {
-            Ok(r) => {
-                self.mark(Which::Primary);
-                return Ok(r);
-            }
-            Err(e) => e,
+        let first = self.active();
+        let err = match self.server(first).map(|s| s.open(rel_path)) {
+            Some(Ok(r)) => return Ok(r),
+            Some(Err(e)) => e,
+            None => SourceError::Unreachable,
         };
-        let Some(secondary) = self.secondary.as_ref().filter(|_| open_falls_back(&err)) else {
+        // A password the backup rejects is no reason to skip the primary.
+        let falls_back = open_falls_back(&err)
+            || (first == Which::Secondary && matches!(err, SourceError::Auth));
+        let second = other(first);
+        let Some(server) = self.server(second).filter(|_| falls_back) else {
             return Err(err);
         };
-        match secondary.open(rel_path) {
+        match server.open(rel_path) {
             Ok(r) => {
-                self.mark(Which::Secondary);
+                self.prefer(second);
                 Ok(r)
             }
-            Err(_) => Err(err),
+            Err(e) => Err(if first == Which::Primary { err } else { e }),
         }
     }
 
     fn describe(&self) -> String {
-        match &self.secondary {
-            Some(s) => format!("{} (fallback: {})", self.primary.describe(), s.describe()),
-            None => self.primary.describe(),
+        match (&self.primary, &self.secondary) {
+            (Some(p), Some(s)) => format!("{} (fallback: {})", p.describe(), s.describe()),
+            (Some(p), None) => p.describe(),
+            (None, Some(s)) => s.describe(),
+            (None, None) => "(no server)".into(),
         }
     }
 }
@@ -202,9 +252,87 @@ mod tests {
         assert_eq!(f.active(), Which::Primary);
         assert_eq!(content(&f, "a.mp3").unwrap(), "s");
         assert_eq!(f.active(), Which::Secondary);
-        // A later success on the primary flips it back.
+        // Sticky: the next track comes from the backup too, without asking the primary.
+        assert_eq!(content(&f, "b.mp3").unwrap(), "s");
+        assert_eq!(f.active(), Which::Secondary);
+        // A check that finds the primary answering brings it back.
+        f.prefer(Which::Primary);
         assert_eq!(content(&f, "b.mp3").unwrap(), "p");
+    }
+
+    #[test]
+    fn on_the_backup_the_primary_is_not_asked_first() {
+        let f = failover(
+            FakeSource::new("p").open_err("a.mp3", SourceError::Timeout),
+            Some(FakeSource::new("s")),
+        );
+        f.prefer(Which::Secondary);
+        assert_eq!(content(&f, "a.mp3").unwrap(), "s");
+        assert_eq!(f.active(), Which::Secondary);
+    }
+
+    #[test]
+    fn a_file_the_backup_lacks_comes_from_the_primary() {
+        let f = failover(
+            FakeSource::new("p"),
+            Some(FakeSource::new("s").open_err("new.mp3", SourceError::NotFound)),
+        );
+        f.prefer(Which::Secondary);
+        assert_eq!(content(&f, "new.mp3").unwrap(), "p");
+        assert_eq!(f.active(), Which::Primary, "the primary answered last");
+    }
+
+    #[test]
+    fn a_password_the_backup_rejects_falls_back_to_the_primary() {
+        let f = failover(
+            FakeSource::new("p"),
+            Some(FakeSource::new("s").open_err("a.mp3", SourceError::Auth)),
+        );
+        f.prefer(Which::Secondary);
+        assert_eq!(content(&f, "a.mp3").unwrap(), "p");
+    }
+
+    #[test]
+    fn both_failing_from_the_backup_returns_the_primarys_error() {
+        let f = failover(
+            FakeSource::new("p").open_err("a.mp3", SourceError::NotFound),
+            Some(FakeSource::new("s").open_err("a.mp3", SourceError::Unreachable)),
+        );
+        f.prefer(Which::Secondary);
+        assert_eq!(content(&f, "a.mp3").err(), Some(SourceError::NotFound));
+        assert_eq!(f.active(), Which::Secondary);
+    }
+
+    #[test]
+    fn a_walk_asks_the_primary_first_even_on_the_backup() {
+        let f = failover(
+            FakeSource::new("p").entry("a.mp3"),
+            Some(FakeSource::new("s").entry("x.mp3")),
+        );
+        f.prefer(Which::Secondary);
+        let mut got = vec![];
+        let report = f.walk(&mut |e| got.push(e.rel_path)).unwrap();
+        assert_eq!(got, ["a.mp3"]);
+        assert!(!report.from_backup);
         assert_eq!(f.active(), Which::Primary);
+    }
+
+    #[test]
+    fn a_switched_off_primary_is_never_read() {
+        let f = FailoverSource::backup_only(Box::new(FakeSource::new("s").entry("x.mp3")));
+        assert_eq!(f.active(), Which::Secondary);
+        assert_eq!(content(&f, "a.mp3").unwrap(), "s");
+        f.prefer(Which::Primary);
+        assert_eq!(f.active(), Which::Secondary, "no primary to prefer");
+        let report = f.walk(&mut |_| {}).unwrap();
+        assert!(report.from_backup, "a backup listing never sweeps");
+        let f = FailoverSource::backup_only(Box::new(
+            FakeSource::new("s")
+                .open_err("a.mp3", SourceError::Timeout)
+                .walk_err(SourceError::Unreachable),
+        ));
+        assert_eq!(content(&f, "a.mp3").err(), Some(SourceError::Timeout));
+        assert_eq!(f.walk(&mut |_| {}).err(), Some(SourceError::Unreachable));
     }
 
     #[test]

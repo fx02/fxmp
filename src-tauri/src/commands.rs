@@ -503,7 +503,7 @@ pub async fn test_connection(
             let libs = st.source.libraries();
             if let Some(servers) = libs.as_ref().and_then(|l| l.get(library)?.servers()) {
                 let live = match which.as_str() {
-                    "primary" => Some(&servers.primary),
+                    "primary" => servers.primary.as_ref(),
                     _ => servers.secondary.as_ref(),
                 };
                 if let Some(live) = live {
@@ -1788,6 +1788,7 @@ mod tests {
                 root: "/MP3/".into(),
                 username: "music".into(),
                 domain: None,
+                enabled: true,
             },
             secondary: Some(ServerConfig {
                 host: "10.111.0.2".into(),
@@ -1795,6 +1796,7 @@ mod tests {
                 root: "".into(),
                 username: "backup".into(),
                 domain: Some("WG".into()),
+                enabled: true,
             }),
             ..Settings::default()
         }
@@ -2265,6 +2267,7 @@ mod tests {
                             root: "".into(),
                             username: "u".into(),
                             domain: None,
+                            enabled: true,
                         },
                         secondary: None,
                     },

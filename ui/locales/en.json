@@ -49,6 +49,8 @@
   "albums.year": "{name} ({year})",
   "settings.main_server": "Main server",
   "settings.backup_server": "Backup server",
+  "settings.server_on": "Use this server",
+  "settings.no_server_on": "Switch on at least one server: the library has nothing to read from.",
   "settings.server": "Server",
   "settings.share": "Share",
   "settings.path": "Path",
