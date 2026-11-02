@@ -22,6 +22,14 @@ use crate::lookup;
 use crate::state::{self, lock, AppState, NowPlaying};
 use crate::tray_click::{self, ClickAction, ClickClassifier};
 
+/// The tray icon. On macOS a template glyph the system recolours for light and
+/// dark menu bars; Windows draws it as it is, so there it is the coloured app icon,
+/// seen on light and dark taskbars alike.
+#[cfg(target_os = "macos")]
+const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-next@2x.png");
+#[cfg(not(target_os = "macos"))]
+const TRAY_ICON: &[u8] = include_bytes!("../icons/32x32.png");
+
 /// Genres change in bursts (every few seconds during a scan): the submenu is rebuilt
 /// once they settle for this long.
 const GENRE_MENU_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -152,10 +160,8 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let window = tray_click::window_for(tray_click::system_interval(), cfg!(windows));
     log::info!("tray: double-click window {} ms", window.as_millis());
     let icon = TrayIconBuilder::with_id("main")
-        .icon(Image::from_bytes(include_bytes!(
-            "../icons/tray-next@2x.png"
-        ))?)
-        .icon_as_template(true)
+        .icon(Image::from_bytes(TRAY_ICON)?)
+        .icon_as_template(cfg!(target_os = "macos"))
         .tooltip(TOOLTIP_IDLE)
         .menu(&menu)
         .show_menu_on_left_click(false)

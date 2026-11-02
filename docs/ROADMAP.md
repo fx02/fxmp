@@ -4,9 +4,6 @@ What the owner asked for that is not done yet. The order is not a priority.
 
 ## Later
 
-- **Tray icon on the dark Windows taskbar.** The tray icon is the macOS template
-  glyph (black on transparent), so it is invisible on the dark taskbar theme.
-  Add a grey/white variant, or follow the system theme.
 - **Where the data lives.** Document where the settings, the database and the
   logs are on macOS and Windows. Done for the paths after the rename (README,
   "Where the app keeps its data"); still open: a log file, since today the log

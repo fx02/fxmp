@@ -394,8 +394,9 @@ Planned work is listed in [docs/ROADMAP.md](docs/ROADMAP.md).
 - A scan served by the backup server treats a file it already knows with the
   same size as unchanged, whatever its date: a file changed on the backup
   without changing size is read again only by a scan from the main server.
-- Windows: the tray icon is the macOS template glyph (black on transparent), so
-  it may be hard to see, or invisible, on a dark taskbar.
+- Windows: the tray icon is the coloured app icon (the macOS menu bar has a
+  black-and-white glyph the system recolours), so it shows on light and dark
+  taskbars alike.
 
 ## Live tests and testing
 
