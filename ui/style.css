@@ -411,3 +411,6 @@ button.link:hover:not(:disabled) { background: none; filter: brightness(1.15); }
 /* Mini player: only the now-playing bar. */
 body.mini > :not(header.now) { display: none !important; }
 body.mini { overflow: hidden; }
+
+.mic-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+.mic-bar span { flex: 1; color: var(--accent); }

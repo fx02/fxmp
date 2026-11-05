@@ -134,6 +134,10 @@ pub struct Settings {
     pub mini: bool,
     /// What the music does while the microphone is in use.
     pub mic_duck: crate::mic::MicMode,
+    /// The volume while lowered for the microphone, in % (0..=80).
+    pub mic_level: u8,
+    /// Windows: only these apps count ("teams, zoom"); blank: any app.
+    pub mic_apps: String,
     /// Where "Look up" goes by default (a click on the now-playing title, the tray).
     #[serde(deserialize_with = "crate::lookup::lenient_service")]
     pub lookup_service: crate::lookup::Service,
@@ -162,6 +166,8 @@ impl Default for Settings {
             close_to_tray: true,
             mini: false,
             mic_duck: crate::mic::MicMode::Lower,
+            mic_level: crate::mic::DEFAULT_LEVEL,
+            mic_apps: String::new(),
             lookup_service: crate::lookup::Service::default(),
         }
     }
@@ -491,6 +497,8 @@ mod tests {
             close_to_tray: false,
             mini: true,
             mic_duck: crate::mic::MicMode::Pause,
+            mic_level: 30,
+            mic_apps: "teams".into(),
             lookup_service: crate::lookup::Service::Genius,
         }
     }

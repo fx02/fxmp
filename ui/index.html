@@ -20,6 +20,12 @@
     <input id="np-seek" class="seek" type="range" min="0" max="1000" step="1" value="0" data-i18n-title="player.seek" data-i18n-aria-label="player.seek">
     <span id="np-time" class="np-time"></span>
   </div>
+  <div id="mic-bar" class="mic-bar" hidden>
+    <span data-i18n="mic.ask_title"></span>
+    <button type="button" data-answer="lower" data-i18n="mic.lower"></button>
+    <button type="button" data-answer="pause" data-i18n="mic.pause"></button>
+    <button type="button" data-answer="ignore" data-i18n="mic.ignore"></button>
+  </div>
   <div class="now-controls">
     <button id="btn-prev" class="icon" data-i18n-title="player.previous" data-i18n-aria-label="player.previous">⏮</button>
     <button id="btn-pause" class="icon" data-i18n-title="player.pause_resume" data-i18n-aria-label="player.pause_resume">⏯</button>
@@ -226,9 +232,16 @@
     <label class="field"><span data-i18n="settings.mic_duck"></span>
       <select id="mic-duck">
         <option value="off" data-i18n="settings.mic_off"></option>
+        <option value="ask" data-i18n="settings.mic_ask"></option>
         <option value="lower" data-i18n="settings.mic_lower"></option>
         <option value="pause" data-i18n="settings.mic_pause"></option>
       </select>
+    </label>
+    <label class="field"><span id="mic-level-label"></span>
+      <input id="mic-level" type="range" min="0" max="80" step="5">
+    </label>
+    <label class="field"><span data-i18n="settings.mic_apps"></span>
+      <input id="mic-apps" data-i18n-placeholder="settings.mic_apps_example" spellcheck="false">
     </label>
     <label class="check"><input id="close-to-tray" type="checkbox"> <span data-i18n="settings.close_to_tray"></span></label>
     <label class="field"><span data-i18n="settings.lookup_service"></span>

@@ -1521,6 +1521,9 @@ function renderSettings(s) {
   $("resume-autoplay").checked = s.resume_autoplay;
   $("close-to-tray").checked = s.close_to_tray;
   $("mic-duck").value = s.mic_duck || "lower";
+  $("mic-level").value = s.mic_level;
+  $("mic-level-label").textContent = t("settings.mic_level", { n: s.mic_level });
+  $("mic-apps").value = s.mic_apps || "";
   renderLookupServices();
   $("volume").value = Math.round(s.volume * 100);
 }
@@ -2152,9 +2155,26 @@ function wire() {
     if (state.settings) state.settings.fill_speakers = e.target.checked;
     run("set_fill_speakers", { b: e.target.checked });
   });
-  $("mic-duck").addEventListener("change", (e) => {
-    if (state.settings) state.settings.mic_duck = e.target.value;
-    run("set_mic_duck", { mode: e.target.value });
+  const sendMic = () => {
+    const mic = {
+      mode: $("mic-duck").value,
+      level: Number($("mic-level").value),
+      apps: $("mic-apps").value,
+    };
+    if (state.settings) Object.assign(state.settings, { mic_duck: mic.mode, mic_level: mic.level, mic_apps: mic.apps });
+    run("set_mic", mic);
+  };
+  $("mic-duck").addEventListener("change", sendMic);
+  $("mic-level").addEventListener("input", (e) =>
+    ($("mic-level-label").textContent = t("settings.mic_level", { n: Number(e.target.value) })),
+  );
+  $("mic-level").addEventListener("change", sendMic);
+  $("mic-apps").addEventListener("change", sendMic);
+  $("mic-bar").addEventListener("click", (e) => {
+    const answer = e.target.dataset && e.target.dataset.answer;
+    if (!answer) return;
+    $("mic-bar").hidden = true;
+    run("mic_respond", { answer });
   });
   $("close-to-tray").addEventListener("change", (e) => {
     if (state.settings) state.settings.close_to_tray = e.target.checked;
@@ -2254,6 +2274,10 @@ async function init() {
     listen("track-skipped", (e) => console.info("skipped:", e.payload)),
     listen("unreadable-changed", () => refreshUnreadable()),
     listen("position", (e) => onPosition(e.payload)),
+    listen("mic-ask", (e) => {
+      $("mic-bar").hidden = !e.payload;
+      if (document.body.classList.contains("mini")) setMini(true);
+    }),
     listen("playlist-changed", () => onPlaylistChanged()),
     listen("audio-changed", (e) => onAudioChanged(e.payload)),
     listen("libraries-changed", () => loadLibraries()),

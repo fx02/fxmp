@@ -1391,9 +1391,35 @@ pub async fn set_resume_autoplay(app: AppHandle, on: bool) -> CmdResult<()> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn set_mic_duck(app: AppHandle, mode: crate::mic::MicMode) -> CmdResult<()> {
+pub async fn set_mic(
+    app: AppHandle,
+    mode: crate::mic::MicMode,
+    level: u8,
+    apps: String,
+) -> CmdResult<()> {
     run(app, move |_, st| {
-        st.settings.update(|s| s.mic_duck = mode, |_| {});
+        let s = st.settings.update(
+            |s| {
+                s.mic_duck = mode;
+                s.mic_level = level.min(crate::mic::MAX_LEVEL);
+                s.mic_apps = apps.trim().to_string();
+            },
+            |_| {},
+        );
+        // Already lowered: the new level applies at once.
+        if mode == crate::mic::MicMode::Lower || mode == crate::mic::MicMode::Ask {
+            crate::mic::level_changed(st, s.mic_level);
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// The answer to "Microphone in use" (the bar's Lower / Pause / Ignore).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn mic_respond(app: AppHandle, answer: crate::mic::Answer) -> CmdResult<()> {
+    run(app, move |app, _| {
+        crate::mic::respond(app, answer);
         Ok(())
     })
     .await

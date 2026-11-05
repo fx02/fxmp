@@ -363,14 +363,19 @@ server's address), an **On** switch and (except the main one) **Remove**:
     checked; the list is read again each time the menu opens); Show window;
     Quit; and, greyed out at the bottom, the version.
 - **Microphone in use** (Settings → Playback): while an app uses the microphone
-  (a call or a meeting), the music is lowered to 20 % (default), paused, or left
-  alone. Once the microphone has been free for 3 s, the volume comes back, or
-  the music plays again; music that was already paused, or that you played
-  again by hand during the call, is left as it is. Nothing is recorded and no
-  microphone permission is asked: macOS reports whether the input device is
-  running (the orange dot), Windows which apps use the microphone (its
-  microphone icon). On macOS this cannot tell when the default input is also
-  the default output (a headset): then nothing happens.
+  (a call or a meeting), the music is lowered (default; to the "Lowered volume"
+  level, 20 % unless set, 0–80 %), paused, left alone, or fxmp **asks**: a
+  notification "Microphone in use" and, in the window (also the mini player), a
+  bar with **Lower / Pause / Ignore** (desktop notifications cannot carry
+  buttons; clicking it opens the window). It asks once per call. Once the
+  microphone has been free for 3 s, the volume comes back, or the music plays
+  again; music that was already paused, or that you played again by hand during
+  the call, is left as it is. On Windows, "Only these apps" (e.g. `teams, zoom`)
+  limits it to those apps; macOS cannot tell which app it is. Nothing is
+  recorded and no microphone permission is asked: macOS reports whether the
+  input device is running (the orange dot), Windows which apps use the
+  microphone (its microphone icon). On macOS this cannot tell when the default
+  input is also the default output (a headset): then nothing happens.
 - **Mini player**: the ▭ button next to 🚫 shrinks the window to the
   now-playing bar (title, position slider, ⏮ ⏯ ⏭ 🚫 and volume); ⤢ brings the
   full window back at its earlier size. It stays that way after a restart.
@@ -519,6 +524,9 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] F8/F9 work and the track shows in Control Center.
 - [ ] Start a call (or the Voice Memos / Sound Recorder app): the music drops to
       20 %, and comes back 3 s after the microphone is free.
+- [ ] "Ask": a call shows the notification and the Lower / Pause / Ignore bar;
+      each answer works and the bar goes when the call ends. Windows: with
+      "teams" in "Only these apps", Sound Recorder does nothing.
 - [ ] ▭ shrinks the window to the now-playing bar and ⤢ restores it; a restart
       keeps the mini player. With "keep in the tray" off, Alt+F4 quits.
 - [ ] Windows: the keyboard's Play/Pause, Next and Previous keys work, also with
