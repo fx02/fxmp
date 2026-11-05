@@ -132,6 +132,8 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// The window shows only the now-playing bar.
     pub mini: bool,
+    /// What the music does while the microphone is in use.
+    pub mic_duck: crate::mic::MicMode,
     /// Where "Look up" goes by default (a click on the now-playing title, the tray).
     #[serde(deserialize_with = "crate::lookup::lenient_service")]
     pub lookup_service: crate::lookup::Service,
@@ -159,6 +161,7 @@ impl Default for Settings {
             resume_autoplay: false,
             close_to_tray: true,
             mini: false,
+            mic_duck: crate::mic::MicMode::Lower,
             lookup_service: crate::lookup::Service::default(),
         }
     }
@@ -487,6 +490,7 @@ mod tests {
             resume_autoplay: true,
             close_to_tray: false,
             mini: true,
+            mic_duck: crate::mic::MicMode::Pause,
             lookup_service: crate::lookup::Service::Genius,
         }
     }

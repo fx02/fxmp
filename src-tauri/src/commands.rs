@@ -1391,6 +1391,15 @@ pub async fn set_resume_autoplay(app: AppHandle, on: bool) -> CmdResult<()> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub async fn set_mic_duck(app: AppHandle, mode: crate::mic::MicMode) -> CmdResult<()> {
+    run(app, move |_, st| {
+        st.settings.update(|s| s.mic_duck = mode, |_| {});
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub async fn set_close_to_tray(app: AppHandle, on: bool) -> CmdResult<()> {
     run(app, move |_, st| {
         st.settings.update(|s| s.close_to_tray = on, |_| {});

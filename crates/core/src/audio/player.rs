@@ -90,6 +90,9 @@ pub enum Command {
         secs: u8,
     },
     SetNormalize(bool),
+    /// Scales the volume (1.0 = as set), ramped: lowers the music during a call
+    /// without changing the volume setting.
+    SetDuck(f32),
     /// Jumps to this many ms into the current track (to just before its end at
     /// most). The jump fades out and back in; paused stays paused.
     Seek(u64),
@@ -220,6 +223,8 @@ struct Engine {
     pause_gain: f32,
     volume: f32,
     volume_target: f32,
+    /// Share of the volume heard (see [`Command::SetDuck`]).
+    duck: f32,
     crossfade_secs: Option<u8>,
     normalize: bool,
 
@@ -272,6 +277,7 @@ impl Engine {
             pause_gain: 1.0,
             volume: 1.0,
             volume_target: 1.0,
+            duck: 1.0,
             crossfade_secs: Some(5),
             normalize: true,
             pending: Vec::with_capacity(BLOCK * 2),
@@ -410,6 +416,11 @@ impl Engine {
             }
             Command::SetNormalize(b) => self.normalize = b,
             Command::Seek(ms) => self.seek(ms),
+            Command::SetDuck(d) => {
+                if d.is_finite() {
+                    self.duck = d.clamp(0.0, 1.0);
+                }
+            }
             Command::Stop => {
                 self.out = None;
                 self.cur = None;
@@ -950,7 +961,7 @@ impl Engine {
         }
         let pause_target = if self.paused { 0.0 } else { 1.0 };
         for f in self.pending.as_chunks_mut::<2>().0 {
-            self.volume += (self.volume_target - self.volume).clamp(-step, step);
+            self.volume += (self.volume_target * self.duck - self.volume).clamp(-step, step);
             self.pause_gain += (pause_target - self.pause_gain).clamp(-step, step);
             let g = self.volume * self.pause_gain;
             for s in f {

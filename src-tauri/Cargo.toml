@@ -29,11 +29,15 @@ tauri-plugin-clipboard-manager = "2"
 keyring = { version = "3", features = ["apple-native"] }
 # NSEvent.doubleClickInterval (tray double click).
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent"] }
+# Whether the default input device is in use (mic.rs).
+objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "AudioHardware"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 # GetDoubleClickTime (tray double click).
 windows-sys = { version = "0.60", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+# The microphone consent store (mic.rs).
+winreg = "0.56"
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
 keyring = "3"

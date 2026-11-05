@@ -1520,6 +1520,7 @@ function renderSettings(s) {
   $("fill-speakers").checked = s.fill_speakers;
   $("resume-autoplay").checked = s.resume_autoplay;
   $("close-to-tray").checked = s.close_to_tray;
+  $("mic-duck").value = s.mic_duck || "lower";
   renderLookupServices();
   $("volume").value = Math.round(s.volume * 100);
 }
@@ -2150,6 +2151,10 @@ function wire() {
   $("fill-speakers").addEventListener("change", (e) => {
     if (state.settings) state.settings.fill_speakers = e.target.checked;
     run("set_fill_speakers", { b: e.target.checked });
+  });
+  $("mic-duck").addEventListener("change", (e) => {
+    if (state.settings) state.settings.mic_duck = e.target.value;
+    run("set_mic_duck", { mode: e.target.value });
   });
   $("close-to-tray").addEventListener("change", (e) => {
     if (state.settings) state.settings.close_to_tray = e.target.checked;

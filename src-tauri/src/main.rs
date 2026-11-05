@@ -11,6 +11,7 @@ mod i18n;
 mod logfile;
 mod lookup;
 mod media;
+mod mic;
 mod migrate;
 mod playlist;
 mod portable;
@@ -70,6 +71,7 @@ fn main() {
             state::AppState::init(handle)?;
             tray::init(handle)?;
             media::init(handle);
+            mic::start(handle);
             let st = handle.state::<state::AppState>();
             let settings = st.settings.get();
             if let Err(e) = autostart::apply(handle, settings.autostart, true) {
@@ -125,6 +127,7 @@ fn main() {
             commands::set_fill_speakers,
             commands::set_close_to_tray,
             commands::set_mini,
+            commands::set_mic_duck,
             commands::list_devices,
             commands::set_device,
             commands::set_crossfade,

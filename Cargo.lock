@@ -2012,6 +2012,7 @@ dependencies = [
  "keyring",
  "log",
  "objc2-app-kit",
+ "objc2-core-audio",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -2027,6 +2028,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows-sys 0.60.2",
+ "winreg",
 ]
 
 [[package]]

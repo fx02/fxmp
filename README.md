@@ -362,6 +362,15 @@ server's address), an **On** switch and (except the main one) **Remove**:
     **Output** ("System default" and every output device, the current one
     checked; the list is read again each time the menu opens); Show window;
     Quit; and, greyed out at the bottom, the version.
+- **Microphone in use** (Settings → Playback): while an app uses the microphone
+  (a call or a meeting), the music is lowered to 20 % (default), paused, or left
+  alone. Once the microphone has been free for 3 s, the volume comes back, or
+  the music plays again; music that was already paused, or that you played
+  again by hand during the call, is left as it is. Nothing is recorded and no
+  microphone permission is asked: macOS reports whether the input device is
+  running (the orange dot), Windows which apps use the microphone (its
+  microphone icon). On macOS this cannot tell when the default input is also
+  the default output (a headset): then nothing happens.
 - **Mini player**: the ▭ button next to 🚫 shrinks the window to the
   now-playing bar (title, position slider, ⏮ ⏯ ⏭ 🚫 and volume); ⤢ brings the
   full window back at its earlier size. It stays that way after a restart.
@@ -508,6 +517,8 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] After closing the window, music keeps playing and the menu bar icon stays.
 - [ ] The menu bar icon looks right in both the light and the dark menu bar.
 - [ ] F8/F9 work and the track shows in Control Center.
+- [ ] Start a call (or the Voice Memos / Sound Recorder app): the music drops to
+      20 %, and comes back 3 s after the microphone is free.
 - [ ] ▭ shrinks the window to the now-playing bar and ⤢ restores it; a restart
       keeps the mini player. With "keep in the tray" off, Alt+F4 quits.
 - [ ] Windows: the keyboard's Play/Pause, Next and Previous keys work, also with
