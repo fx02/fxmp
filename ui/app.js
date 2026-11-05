@@ -247,9 +247,35 @@ async function setMini(on) {
   document.body.classList.toggle("mini", on);
   $("btn-mini").textContent = on ? "⤢" : "▭";
   if (state.settings) state.settings.mini = on;
-  const height = Math.ceil(document.querySelector("header.now").getBoundingClientRect().height);
-  await run("set_mini", { on, height });
+  if (on) await fitMini();
+  else await run("set_mini", { on: false, height: 0 });
 }
+
+let fitting = false;
+/** Sizes the mini window to the bar: again whenever the bar changes height (a
+ * track starts and its position slider shows, the microphone bar comes). */
+async function fitMini() {
+  if (fitting || !document.body.classList.contains("mini")) return;
+  fitting = true;
+  try {
+    const need = Math.ceil(document.querySelector("header.now").getBoundingClientRect().height);
+    let height = need;
+    await run("set_mini", { on: true, height });
+    // The window may come out shorter than asked (a title bar counted in a
+    // limit): grow it by what is missing, so no row is ever cut off.
+    for (let i = 0; i < 2; i++) {
+      await new Promise((r) => setTimeout(r, 150));
+      const missing = need - window.innerHeight;
+      if (missing <= 0 || !document.body.classList.contains("mini")) break;
+      height += missing;
+      await run("set_mini", { on: true, height });
+    }
+  } finally {
+    fitting = false;
+  }
+}
+
+new ResizeObserver(() => fitMini()).observe(document.querySelector("header.now"));
 
 let banTimer = null;
 function resetBan() {
@@ -2274,10 +2300,7 @@ async function init() {
     listen("track-skipped", (e) => console.info("skipped:", e.payload)),
     listen("unreadable-changed", () => refreshUnreadable()),
     listen("position", (e) => onPosition(e.payload)),
-    listen("mic-ask", (e) => {
-      $("mic-bar").hidden = !e.payload;
-      if (document.body.classList.contains("mini")) setMini(true);
-    }),
+    listen("mic-ask", (e) => ($("mic-bar").hidden = !e.payload)),
     listen("playlist-changed", () => onPlaylistChanged()),
     listen("audio-changed", (e) => onAudioChanged(e.payload)),
     listen("libraries-changed", () => loadLibraries()),

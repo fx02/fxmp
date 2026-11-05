@@ -83,6 +83,8 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
 
 /* Now playing */
 .now {
+  /* Never squeezed by a short window: the mini player measures its height. */
+  flex: none;
   display: flex;
   flex-direction: column;
   gap: 6px;
