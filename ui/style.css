@@ -79,6 +79,9 @@ input:focus, select:focus, button:focus-visible {
   outline-offset: -1px;
 }
 input[type="range"] { accent-color: var(--accent); }
+/* No focus frame on the sliders (Windows' WebView draws one after a drag);
+   they still move with the arrow keys once clicked. */
+input[type="range"]:focus { outline: none; }
 input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
 
 /* Now playing */
