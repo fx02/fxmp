@@ -362,7 +362,9 @@ server's address), an **On** switch and (except the main one) **Remove**:
     **Output** ("System default" and every output device, the current one
     checked; the list is read again each time the menu opens); Show window;
     Quit; and, greyed out at the bottom, the version.
-- **F8** is pause/resume, **F9** next (Control Center works too).
+- **F8** is pause/resume, **F9** next (Control Center works too). On Windows the
+  keyboard's and headset's media keys (Play/Pause, Next, Previous) work too, and
+  the track shows in the media overlay next to the volume flyout.
 - **Dock**: the app has a Dock icon. Closing the window (red button) only hides
   it: the music plays on and the Dock and menu bar icons stay. A click on the
   Dock icon brings the window back. Minimizing (yellow button) puts the window
@@ -412,10 +414,8 @@ Planned work is listed in [docs/ROADMAP.md](docs/ROADMAP.md).
   kept, and the library stays playable meanwhile.
 - If a track is played before you answer the keychain prompt, tracks are
   skipped until the password is available.
-- Windows: CI builds the `.msi`/`.exe`, but media keys (souvlaki needs an HWND)
-  are macOS-only for now, and the build has not been tried on real Windows.
-  The code and tests were only type-checked for Windows on a Mac; the Windows
-  CI job has not had a green run yet.
+- Windows: CI builds and tests the `.msi`/`.exe` and the portable zip; the
+  owner runs them on real Windows.
 - The first start after an update that changes the library's format updates
   it before the window and the menu bar icon appear (about a second for
   ~59,000 tracks, once).
@@ -502,6 +502,8 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] After closing the window, music keeps playing and the menu bar icon stays.
 - [ ] The menu bar icon looks right in both the light and the dark menu bar.
 - [ ] F8/F9 work and the track shows in Control Center.
+- [ ] Windows: the keyboard's Play/Pause, Next and Previous keys work, also with
+      the window closed, and the volume flyout shows the track.
 - [ ] Notifications appear only when turned on (try with the installed .app).
 - [ ] Start at login: after logging out and in, the app is in the menu bar with the window hidden.
 - [ ] The Dock icon stays, and clicking it opens the window (also after the red

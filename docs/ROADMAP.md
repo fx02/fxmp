@@ -7,8 +7,6 @@ What the owner asked for that is not done yet. The order is not a priority.
 - **Lower memory use.** Consider a native UI instead of the WebView.
 - **A web version** hosted on Debian.
 - **An Android app.**
-- **F8/F9 media keys on Windows.** souvlaki is disabled there (it needs a
-  window handle), so the media keys and the F8/F9 shortcuts work only on macOS.
 - **Lower the music when the microphone is in use** (calls, meetings). Detect
   that some app is using the microphone, without recording or needing microphone
   permission:

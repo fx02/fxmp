@@ -4,19 +4,14 @@
 use std::cell::RefCell;
 use std::sync::Mutex;
 
-#[cfg(target_os = "macos")]
 use fxmp_core::audio::player::Command;
 use fxmp_core::TrackId;
-#[cfg(target_os = "macos")]
-use souvlaki::{MediaControlEvent, PlatformConfig};
-use souvlaki::{MediaControls, MediaMetadata, MediaPlayback};
+use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
-#[cfg(target_os = "macos")]
 use crate::commands::{next_now, pause_now, play_pause_now, previous_now, spawn_action};
 use crate::state::{self, lock, AppState, NowPlaying};
-#[cfg(target_os = "macos")]
 use crate::tray::show_main_window;
 
 thread_local! {
@@ -44,19 +39,27 @@ pub fn init(app: &AppHandle) {
     });
 }
 
-/// Windows needs an HWND for media controls, which is not wired up yet (the
-/// Windows pass comes later), so media keys are macOS-only for now.
-#[cfg(not(target_os = "macos"))]
-fn create_controls(_app: &AppHandle) -> Result<MediaControls, String> {
-    Err("not supported on this platform yet".into())
+/// The window Windows ties the media keys and its media overlay to (the main
+/// window, also while hidden). Other systems need none.
+#[cfg(windows)]
+fn media_hwnd(app: &AppHandle) -> Result<Option<*mut std::ffi::c_void>, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("no main window")?;
+    let hwnd = window.hwnd().map_err(|e| e.to_string())?;
+    Ok(Some(hwnd.0 as *mut std::ffi::c_void))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
+fn media_hwnd(_app: &AppHandle) -> Result<Option<*mut std::ffi::c_void>, String> {
+    Ok(None)
+}
+
 fn create_controls(app: &AppHandle) -> Result<MediaControls, String> {
     let mut controls = MediaControls::new(PlatformConfig {
         display_name: "fxmp",
         dbus_name: "hr.pvt.fxmp",
-        hwnd: None,
+        hwnd: media_hwnd(app)?,
     })
     .map_err(|e| format!("{e:?}"))?;
     let handle = app.clone();
@@ -67,7 +70,6 @@ fn create_controls(app: &AppHandle) -> Result<MediaControls, String> {
     Ok(controls)
 }
 
-#[cfg(target_os = "macos")]
 fn on_media_event(app: &AppHandle, event: MediaControlEvent) {
     log::debug!("media key: {event:?}");
     match event {
