@@ -43,9 +43,7 @@ pub fn init(app: &AppHandle) {
 /// window, also while hidden). Other systems need none.
 #[cfg(windows)]
 fn media_hwnd(app: &AppHandle) -> Result<Option<*mut std::ffi::c_void>, String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or("no main window")?;
+    let window = app.get_webview_window("main").ok_or("no main window")?;
     let hwnd = window.hwnd().map_err(|e| e.to_string())?;
     Ok(Some(hwnd.0 as *mut std::ffi::c_void))
 }

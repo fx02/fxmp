@@ -85,11 +85,20 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing only hides the window; the music, the Dock and the tray icon
-            // stay. Minimizing is left to the system (the window goes to the Dock).
+            // Closing only hides the window (the music, the Dock and the tray icon
+            // stay), unless "keep in the tray" is off: then it quits. Minimizing
+            // is left to the system (the window goes to the Dock / taskbar).
             if let WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let to_tray = app
+                    .try_state::<state::AppState>()
+                    .is_none_or(|st| st.settings.get().close_to_tray);
                 api.prevent_close();
-                let _ = window.hide();
+                if to_tray {
+                    let _ = window.hide();
+                } else {
+                    app.exit(0);
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -114,6 +123,8 @@ fn main() {
             commands::set_volume,
             commands::seek,
             commands::set_fill_speakers,
+            commands::set_close_to_tray,
+            commands::set_mini,
             commands::list_devices,
             commands::set_device,
             commands::set_crossfade,

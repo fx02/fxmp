@@ -128,6 +128,10 @@ pub struct Settings {
     pub language: String,
     /// A restored playlist plays on start (else it waits, paused, where it stopped).
     pub resume_autoplay: bool,
+    /// Closing the window (red button, Alt+F4) only hides it; off: it quits.
+    pub close_to_tray: bool,
+    /// The window shows only the now-playing bar.
+    pub mini: bool,
     /// Where "Look up" goes by default (a click on the now-playing title, the tray).
     #[serde(deserialize_with = "crate::lookup::lenient_service")]
     pub lookup_service: crate::lookup::Service,
@@ -153,6 +157,8 @@ impl Default for Settings {
             last_selection: Vec::new(),
             language: i18n::DEFAULT_LANGUAGE.into(),
             resume_autoplay: false,
+            close_to_tray: true,
+            mini: false,
             lookup_service: crate::lookup::Service::default(),
         }
     }
@@ -479,6 +485,8 @@ mod tests {
             last_selection: vec!["rock".into()],
             language: "hr".into(),
             resume_autoplay: true,
+            close_to_tray: false,
+            mini: true,
             lookup_service: crate::lookup::Service::Genius,
         }
     }

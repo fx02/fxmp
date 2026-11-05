@@ -407,3 +407,7 @@ button.link:hover:not(:disabled) { background: none; filter: brightness(1.15); }
 .library-actions .check { margin: 0; }
 .library-form { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; margin: 10px 0; }
 .library-form h4 { margin: 2px 0 6px; }
+
+/* Mini player: only the now-playing bar. */
+body.mini > :not(header.now) { display: none !important; }
+body.mini { overflow: hidden; }

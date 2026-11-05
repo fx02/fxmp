@@ -362,6 +362,12 @@ server's address), an **On** switch and (except the main one) **Remove**:
     **Output** ("System default" and every output device, the current one
     checked; the list is read again each time the menu opens); Show window;
     Quit; and, greyed out at the bottom, the version.
+- **Mini player**: the ▭ button next to 🚫 shrinks the window to the
+  now-playing bar (title, position slider, ⏮ ⏯ ⏭ 🚫 and volume); ⤢ brings the
+  full window back at its earlier size. It stays that way after a restart.
+- **Closing the window** (red button, Alt+F4) keeps fxmp playing in the tray by
+  default; Settings → "Closing the window keeps fxmp in the tray" off makes it
+  quit instead.
 - **F8** is pause/resume, **F9** next (Control Center works too). On Windows the
   keyboard's and headset's media keys (Play/Pause, Next, Previous) work too, and
   the track shows in the media overlay next to the volume flyout.
@@ -502,6 +508,8 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] After closing the window, music keeps playing and the menu bar icon stays.
 - [ ] The menu bar icon looks right in both the light and the dark menu bar.
 - [ ] F8/F9 work and the track shows in Control Center.
+- [ ] ▭ shrinks the window to the now-playing bar and ⤢ restores it; a restart
+      keeps the mini player. With "keep in the tray" off, Alt+F4 quits.
 - [ ] Windows: the keyboard's Play/Pause, Next and Previous keys work, also with
       the window closed, and the volume flyout shows the track.
 - [ ] Notifications appear only when turned on (try with the installed .app).

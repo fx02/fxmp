@@ -1390,6 +1390,61 @@ pub async fn set_resume_autoplay(app: AppHandle, on: bool) -> CmdResult<()> {
     .await
 }
 
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_close_to_tray(app: AppHandle, on: bool) -> CmdResult<()> {
+    run(app, move |_, st| {
+        st.settings.update(|s| s.close_to_tray = on, |_| {});
+        Ok(())
+    })
+    .await
+}
+
+/// The window's size before it became the mini player, to go back to.
+static FULL_SIZE: Mutex<Option<tauri::LogicalSize<f64>>> = Mutex::new(None);
+/// The full window's size when none was remembered (as in `tauri.conf.json`).
+const FULL_DEFAULT: tauri::LogicalSize<f64> = tauri::LogicalSize::new(420.0, 640.0);
+const FULL_MIN: tauri::LogicalSize<f64> = tauri::LogicalSize::new(320.0, 360.0);
+
+/// The mini player on or off: the window shrinks to the now-playing bar,
+/// `height` px high (measured by the page), or goes back to its earlier size.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_mini(
+    app: AppHandle,
+    window: tauri::Window,
+    on: bool,
+    height: f64,
+) -> CmdResult<()> {
+    run(app, move |_, st| {
+        st.settings.update(|s| s.mini = on, |_| {});
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let current = window.inner_size().ok().map(|s| s.to_logical::<f64>(scale));
+        let width = current.map_or(FULL_DEFAULT.width, |s| s.width);
+        let result = if on {
+            let mut full = lock(&FULL_SIZE);
+            // Already mini (a restart, the page reloaded): keep the full size.
+            if full.is_none() && current.is_some_and(|s| s.height > height + 1.0) {
+                *full = current;
+            }
+            let mini = tauri::LogicalSize::new(width, height.clamp(60.0, 400.0));
+            window
+                .set_min_size(Some(tauri::LogicalSize::new(FULL_MIN.width, mini.height)))
+                .and_then(|_| {
+                    window.set_max_size(Some(tauri::LogicalSize::new(4000.0, mini.height)))
+                })
+                .and_then(|_| window.set_size(mini))
+        } else {
+            let full = lock(&FULL_SIZE).take().unwrap_or(FULL_DEFAULT);
+            window
+                .set_max_size(None::<tauri::LogicalSize<f64>>)
+                .and_then(|_| window.set_min_size(Some(FULL_MIN)))
+                .and_then(|_| window.set_size(tauri::LogicalSize::new(width, full.height)))
+        };
+        result.map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+}
+
 /// The volume and the output device, sent as `audio-changed` whenever either
 /// changes, so the window's slider and device list follow the tray.
 #[derive(Debug, Clone, Serialize)]

@@ -242,6 +242,15 @@ function onPosition(p) {
   renderPosition();
 }
 
+/** The mini player (only the now-playing bar) on or off; the window follows. */
+async function setMini(on) {
+  document.body.classList.toggle("mini", on);
+  $("btn-mini").textContent = on ? "⤢" : "▭";
+  if (state.settings) state.settings.mini = on;
+  const height = Math.ceil(document.querySelector("header.now").getBoundingClientRect().height);
+  await run("set_mini", { on, height });
+}
+
 let banTimer = null;
 function resetBan() {
   clearTimeout(banTimer);
@@ -1510,6 +1519,7 @@ function renderSettings(s) {
   $("normalize").checked = s.normalize;
   $("fill-speakers").checked = s.fill_speakers;
   $("resume-autoplay").checked = s.resume_autoplay;
+  $("close-to-tray").checked = s.close_to_tray;
   renderLookupServices();
   $("volume").value = Math.round(s.volume * 100);
 }
@@ -2141,6 +2151,11 @@ function wire() {
     if (state.settings) state.settings.fill_speakers = e.target.checked;
     run("set_fill_speakers", { b: e.target.checked });
   });
+  $("close-to-tray").addEventListener("change", (e) => {
+    if (state.settings) state.settings.close_to_tray = e.target.checked;
+    run("set_close_to_tray", { on: e.target.checked });
+  });
+  $("btn-mini").addEventListener("click", () => setMini(!document.body.classList.contains("mini")));
   $("resume-autoplay").addEventListener("change", (e) => {
     if (state.settings) state.settings.resume_autoplay = e.target.checked;
     run("set_resume_autoplay", { on: e.target.checked });
@@ -2258,6 +2273,8 @@ async function init() {
   state.position = position || null;
   renderNowPlaying(np || null);
   if (scan && scan.scanning) renderScanProgress(scan.progress);
+  // Back as the mini player if it was left that way.
+  if (state.settings && state.settings.mini) setMini(true);
   renderUnreadableTab();
   loadUnreadableCount();
   await loadGenres();
