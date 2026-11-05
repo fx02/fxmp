@@ -116,7 +116,9 @@ the log then also shows in the Terminal).
 
 Put a folder named `fxmp-data` beside the app and fxmp keeps its settings,
 library, playlist and log there instead of in the folders above: beside
-`fxmp.exe` on Windows (the `fxmp_…_portable.zip` build comes with it), beside
+`fxmp.exe` on Windows (the `fxmp_…_portable.zip` build comes with it, and the
+`…-setup.exe` installer offers it at the end: answer **Yes** to "Portable
+installation?", after picking the folder, e.g. on a USB stick), beside
 `fxmp.app` on macOS. A copy on a USB stick or in any folder then carries its own
 data, and the catalog works on any computer that reaches the same shares.
 
