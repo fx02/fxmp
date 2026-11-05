@@ -11,6 +11,49 @@ use crate::{Error, Result};
 /// Length of the ring between the engine thread and the device callback.
 const RING_MS: usize = 200;
 
+/// Spread stereo over all the speakers of a multichannel output (see [`upmix`]).
+/// Channels [`upmix`] fills; any beyond (rare 9+ channel outputs) stay silent.
+const MAX_CHANNELS: usize = 8;
+
+static FILL_SPEAKERS: AtomicBool = AtomicBool::new(true);
+
+/// Turns spreading stereo over all speakers on or off; applies at once.
+pub fn set_fill_speakers(on: bool) {
+    FILL_SPEAKERS.store(on, Ordering::Relaxed);
+}
+
+/// -3 dB: the copies on the centre and rear speakers, so the sum is not louder.
+const SIDE_GAIN: f32 = 0.707;
+
+/// One output frame of `out.len()` channels from a stereo frame. Mono gets the
+/// average; front left/right get the stereo pair. With `fill`, the other speakers
+/// of the usual Windows layouts get it too: quad (back L/R), 5.1 (centre, LFE,
+/// back L/R) and 7.1 (as 5.1 plus side L/R); the centre gets the average and the
+/// LFE stays silent (the driver routes bass to the subwoofer). Without `fill`, or
+/// on other layouts, the extra channels are silent.
+pub fn upmix(lr: [f32; 2], fill: bool, out: &mut [f32]) {
+    let [l, r] = lr;
+    match out.len() {
+        0 => {}
+        1 => out[0] = (l + r) * 0.5,
+        n => {
+            out[0] = l;
+            out[1] = r;
+            out[2..].fill(0.0);
+            if !fill {
+                return;
+            }
+            let (sl, sr, c) = (l * SIDE_GAIN, r * SIDE_GAIN, (l + r) * 0.5 * SIDE_GAIN);
+            match n {
+                4 => out[2..4].copy_from_slice(&[sl, sr]),
+                6 => out[2..6].copy_from_slice(&[c, 0.0, sl, sr]),
+                8 => out[2..8].copy_from_slice(&[c, 0.0, sl, sr, sl, sr]),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Result of handing samples to a sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkWrite {
@@ -148,17 +191,18 @@ where
         let mut written = 0;
         if let Ok(chunk) = consumer.read_chunk(n * 2) {
             let (a, b) = chunk.as_slices();
+            let fill = FILL_SPEAKERS.load(Ordering::Relaxed);
+            let mut frame = [0.0f32; MAX_CHANNELS];
+            let frame = &mut frame[..channels.min(MAX_CHANNELS)];
             for (out, lr) in data
                 .chunks_exact_mut(channels)
                 .zip(a.as_chunks::<2>().0.iter().chain(b.as_chunks::<2>().0))
             {
-                if channels == 1 {
-                    out[0] = T::from_sample((lr[0] + lr[1]) * 0.5);
-                } else {
-                    out[0] = T::from_sample(lr[0]);
-                    out[1] = T::from_sample(lr[1]);
-                    out[2..].fill(silence);
+                upmix(*lr, fill, frame);
+                for (o, s) in out.iter_mut().zip(frame.iter()) {
+                    *o = T::from_sample(*s);
                 }
+                out[frame.len()..].fill(silence);
                 written += 1;
             }
             chunk.commit_all();
@@ -203,5 +247,42 @@ impl SinkFactory for CpalSinkFactory {
     fn open(&mut self, device: Option<&str>) -> Result<(Box<dyn Sink>, String)> {
         let (sink, name) = CpalSink::open(device)?;
         Ok((Box::new(sink), name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(n: usize, fill: bool) -> Vec<f32> {
+        let mut out = vec![9.0; n];
+        upmix([0.8, 0.4], fill, &mut out);
+        out
+    }
+
+    fn near(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-3)
+    }
+
+    #[test]
+    fn stereo_and_mono_are_unchanged() {
+        assert_eq!(frame(2, true), [0.8, 0.4]);
+        assert!(near(&frame(1, true), &[0.6]));
+    }
+
+    #[test]
+    fn five_one_fills_centre_and_rears_but_not_the_lfe() {
+        let c = 0.6 * SIDE_GAIN;
+        let (l, r) = (0.8 * SIDE_GAIN, 0.4 * SIDE_GAIN);
+        assert!(near(&frame(6, true), &[0.8, 0.4, c, 0.0, l, r]));
+        assert!(near(&frame(8, true), &[0.8, 0.4, c, 0.0, l, r, l, r]));
+        assert!(near(&frame(4, true), &[0.8, 0.4, l, r]));
+    }
+
+    #[test]
+    fn without_fill_only_the_front_pair_plays() {
+        assert_eq!(frame(6, false), [0.8, 0.4, 0.0, 0.0, 0.0, 0.0]);
+        // An unknown layout is never guessed at.
+        assert_eq!(frame(3, true), [0.8, 0.4, 0.0]);
     }
 }

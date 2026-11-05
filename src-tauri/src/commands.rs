@@ -1518,6 +1518,18 @@ pub async fn set_normalize(app: AppHandle, b: bool) -> CmdResult<()> {
     .await
 }
 
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_fill_speakers(app: AppHandle, b: bool) -> CmdResult<()> {
+    run(app, move |_, st| {
+        st.settings.update(
+            |s| s.fill_speakers = b,
+            |s| fxmp_core::audio::output::set_fill_speakers(s.fill_speakers),
+        );
+        Ok(())
+    })
+    .await
+}
+
 /// Bans the playing track for good, takes it out of the playlist and skips to the
 /// next one.
 pub fn ban_current_now(app: &AppHandle, st: &AppState) -> CmdResult<()> {

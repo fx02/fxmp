@@ -790,6 +790,7 @@ fn send_mix_settings(player: &Player, s: &Settings) {
         secs: s.crossfade_secs,
     });
     player.send(Command::SetNormalize(s.normalize));
+    fxmp_core::audio::output::set_fill_speakers(s.fill_speakers);
 }
 
 /// Applies all player-related settings, including `device: None` (system default).

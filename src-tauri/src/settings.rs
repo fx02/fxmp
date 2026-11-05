@@ -118,6 +118,8 @@ pub struct Settings {
     /// 1..=10.
     pub crossfade_secs: u8,
     pub normalize: bool,
+    /// Spread stereo over all speakers of a 5.1/7.1 output.
+    pub fill_speakers: bool,
     pub notify: bool,
     pub autostart: bool,
     /// Genre keys of the last genre selection (empty = all).
@@ -145,6 +147,7 @@ impl Default for Settings {
             crossfade_enabled: true,
             crossfade_secs: 5,
             normalize: true,
+            fill_speakers: true,
             notify: false,
             autostart: false,
             last_selection: Vec::new(),
@@ -470,6 +473,7 @@ mod tests {
             crossfade_enabled: false,
             crossfade_secs: 9,
             normalize: false,
+            fill_speakers: false,
             notify: true,
             autostart: true,
             last_selection: vec!["rock".into()],

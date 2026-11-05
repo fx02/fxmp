@@ -1508,6 +1508,7 @@ function renderSettings(s) {
   $("crossfade-secs").disabled = !s.crossfade_enabled;
   $("crossfade-label").textContent = t("settings.seconds", { n: s.crossfade_secs });
   $("normalize").checked = s.normalize;
+  $("fill-speakers").checked = s.fill_speakers;
   $("resume-autoplay").checked = s.resume_autoplay;
   renderLookupServices();
   $("volume").value = Math.round(s.volume * 100);
@@ -2135,6 +2136,10 @@ function wire() {
   $("normalize").addEventListener("change", (e) => {
     if (state.settings) state.settings.normalize = e.target.checked;
     run("set_normalize", { b: e.target.checked });
+  });
+  $("fill-speakers").addEventListener("change", (e) => {
+    if (state.settings) state.settings.fill_speakers = e.target.checked;
+    run("set_fill_speakers", { b: e.target.checked });
   });
   $("resume-autoplay").addEventListener("change", (e) => {
     if (state.settings) state.settings.resume_autoplay = e.target.checked;

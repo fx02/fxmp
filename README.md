@@ -304,7 +304,11 @@ server's address), an **On** switch and (except the main one) **Remove**:
 - **Settings → Language**: English (default) or Hrvatski; it switches at once,
   the menu bar menu included.
 - **Settings → Playback**: output device, crossfade on/off and its length
-  (1–10 s), "Normalize volume", "Resume playing automatically on start" (off by
+  (1–10 s), "Normalize volume", "Play stereo on all speakers (5.1/7.1)" (on by
+  default: on a quad, 5.1 or 7.1 output the rear and side speakers get the left
+  and right channel and the centre gets both, each 3 dB quieter; the subwoofer
+  channel stays silent and the driver sends it the bass; off: only the front
+  pair plays), "Resume playing automatically on start" (off by
   default, so a start at login does not start music unasked) and "Default
   lookup service".
 - **Settings → Danger zone** (each asks for confirmation first):
@@ -448,6 +452,9 @@ These cannot be checked automatically (they need listening or clicking):
 - [ ] Look in light and dark mode (420×640, long titles, genre chip, ⋯).
 - [ ] Left click on the menu bar icon reliably pauses / resumes, after the
       system double-click interval, max 0.4 s (0.4 s on a default Mac).
+- [ ] Windows, 5.1 output: with "Play stereo on all speakers" on, the rear and
+      centre speakers play too (unplug or mute the front pair to hear it);
+      off, only the front pair plays. Stereo outputs sound the same either way.
 - [ ] Dragging the position slider jumps there without a click in the sound,
       also while paused (it stays paused); the time follows the slider.
 - [ ] Double click on the menu bar icon skips the track and does not pause;

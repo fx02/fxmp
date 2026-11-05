@@ -87,6 +87,7 @@
   "settings.crossfade_length": "Trajanje crossfadea",
   "settings.seconds": "{n} s",
   "settings.normalize": "Ujednači glasnoću",
+  "settings.fill_speakers": "Stereo na svim zvučnicima (5.1/7.1)",
   "settings.library": "Katalog",
   "settings.refresh": "Osvježi katalog",
   "settings.banned": "Zabranjene pjesme",

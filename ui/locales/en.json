@@ -87,6 +87,7 @@
   "settings.crossfade_length": "Crossfade length",
   "settings.seconds": "{n} s",
   "settings.normalize": "Normalize volume",
+  "settings.fill_speakers": "Play stereo on all speakers (5.1/7.1)",
   "settings.library": "Library",
   "settings.refresh": "Refresh library",
   "settings.banned": "Banned tracks",
