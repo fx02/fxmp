@@ -4,12 +4,6 @@ What the owner asked for that is not done yet. The order is not a priority.
 
 ## Later
 
-- **Portable mode.**
-  - The catalog database can be copied between machines that reach the same
-    shares, since its paths are relative per library.
-  - An installable/portable variant that keeps its data next to the executable.
-  - Keychain credentials are not portable: on another machine (or in the
-    portable variant) the passwords are entered again.
 - **Lower memory use.** Consider a native UI instead of the WebView.
 - **A web version** hosted on Debian.
 - **An Android app.**

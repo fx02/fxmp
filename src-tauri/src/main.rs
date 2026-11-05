@@ -13,6 +13,7 @@ mod lookup;
 mod media;
 mod migrate;
 mod playlist;
+mod portable;
 mod provider;
 mod settings;
 mod state;
@@ -48,7 +49,7 @@ fn main() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(autostart::plugin())
         .setup(move |app| {
-            let log_dir = match devdata::current() {
+            let log_dir = match devdata::current().or_else(portable::current) {
                 Some(dir) => Ok(dir.join("logs")),
                 None => app.path().app_log_dir(),
             };

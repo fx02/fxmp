@@ -64,10 +64,19 @@ jobs:
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         with:
           tauriScript: cargo tauri
+      - name: Portable zip (fxmp.exe beside its fxmp-data folder)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force portable/fxmp/fxmp-data | Out-Null
+          Copy-Item target/release/fxmp.exe portable/fxmp/
+          # A file, so the zip keeps the folder.
+          Set-Content portable/fxmp/fxmp-data/README.txt "fxmp keeps its settings, library and log in this folder. Delete the folder to use the installed app's data instead."
+          Compress-Archive -Path portable/fxmp -DestinationPath portable/fxmp_0.1.0_x64_portable.zip
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fxmp-windows-installers
           path: |
             target/release/bundle/msi/*.msi
             target/release/bundle/nsis/*.exe
+            portable/*.zip
           if-no-files-found: error

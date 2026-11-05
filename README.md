@@ -112,6 +112,24 @@ The log has no passwords. For more detail start the app with `RUST_LOG=debug`
 (macOS, from Terminal: `RUST_LOG=debug /Applications/fxmp.app/Contents/MacOS/fxmp`;
 the log then also shows in the Terminal).
 
+### Portable mode
+
+Put a folder named `fxmp-data` beside the app and fxmp keeps its settings,
+library, playlist and log there instead of in the folders above: beside
+`fxmp.exe` on Windows (the `fxmp_…_portable.zip` build comes with it), beside
+`fxmp.app` on macOS. A copy on a USB stick or in any folder then carries its own
+data, and the catalog works on any computer that reaches the same shares.
+
+- Passwords stay in each computer's keychain / Credential Manager: on a new
+  computer, enter them once in Settings. They are never written to the folder.
+- The window cache (WebView) still goes to the system folder in the table above.
+- "Start at login" registers the copy where it is now; turn it off before moving
+  the copy.
+- macOS: a downloaded app run straight from the disk image or the Downloads
+  folder may run from a hidden random location (App Translocation) and not see
+  the folder: move `fxmp.app` beside `fxmp-data` first.
+- Delete or rename `fxmp-data` to go back to the normal folders.
+
 A debug build with `SMP_DATA_DIR` keeps everything in that folder instead (see
 [Live tests and testing](#live-tests-and-testing)).
 

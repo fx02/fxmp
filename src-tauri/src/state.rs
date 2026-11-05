@@ -210,9 +210,17 @@ impl AppState {
                 );
                 (dir.clone(), dir.clone())
             }
-            None => (app.path().app_config_dir()?, app.path().app_data_dir()?),
+            None => match crate::portable::current() {
+                Some(dir) => {
+                    log::info!("portable: data in {}", dir.display());
+                    (dir.clone(), dir)
+                }
+                None => (app.path().app_config_dir()?, app.path().app_data_dir()?),
+            },
         };
-        // The first start after SMB Music Player brings its data over (once).
+        let portable = dev_dir.is_none() && crate::portable::current().is_some();
+        // The first start after SMB Music Player brings its data over (once); a
+        // portable copy starts with its own folder.
         let dev = dev_dir.is_some();
         let debug = cfg!(debug_assertions);
         let dev_from = if dev {
@@ -220,8 +228,12 @@ impl AppState {
         } else {
             None
         };
-        let migration =
-            migrate::prepare(config_dir, data_dir, &migrate::source(debug, dev, dev_from));
+        let source = if portable {
+            migrate::Source::Skip
+        } else {
+            migrate::source(debug, dev, dev_from)
+        };
+        let migration = migrate::prepare(config_dir, data_dir, &source);
         if migration.copied && !debug {
             if let Err(e) = migrate::remove_old_login_item() {
                 log::warn!(
