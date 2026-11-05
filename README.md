@@ -106,7 +106,11 @@ anyway, quit fxmp, delete its folder and start it again.
 | Library, playlist, bans, play history (`catalog.db`, with `catalog.db-wal`/`-shm`) | the same folder | the same folder |
 | Passwords | keychain, service `fxmp` | Credential Manager (Windows credentials), service `fxmp` |
 | Window cache (WebView) | `~/Library/WebKit/hr.pvt.fxmp/`, `~/Library/Caches/hr.pvt.fxmp/` | `%LOCALAPPDATA%\hr.pvt.fxmp\` |
-| Log | no file: written to the standard error output; to see it, start the app from Terminal: `/Applications/fxmp.app/Contents/MacOS/fxmp` (`RUST_LOG=debug` for more) | no file, and a release build has no console, so the log is not visible |
+| Log (`fxmp.log`, the previous one `fxmp.old.log`; a new file every 2 MB, so at most about 4 MB) | `~/Library/Logs/hr.pvt.fxmp/` (also in Console.app → Log Reports) | `%LOCALAPPDATA%\hr.pvt.fxmp\logs\` |
+
+The log has no passwords. For more detail start the app with `RUST_LOG=debug`
+(macOS, from Terminal: `RUST_LOG=debug /Applications/fxmp.app/Contents/MacOS/fxmp`;
+the log then also shows in the Terminal).
 
 A debug build with `SMP_DATA_DIR` keeps everything in that folder instead (see
 [Live tests and testing](#live-tests-and-testing)).

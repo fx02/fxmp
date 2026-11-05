@@ -8,6 +8,7 @@ mod connection;
 mod credentials;
 mod devdata;
 mod i18n;
+mod logfile;
 mod lookup;
 mod media;
 mod migrate;
@@ -25,7 +26,10 @@ use tauri::{Manager, WindowEvent};
 const LOG_FILTER: &str = "info,smb=warn";
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(LOG_FILTER)).init();
+    let log_sink = logfile::LogSink::default();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(LOG_FILTER))
+        .target(env_logger::Target::Pipe(Box::new(log_sink.clone())))
+        .init();
     let mut builder = tauri::Builder::default();
     // First, so a second launch exits before anything else starts. A debug build
     // with its own data folder runs beside the installed app instead of handing
@@ -43,7 +47,20 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(autostart::plugin())
-        .setup(|app| {
+        .setup(move |app| {
+            let log_dir = match devdata::current() {
+                Some(dir) => Ok(dir.join("logs")),
+                None => app.path().app_log_dir(),
+            };
+            match log_dir
+                .map_err(|e| e.to_string())
+                .and_then(|d| log_sink.attach(&d).map_err(|e| e.to_string()))
+            {
+                Ok(path) => {
+                    log::info!("fxmp {} log: {}", env!("CARGO_PKG_VERSION"), path.display())
+                }
+                Err(e) => log::warn!("no log file: {e}"),
+            }
             // In the Dock and the menu bar: the Dock icon opens the window, Cmd+Q
             // quits (the default app menu), the tray icon stays.
             #[cfg(target_os = "macos")]
