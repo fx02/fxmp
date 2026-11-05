@@ -1261,17 +1261,24 @@ mod tests {
             let scan = s.spawn(|| {
                 scan_with(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no, &opts).unwrap()
             });
-            let mut worst = Duration::ZERO;
+            let mut waits = Vec::new();
             while !scan.is_finished() {
                 let t = Instant::now();
                 other.set_last_first("probe", 1).unwrap();
-                worst = worst.max(t.elapsed());
+                waits.push(t.elapsed());
                 std::thread::sleep(Duration::from_millis(20));
             }
             assert_eq!(scan.join().unwrap().read, 8);
+            // A lock held across the 150 ms reads would hold up most writes; one
+            // slow write is a stall of a busy machine (seen on CI), not the lock.
+            let slow = waits
+                .iter()
+                .filter(|w| **w >= Duration::from_millis(100))
+                .count();
             assert!(
-                worst < Duration::from_millis(100),
-                "a write waited {worst:?}"
+                slow <= 1,
+                "{slow} of {} writes waited: {waits:?}",
+                waits.len()
             );
         });
     }
