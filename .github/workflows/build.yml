@@ -71,7 +71,8 @@ jobs:
           Copy-Item target/release/fxmp.exe portable/fxmp/
           # A file, so the zip keeps the folder.
           Set-Content portable/fxmp/fxmp-data/README.txt "fxmp keeps its settings, library and log in this folder. Delete the folder to use the installed app's data instead."
-          Compress-Archive -Path portable/fxmp -DestinationPath portable/fxmp_0.1.0_x64_portable.zip
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          Compress-Archive -Path portable/fxmp -DestinationPath "portable/fxmp_${version}_x64_portable.zip"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fxmp-windows-installers

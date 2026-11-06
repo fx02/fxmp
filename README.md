@@ -27,7 +27,7 @@ A macOS-first Tauri 2 player that plays music straight from an SMB share
 
 ## Installation (macOS 12+, Apple Silicon and Intel)
 
-1. Download the `.dmg` (`fxmp_0.1.0_universal.dmg`), open it and
+1. Download the `.dmg` (`fxmp_<version>_universal.dmg`), open it and
    drag the app into `Applications`.
 2. The app is neither signed nor notarized, so macOS blocks it on first launch.
    Remove the quarantine flag:
