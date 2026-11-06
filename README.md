@@ -374,8 +374,10 @@ server's address), an **On** switch and (except the main one) **Remove**:
   limits it to those apps; macOS cannot tell which app it is. Nothing is
   recorded and no microphone permission is asked: macOS reports whether the
   input device is running (the orange dot), Windows which apps use the
-  microphone (its microphone icon). On macOS this cannot tell when the default
-  input is also the default output (a headset): then nothing happens.
+  microphone (its microphone icon). macOS 14.2 and later report which processes
+  record, from any input (a call usually uses the headset's microphone, not the
+  default input); older macOS versions only report whether the default input
+  device runs, and cannot tell when it is also the default output (a headset).
 - **Mini player**: the ▭ button next to 🚫 shrinks the window to the
   now-playing bar (title, position slider, ⏮ ⏯ ⏭ 🚫 and volume); ⤢ brings the
   full window back at its earlier size. It stays that way after a restart.

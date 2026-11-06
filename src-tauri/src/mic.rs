@@ -288,27 +288,43 @@ pub fn app_counts(key: &str, filter: &[String]) -> bool {
     filter.is_empty() || filter.iter().any(|f| key.contains(f.as_str()))
 }
 
-/// Whether some app is using the microphone (`None`: cannot tell).
+/// Whether some app is using the microphone (`None`: cannot tell). macOS 14.2+
+/// says for each process whether it is recording, from whichever input device
+/// (a call often uses the headset's microphone, not the default input); older
+/// systems only say whether the default input device is running.
 /// macOS cannot tell which app it is: `_apps` is not used.
 #[cfg(target_os = "macos")]
 pub fn in_use(_apps: &[String]) -> Option<bool> {
+    mac::any_process_recording().or_else(mac::default_input_running)
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
     use objc2_core_audio::{
         kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioHardwarePropertyDefaultInputDevice,
-        kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
-        kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, AudioObjectGetPropertyData,
-        AudioObjectPropertyAddress,
+        kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyProcessObjectList,
+        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
+        kAudioProcessPropertyIsRunningInput, kAudioProcessPropertyPID, AudioObjectGetPropertyData,
+        AudioObjectGetPropertyDataSize, AudioObjectPropertyAddress,
     };
     use std::ptr::NonNull;
 
-    fn get_u32(object: u32, selector: u32) -> Option<u32> {
-        let address = AudioObjectPropertyAddress {
+    const SYSTEM: u32 = kAudioObjectSystemObject as u32;
+
+    fn address(selector: u32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress {
             mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain,
-        };
-        let mut value: u32 = 0;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        // SAFETY: valid pointers to a property address, a size and a u32 that
+        }
+    }
+
+    /// A property of fixed size `T` (a u32 or an i32).
+    fn get<T: Default + Copy>(object: u32, selector: u32) -> Option<T> {
+        let address = address(selector);
+        let mut value = T::default();
+        let mut size = std::mem::size_of::<T>() as u32;
+        // SAFETY: valid pointers to a property address, a size and a `T` that
         // outlive the call; the size tells CoreAudio how much it may write.
         let status = unsafe {
             AudioObjectGetPropertyData(
@@ -320,20 +336,71 @@ pub fn in_use(_apps: &[String]) -> Option<bool> {
                 NonNull::from(&mut value).cast(),
             )
         };
-        (status == 0).then_some(value)
+        (status == 0 && size as usize == std::mem::size_of::<T>()).then_some(value)
     }
 
-    let system = kAudioObjectSystemObject as u32;
-    let input = get_u32(system, kAudioHardwarePropertyDefaultInputDevice)?;
-    if input == 0 {
-        return Some(false);
+    /// A property that is a list of audio object ids.
+    fn get_list(object: u32, selector: u32) -> Option<Vec<u32>> {
+        let address = address(selector);
+        let mut size = 0u32;
+        // SAFETY: as in `get`; this only reads the size of the list.
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                object,
+                NonNull::from(&address),
+                0,
+                std::ptr::null(),
+                NonNull::from(&mut size),
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let mut ids = vec![0u32; size as usize / std::mem::size_of::<u32>()];
+        if ids.is_empty() {
+            return Some(ids);
+        }
+        // SAFETY: `ids` has room for `size` bytes, which CoreAudio may not exceed.
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                object,
+                NonNull::from(&address),
+                0,
+                std::ptr::null(),
+                NonNull::from(&mut size),
+                NonNull::new(ids.as_mut_ptr()).expect("non-empty").cast(),
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        ids.truncate(size as usize / std::mem::size_of::<u32>());
+        Some(ids)
     }
-    // A headset that is also the default output runs while music plays: its
-    // "running" says nothing about the microphone.
-    if get_u32(system, kAudioHardwarePropertyDefaultOutputDevice) == Some(input) {
-        return None;
+
+    /// Some other process records from any input device (`None`: this macOS
+    /// does not list audio processes, before 14.2).
+    pub fn any_process_recording() -> Option<bool> {
+        let own = std::process::id() as i32;
+        let processes = get_list(SYSTEM, kAudioHardwarePropertyProcessObjectList)?;
+        Some(processes.into_iter().any(|p| {
+            get::<u32>(p, kAudioProcessPropertyIsRunningInput) == Some(1)
+                && get::<i32>(p, kAudioProcessPropertyPID) != Some(own)
+        }))
     }
-    get_u32(input, kAudioDevicePropertyDeviceIsRunningSomewhere).map(|v| v != 0)
+
+    /// The default input device runs. A headset that is also the default output
+    /// runs while music plays: its "running" says nothing, so `None` then.
+    pub fn default_input_running() -> Option<bool> {
+        let input = get::<u32>(SYSTEM, kAudioHardwarePropertyDefaultInputDevice)?;
+        if input == 0 {
+            return Some(false);
+        }
+        if get::<u32>(SYSTEM, kAudioHardwarePropertyDefaultOutputDevice) == Some(input) {
+            return None;
+        }
+        get::<u32>(input, kAudioDevicePropertyDeviceIsRunningSomewhere).map(|v| v != 0)
+    }
 }
 
 /// Whether some app is using the microphone (`None`: cannot tell): an app in the
@@ -446,6 +513,12 @@ mod tests {
     #[ignore]
     fn live_mic_state() {
         eprintln!("microphone in use: {:?}", in_use(&[]));
+        #[cfg(target_os = "macos")]
+        eprintln!(
+            "per process: {:?}, default input: {:?}",
+            mac::any_process_recording(),
+            mac::default_input_running()
+        );
     }
 
     #[test]
