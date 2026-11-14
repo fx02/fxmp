@@ -2693,20 +2693,20 @@ mod tests {
     fn rule_to_an_unknown_name_is_ignored() {
         let c = Catalog::open_in_memory().unwrap();
         add(&c, "a.mp3", Some("Chillout"));
-        c.add_genre_rule("chillout", "ZZ Test Preimenovano")
+        c.add_genre_rule("chillout", "ZZ Test Renamed")
             .unwrap();
         assert_eq!(count_of(&c, "chillout"), Some(1));
         assert!(c
             .genres()
             .unwrap()
             .iter()
-            .all(|g| g.key != "zztestpreimenovano"));
+            .all(|g| g.key != "zztestrenamed"));
     }
 
     #[test]
     fn unknown_tag_genres_go_to_unknown() {
         let c = Catalog::open_in_memory().unwrap();
-        let zz = add(&c, "a.mp3", Some("ZZ Test Preimenovano"));
+        let zz = add(&c, "a.mp3", Some("ZZ Test Renamed"));
         let other = add(&c, "b.mp3", Some("Other"));
         let num = add(&c, "c.mp3", Some("(250)"));
         c.rebuild_genres().unwrap();
@@ -2752,7 +2752,7 @@ mod tests {
         let db = dir.path().join("catalog.db");
         let (zz, rock) = {
             let c = Catalog::open(&db).unwrap();
-            let zz = add(&c, "a.mp3", Some("ZZ Test Preimenovano"));
+            let zz = add(&c, "a.mp3", Some("ZZ Test Renamed"));
             let rock = add(&c, "b.mp3", Some("Rock"));
             add(&c, "c.mp3", None);
             // What an older version left behind: every tag value a genre, Croatian
@@ -2761,10 +2761,10 @@ mod tests {
                 .execute_batch(
                     "DELETE FROM track_genres; DELETE FROM genres;
                      INSERT INTO genres(id, key, display) VALUES
-                        (1, 'zztestpreimenovano', 'ZZ Test Preimenovano'),
-                        (2, 'rock', 'Rock'), (3, '_none', '(bez žanra)');
+                        (1, 'zztestrenamed', 'ZZ Test Renamed'),
+                        (2, 'rock', 'Rock'), (3, '_none', '(no genre)');
                      INSERT INTO track_genres VALUES (1, 1), (2, 2), (3, 3);
-                     INSERT INTO genre_rules VALUES ('rock', 'ZZ Test Preimenovano');
+                     INSERT INTO genre_rules VALUES ('rock', 'ZZ Test Renamed');
                      PRAGMA user_version = 0;",
                 )
                 .unwrap();

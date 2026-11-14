@@ -123,7 +123,7 @@ test("filterGenres matches substrings regardless of case and diacritics", () => 
   const genres = [
     { key: "a", display: "Chillout", count: 3 },
     { key: "b", display: "Drum & Bass", count: 5 },
-    { key: "c", display: "Zabavna glazba Čvrsto", count: 1 },
+    { key: "c", display: "Easy listening Čvrsto", count: 1 },
   ];
   assert.deepEqual(filterGenres(genres, ""), genres);
   assert.deepEqual(filterGenres(genres, "  "), genres);
@@ -476,7 +476,7 @@ test("libraryName: its own name, else the main server, the folder or the host", 
   assert.equal(libraryName({ id: 1, name: "" }, en), "Main server");
   assert.equal(libraryName({ id: 1, name: "" }, hr), "Glavni server");
   assert.equal(libraryName({ id: 2, name: "", source: local("/Volumes/USB Disk/") }, en), "USB Disk");
-  assert.equal(libraryName({ id: 2, name: "", source: local("D:\\Glazba\\Čista") }, en), "Čista");
+  assert.equal(libraryName({ id: 2, name: "", source: local("D:\\Music\\Čapek") }, en), "Čapek");
   const smb = { type: "smb", primary: { host: " nas.local " }, secondary: null };
   assert.equal(libraryName({ id: 4, name: "", source: smb }, en), "nas.local");
   assert.equal(libraryName({ id: 5, name: "" }, en), "Library 5");
@@ -494,8 +494,8 @@ test("libraryFromForm builds the backend's library", () => {
     },
   );
   assert.deepEqual(
-    libraryFromForm({ id: 4, name: "", enabled: false, type: "local", path: " /Volumes/Glazba čž " }),
-    { id: 4, name: "", enabled: false, source: { type: "local", path: "/Volumes/Glazba čž" } },
+    libraryFromForm({ id: 4, name: "", enabled: false, type: "local", path: " /Volumes/Music čž " }),
+    { id: 4, name: "", enabled: false, source: { type: "local", path: "/Volumes/Music čž" } },
   );
 });
 

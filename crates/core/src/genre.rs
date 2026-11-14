@@ -438,7 +438,7 @@ mod tests {
             ("rocknroll", "rockandroll"),
             ("deephouse", "house"),
             ("trance", "trance"),
-            ("zztestpreimenovano", "zztestpreimenovano"),
+            ("zztestrenamed", "zztestrenamed"),
             ("_none", "_none"),
         ] {
             assert_eq!(current_key(old), new, "{old}");
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn unknown_and_junk_names_are_not_genres() {
         for n in [
-            "ZZ Test Preimenovano",
+            "ZZ Test Renamed",
             "Other",
             "other",
             "Misc",

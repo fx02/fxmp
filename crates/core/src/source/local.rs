@@ -265,11 +265,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("Čćž Ђ 🎵 folder");
         fs::create_dir(&dir).unwrap();
-        for name in ["Pjesma čćžšđ 🎶.mp3", "a b  c.flac"] {
+        for name in ["Song čćžšđ 🎶.mp3", "a b  c.flac"] {
             fs::copy(fixtures().join("tone.mp3"), dir.join(name)).unwrap();
         }
         // AppleDouble companions (resource forks on non-Mac disks) and hidden files.
-        fs::write(dir.join("._Pjesma čćžšđ 🎶.mp3"), "x").unwrap();
+        fs::write(dir.join("._Song čćžšđ 🎶.mp3"), "x").unwrap();
         fs::write(tmp.path().join("._root.mp3"), "x").unwrap();
         fs::write(tmp.path().join(".DS_Store"), "x").unwrap();
 
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(
             got,
             [
-                "Čćž Ђ 🎵 folder/Pjesma čćžšđ 🎶.mp3",
+                "Čćž Ђ 🎵 folder/Song čćžšđ 🎶.mp3",
                 "Čćž Ђ 🎵 folder/a b  c.flac"
             ]
         );

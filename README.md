@@ -2,6 +2,8 @@
 
 Vibe coded with Claude
 
+<img src="docs/screenshots/main.png" alt="fxmp main window: now playing, transport controls and the genre list" width="420">
+
 Formerly SMB Music Player.
 
 A macOS-first Tauri 2 player that plays music straight from an SMB share

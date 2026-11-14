@@ -24,7 +24,7 @@ export function albumLabel(album, t) {
   return album.year ? t("albums.year", { name, year: String(album.year) }) : name;
 }
 
-/** Lowercase, no diacritics, trimmed: "Čvrsto" and "cvrsto" match. */
+/** Lowercase, no diacritics, trimmed: "Škoda" and "skoda" match. */
 export function foldForSearch(s) {
   return s
     .normalize("NFD")

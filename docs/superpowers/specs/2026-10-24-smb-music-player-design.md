@@ -1,189 +1,194 @@
-# SMB Music Player — dizajn (desktop: macOS + Windows)
+# SMB Music Player — design (desktop: macOS + Windows)
 
-Datum: 2026-10-24
-Status: odobreno za macOS fazu
+Date: 2026-10-24
+Status: approved for the macOS phase
 
-## 1. Namjera i zašto
+## 1. Intent and rationale
 
-Vlasnik ima veliku, uredno tagiranu glazbenu kolekciju na NAS-u (SMB share
-`\\10.111.100.2\F\MP3`, zaštićen korisničkim imenom i lozinkom), složenu u
-mape po izvođačima ili žanrovima. Sluša "po raspoloženju": nekad trance, nekad
-chillout, jazz, domaće, dnb, metal, oldies, a nekad sve skupa.
+The owner has a large, well-tagged music collection on a NAS (SMB share
+`\\10.111.100.2\F\MP3`, protected by username and password), organized into
+folders by artist or genre. They listen "by mood": sometimes trance, sometimes
+chillout, jazz, local music, dnb, metal, oldies, and sometimes everything
+together.
 
-Treba mu mali, neintruzivan desktop player koji:
-- jednom (ili na zahtjev) pokupi popis svih pjesama s diska i zapamti ga,
-- prikaže glazbu grupiranu po žanru,
-- jednim klikom pusti nasumično iz odabranog žanra ili kombinacije žanrova,
-- živi u trayu i preskače pjesmu jednim klikom.
+They need a small, unobtrusive desktop player that:
+- scans the list of all songs on the disk once (or on demand) and remembers it,
+- shows the music grouped by genre,
+- plays random songs from the selected genre or combination of genres with one click,
+- lives in the tray and skips a song with one click.
 
-**Uspjeh:** klikne žanr i glazba svira za par sekundi. Svaki put počinje drugom,
-stvarno nasumičnom pjesmom. Nepoželjnu pjesmu preskoči jednim klikom u trayu,
-bez otvaranja prozora. Player ne smeta dok radi.
+**Success:** click a genre and music plays within a couple of seconds. Every
+time it starts with a different, truly random song. An unwanted song is skipped
+with one click in the tray, without opening a window. The player stays out of
+the way while it runs.
 
-## 2. Ciljevi
+## 2. Goals
 
-1. **Izvor:** SMB share. Host/IP, share i putanja mogu se mijenjati u
-   postavkama (zadano `10.111.100.2`, share `F`, putanja `MP3`). Uz to idu
-   korisničko ime, lozinka i opcionalna domena/radna grupa.
-2. **Indeks:** rekurzivno skeniranje stabla i čitanje tagova (izvođač, album,
-   naslov, žanr, trajanje, broj pjesme, ReplayGain ako postoji). Rezultat se
-   sprema u lokalnu bazu (SQLite). Skeniranje se pokreće pri prvom pokretanju
-   ili ručno ("Osvježi"). Ponovno skeniranje je inkrementalno: preskače
-   datoteke kojima se nisu promijenili veličina i mtime.
-3. **Reprodukcija se streama sa SMB-a**, bez preuzimanja cijele kolekcije.
-   Pjesma se čita s read-ahead bufferom, a sljedeća pjesma se počinje učitavati
-   prije kraja trenutne.
-   - Crossfade je po defaultu **uključen, 5 s** (moja odluka).
-   - Kad je crossfade isključen: nema umjetne tišine između pjesama, ali
-     reprodukcija nije sample-točno gapless (nema trimanja LAME encoder
-     delaya). Ako dekoder to već sam podržava, to je bonus (moja odluka).
-   - I ručni "sljedeća" radi kratki fade (~0,5–1 s) da nema klika (moja
-     odluka).
-4. **Formati:** MP3, FLAC, OGG Vorbis (Opus u OGG-u je poželjan, ne obavezan).
-5. **Nativni audio:** dekodiranje i izlaz idu kroz nativni audio stack, ne kroz
-   web/HTML5 audio.
-6. **Kontrole:** play/pauza, sljedeća, glasnoća, odabir izlaznog uređaja od
-   onih koje sustav nudi (pamti se, uz fallback na zadani ako uređaj nestane).
-   Crossfade se uključuje/isključuje, trajanje je 1–10 s.
-7. **Žanrovi:** glavni pogled je popis žanrova s brojem pjesama. Može se
-   odabrati jedan ili više žanrova, ili "Sve". Klik pokreće shuffle.
-8. **Pravi random:**
-   - pri svakom pokretanju odabira radi se svježe Fisher–Yates miješanje iz
-     kriptografski seedanog RNG-a (OS entropija), bez fiksnog seeda i bez
-     spremljenog redoslijeda;
-   - prva pjesma je jednako nasumična kao i ostale; ako je ista kao prva pjesma
-     prethodnog pokretanja za isti odabir, zamijeni se s drugom;
-   - unutar jednog prolaza nema ponavljanja dok se ne iscrpi cijeli skup;
-     zatim slijedi novo miješanje, pri čemu se pazi da prva pjesma novog
-     prolaza nije zadnja odsvirana.
-   - Testom se potvrđuje da su prve pjesme kroz 1000 pokretanja raspršene.
-9. **Normalizacija žanrova:** slični nazivi automatski se spajaju
-   (case/razmaci/interpunkcija, npr. "Drum & Bass" / "DnB" / "drum n bass",
-   "Chill Out" / "Chillout"). Korisnik može ručno spojiti ili preimenovati
-   žanr. Ručna pravila se spremaju lokalno i ne diraju tagove na disku.
-   Pjesma s više žanrova (npr. "Trance; Chillout" ili više genre frameova)
-   broji se u svakom od njih. Model ima zasebnu tablicu pjesma–žanr, a
-   višestruki odabir uklanja duplikate prije miješanja (moja odluka).
-   Pjesme bez žanra idu u "(bez žanra)", uz fallback na ime nadređene mape ako
-   ona izgleda kao žanr (odluka graditelja kako to detektirati).
-10. **Nečitljive datoteke:** ako datoteka nedostaje, oštećena je, ne da se
-    dekodirati ili čitanje istekne, tiho se preskače i svira sljedeća. Datoteka
-    se označi u bazi i nakon N uzastopnih neuspjeha isključi iz shufflea
-    dok se ne napravi ponovno skeniranje.
-11. **Normalizacija glasnoće (može se isključiti, uključena po defaultu):**
-    - ReplayGain tag (track gain) primjenjuje se ako postoji;
-    - ako ga nema, glasnoća se mjeri tijekom reprodukcije (EBU R128 /
-      LUFS-procjena), rezultat se sprema u bazu i koristi od sljedećeg puta;
-    - nema unaprijednog skeniranja glasnoće cijele kolekcije;
-    - zaštita od clippinga (limiter ili ograničenje pojačanja).
-12. **Tray / izbornička traka:**
-    - lijevi klik na tray ikonu = **sljedeća pjesma** (glavna radnja);
-    - desni klik otvara izbornik: trenutna pjesma (izvođač – naslov), pauza/
-      nastavi, sljedeća, podizbornik "Žanr" za brzu promjenu raspoloženja,
-      "Prikaži prozor", "Izlaz";
-    - zatvaranje prozora skriva ga u tray, a ne gasi aplikaciju.
-    - Napomena za macOS: lijevi klik na ikonu u menu baru po konvenciji otvara
-      izbornik. Ako ga nije moguće pouzdano mapirati na "sljedeća", stavljaju
-      se dvije ikone (⏭ i glavna) ili ⏭ kao prva stavka izbornika. Graditelj
-      odlučuje prema tome što platforma dopušta, a cilj je preskakanje jednim
-      klikom.
-13. **Medijske tipke i OS kontrole:** play/pauza/sljedeća s tipkovnice,
-    integracija s macOS Now Playing i Windows SMTC.
-14. **Obavijest pri promjeni pjesme:** kratka sistemska obavijest
-    (izvođač – naslov), može se isključiti, po defaultu isključena da ne bude
-    intruzivno.
-15. **Pokretanje sa sustavom:** opcija, po defaultu isključena.
-16. **Ban:** "Nikad više ne puštaj ovu pjesmu" (iz trayа i prozora). Banane
-    pjesme se mogu pregledati i odbanati u postavkama.
-17. **Offline ponašanje:** ako share nije dostupan, katalog se i dalje
-    prikazuje iz cachea. Aplikacija jasno kaže da disk nije dostupan i pokušava
-    se ponovno spojiti. Kod pogrešne lozinke traži ispravak.
-18. **Sigurnost vjerodajnica:** lozinka se sprema u OS keychain (macOS
-    Keychain, Windows Credential Manager), nikad u čistu datoteku ili log.
+1. **Source:** SMB share. Host/IP, share and path can be changed in settings
+   (default `10.111.100.2`, share `F`, path `MP3`). It also takes a username,
+   password and an optional domain/workgroup.
+2. **Index:** recursive tree scan and tag reading (artist, album, title, genre,
+   duration, track number, ReplayGain if present). The result is stored in a
+   local database (SQLite). The scan runs on first launch or manually
+   ("Refresh"). Rescanning is incremental: it skips files whose size and mtime
+   have not changed.
+3. **Playback is streamed from SMB**, without downloading the whole collection.
+   A song is read with a read-ahead buffer, and the next song starts loading
+   before the current one ends.
+   - Crossfade is **on by default, 5 s** (my decision).
+   - When crossfade is off: there is no artificial silence between songs, but
+     playback is not sample-accurate gapless (no trimming of the LAME encoder
+     delay). If the decoder already supports it by itself, that is a bonus (my
+     decision).
+   - A manual "next" also does a short fade (~0.5–1 s) to avoid a click (my
+     decision).
+4. **Formats:** MP3, FLAC, OGG Vorbis (Opus in OGG is desirable, not required).
+5. **Native audio:** decoding and output go through the native audio stack, not
+   through web/HTML5 audio.
+6. **Controls:** play/pause, next, volume, choice of output device among those
+   the system offers (remembered, with fallback to the default if the device
+   disappears). Crossfade can be turned on/off, duration is 1–10 s.
+7. **Genres:** the main view is a list of genres with song counts. One or more
+   genres can be selected, or "All". A click starts shuffle.
+8. **True random:**
+   - on every selection start, a fresh Fisher–Yates shuffle is done from a
+     cryptographically seeded RNG (OS entropy), with no fixed seed and no
+     stored order;
+   - the first song is as random as the others; if it is the same as the first
+     song of the previous start for the same selection, it is swapped with
+     another one;
+   - within one pass there are no repeats until the whole set is exhausted;
+     then a new shuffle follows, taking care that the first song of the new pass
+     is not the last one played.
+   - A test confirms that the first songs are spread out across 1000 starts.
+9. **Genre normalization:** similar names are merged automatically
+   (case/whitespace/punctuation, e.g. "Drum & Bass" / "DnB" / "drum n bass",
+   "Chill Out" / "Chillout"). The user can manually merge or rename a genre.
+   Manual rules are stored locally and do not touch the tags on disk. A song
+   with multiple genres (e.g. "Trance; Chillout" or multiple genre frames) is
+   counted in each of them. The model has a separate song–genre table, and a
+   multi-genre selection removes duplicates before shuffling (my decision).
+   Songs without a genre go into "(no genre)", with a fallback to the parent
+   folder name if it looks like a genre (how to detect that is the builder's
+   decision).
+10. **Unreadable files:** if a file is missing, corrupt, cannot be decoded, or
+    the read times out, it is silently skipped and the next one plays. The file
+    is flagged in the database and, after N consecutive failures, excluded from
+    shuffle until a rescan is done.
+11. **Loudness normalization (can be turned off, on by default):**
+    - the ReplayGain tag (track gain) is applied if present;
+    - if absent, loudness is measured during playback (EBU R128 / LUFS
+      estimate), the result is stored in the database and used from the next
+      time on;
+    - there is no up-front loudness scan of the whole collection;
+    - clipping protection (limiter or gain limit).
+12. **Tray / menu bar:**
+    - left click on the tray icon = **next song** (the main action);
+    - right click opens a menu: current song (artist – title), pause/resume,
+      next, a "Genre" submenu for quickly changing mood, "Show window", "Quit";
+    - closing the window hides it to the tray instead of quitting the app.
+    - Note for macOS: by convention, a left click on a menu bar icon opens the
+      menu. If it cannot be reliably mapped to "next", two icons are used (⏭ and
+      the main one) or ⏭ as the first menu item. The builder decides based on
+      what the platform allows; the goal is skipping with one click.
+13. **Media keys and OS controls:** play/pause/next from the keyboard,
+    integration with macOS Now Playing and Windows SMTC.
+14. **Notification on song change:** a short system notification
+    (artist – title), can be turned off, off by default so it is not intrusive.
+15. **Launch at login:** an option, off by default.
+16. **Ban:** "Never play this song again" (from the tray and the window). Banned
+    songs can be reviewed and unbanned in settings.
+17. **Offline behavior:** if the share is unavailable, the catalog is still
+    shown from the cache. The app clearly says the disk is unavailable and
+    tries to reconnect. On a wrong password it asks for a correction.
+18. **Credential security:** the password is stored in the OS keychain (macOS
+    Keychain, Windows Credential Manager), never in a plain file or log.
 
-## 3. Ne-ciljevi (za sada)
+## 3. Non-goals (for now)
 
-- Android: zaseban, drugi projekt nakon desktopa, na istim idejama (vidi §8).
-- Uređivanje tagova na disku.
-- Upravljanje playlistama, ocjene, statistike, last.fm, omoti albuma kao
-  obavezni dio (omot se smije prikazati ako je trivijalno).
-- Kopiranje ili sinkronizacija kolekcije lokalno.
-- Bilo kakav cloud ili server komponenta.
+- Android: a separate, second project after desktop, built on the same ideas
+  (see §8).
+- Editing tags on disk.
+- Playlist management, ratings, statistics, last.fm, album covers as a required
+  part (a cover may be shown if trivial).
+- Copying or syncing the collection locally.
+- Any cloud or server component.
 
-## 4. Anti-ciljevi (bilo bi promašaj čak i da "radi")
+## 4. Anti-goals (a miss even if it "works")
 
-- Prva pjesma shufflea je ponovljiva ili predvidiva.
-- Aplikacija je teška i bučna: velik RAM/CPU u pozadini, iskačući prozori,
-  fokus krađa, obavijesti po defaultu.
-- Jedna loša datoteka zaustavlja reprodukciju ili izbacuje modalni dijalog.
-- Lozinka u čistom tekstu na disku.
-- Pokretanje aplikacije ponovno skenira cijeli disk.
-- Reprodukcija ovisi o tome da OS ima montiran share (aplikacija se sama spaja
-  preko SMB-a).
+- The first song of a shuffle is repeatable or predictable.
+- The app is heavy and noisy: high RAM/CPU in the background, pop-up windows,
+  focus stealing, notifications by default.
+- One bad file stops playback or throws a modal dialog.
+- Password in plain text on disk.
+- Launching the app rescans the whole disk.
+- Playback depends on the OS having the share mounted (the app connects by
+  itself over SMB).
 
-## 5. Ograničenja
+## 5. Constraints
 
-- **Redoslijed (vlasnikova odluka):** prvo se radi i isporučuje macOS
-  verzija. Windows dolazi poslije. Gradit će se preko GitHub Actions
-  (Windows runner), a ako to ne bude moguće, vlasnik će kasnije pokrenuti
-  Claude nativno na Windows stroju. Kod mora od početka biti cross-platform,
-  bez macOS-only prečaca u jezgri, ali za Windows se u prvoj fazi ne
-  isporučuje ništa osim CI builda ako on prođe.
+- **Order (owner's decision):** the macOS version is built and delivered first.
+  Windows comes after. It will be built via GitHub Actions (Windows runner),
+  and if that is not possible, the owner will later run Claude natively on a
+  Windows machine. The code must be cross-platform from the start, with no
+  macOS-only shortcuts in the core, but for Windows nothing is delivered in
+  the first phase except a CI build, if it passes.
 
-- **Serveri:** glavni je `10.111.100.2`, Windows 10 (SMB 3.x, NTLMv2,
-  signing moguć). Rezervni je `10.111.0.2`, Unraid (Samba), s istom glazbom.
-  Port 445 na oba je dostupan s razvojnog Maca, pa se testira na pravim
-  serverima.
-- **Primarni i rezervni izvor (moja odluka):** postavke podržavaju glavni i
-  opcionalni rezervni server. Svaki ima svoj host, share, putanju i
-  vjerodajnice. Katalog se gradi s glavnog. Pjesma se identificira relativnom
-  putanjom unutar korijena glazbe. Ako glavni nije dostupan, reprodukcija ide
-  s rezervnog po istoj relativnoj putanji, a ako je tamo nema, pjesma se
-  preskače. Pretpostavka je da je struktura mapa na oba ista; to treba
-  potvrditi na stvarnim serverima prije implementacije fallbacka.
+- **Servers:** the primary is `10.111.100.2`, Windows 10 (SMB 3.x, NTLMv2,
+  signing possible). The backup is `10.111.0.2`, Unraid (Samba), with the same
+  music. Port 445 on both is reachable from the development Mac, so testing is
+  done against the real servers.
+- **Primary and backup source (my decision):** settings support a primary and
+  an optional backup server. Each has its own host, share, path and
+  credentials. The catalog is built from the primary. A song is identified by
+  its relative path within the music root. If the primary is unavailable,
+  playback goes to the backup by the same relative path, and if the song is not
+  there, it is skipped. The assumption is that the folder structure is the same
+  on both; this must be confirmed on the real servers before implementing the
+  fallback.
 
-- macOS (Apple Silicon i Intel, macOS 12+) i Windows 10/11 x64.
-- Kolekcija vjerojatno ima desetke tisuća datoteka. UI i baza moraju to
-  podnijeti bez zastoja (virtualizirane liste).
-- Mreža je LAN. Buffer mora preživjeti kratke zastoje od nekoliko sekundi.
-- SMB2/3 s NTLM autentikacijom.
-- Na razvojnom Macu trenutno nije instaliran Rust toolchain, treba ga
-  instalirati (rustup).
+- macOS (Apple Silicon and Intel, macOS 12+) and Windows 10/11 x64.
+- The collection likely has tens of thousands of files. The UI and database
+  must handle that without stalls (virtualized lists).
+- The network is a LAN. The buffer must survive short stalls of a few seconds.
+- SMB2/3 with NTLM authentication.
+- The development Mac currently has no Rust toolchain installed; it must be
+  installed (rustup).
 
-## 6. Tehničke odluke (moj izbor; vlasnik je izbor stacka prepustio meni)
+## 6. Technical decisions (my choice; the owner left the stack choice to me)
 
-- **Okvir:** Tauri 2 (Rust backend, lagani web UI u sistemskom webviewu).
-  Daje mali binarij, tray podršku i jedan kod za obje platforme.
-- **Audio:** dekodiranje u Rustu (`symphonia`: MP3, FLAC, OGG Vorbis), izlaz
-  preko `cpal` (CoreAudio / WASAPI), uključujući enumeraciju i odabir uređaja.
-  Vlastiti mikser za crossfade (dvije dekodirane struje, equal-power krivulja),
-  glasnoću i gain.
-- **SMB klijent:** Rust SMB2/3 biblioteka koja ne ovisi o montiranju na OS-u.
-  Graditelj bira konkretnu biblioteku nakon kratke provjere zrelosti. Ako
-  nijedna nije dovoljno pouzdana, fallback je `libsmb2` preko FFI-ja.
-- **Baza:** SQLite (`rusqlite`), u app data direktoriju.
-- **Vjerodajnice:** `keyring` crate.
-- **UI:** minimalan; frontend framework bira graditelj (dovoljan je i vanilla
-  ili Svelte). Svijetla/tamna tema prema sustavu.
-- **Pakiranje:** `.dmg` za macOS, `.msi`/`.exe` za Windows. Potpisivanje i
-  notarizacija nisu nužni za osobnu upotrebu. Graditelj dokumentira kako
-  zaobići Gatekeeper/SmartScreen.
+- **Framework:** Tauri 2 (Rust backend, lightweight web UI in the system
+  webview). Gives a small binary, tray support and one codebase for both
+  platforms.
+- **Audio:** decoding in Rust (`symphonia`: MP3, FLAC, OGG Vorbis), output via
+  `cpal` (CoreAudio / WASAPI), including device enumeration and selection. A
+  custom mixer for crossfade (two decoded streams, equal-power curve), volume
+  and gain.
+- **SMB client:** a Rust SMB2/3 library that does not depend on OS mounting.
+  The builder picks a specific library after a short maturity check. If none is
+  reliable enough, the fallback is `libsmb2` via FFI.
+- **Database:** SQLite (`rusqlite`), in the app data directory.
+- **Credentials:** `keyring` crate.
+- **UI:** minimal; the builder chooses the frontend framework (vanilla or
+  Svelte is enough). Light/dark theme following the system.
+- **Packaging:** `.dmg` for macOS, `.msi`/`.exe` for Windows. Signing and
+  notarization are not required for personal use. The builder documents how to
+  bypass Gatekeeper/SmartScreen.
 
-## 7. Prepušteno graditelju
+## 7. Left to the builder
 
-- Raspored prozora i vizualni stil, uz uvjet: kompaktno, jedan glavni pogled
-  sa žanrovima, mini kontrole, sporedni pogled izvođač/album.
-- Veličina read-ahead buffera i strategija pretpunjenja.
-- Točan algoritam spajanja žanrova i detekcija "mapa = žanr".
-- N za isključivanje nečitljivih datoteka (prijedlog: 3).
-- Način paralelizacije skeniranja i prikaz napretka.
-- Ikone.
+- Window layout and visual style, provided it is compact: one main view with
+  genres, mini controls, a secondary artist/album view.
+- Read-ahead buffer size and prefill strategy.
+- The exact genre merging algorithm and "folder = genre" detection.
+- N for excluding unreadable files (suggestion: 3).
+- How to parallelize scanning and show progress.
+- Icons.
 
-## 8. Napomena za budući Android projekt
+## 8. Note for the future Android project
 
-Isti model: SMB indeks u lokalnoj bazi, shuffle po žanru, crossfade, preskakanje
-neispravnih datoteka. Prijedlog stacka: Kotlin + Media3/ExoPlayer, `smbj` ili
-`jcifs-ng`, MediaSession (kontrole na zaključanom zaslonu i u obavijestima),
-Android Keystore. Shuffle i normalizacija žanrova trebaju se ponašati jednako
-kao na desktopu, pa ih vrijedi opisati kao jasnu specifikaciju, ne samo kao
-kod.
+Same model: SMB index in a local database, shuffle by genre, crossfade,
+skipping broken files. Suggested stack: Kotlin + Media3/ExoPlayer, `smbj` or
+`jcifs-ng`, MediaSession (lock screen and notification controls), Android
+Keystore. Shuffle and genre normalization must behave the same as on desktop,
+so they are worth describing as a clear specification, not just as code.

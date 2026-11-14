@@ -2331,8 +2331,8 @@ mod tests {
             "\u{201e}Foo\u{201c} nije poznat \u{17e}anr."
         );
         assert_eq!(
-            merge_target("en", "ZZ Test Preimenovano").unwrap_err(),
-            "\u{201c}ZZ Test Preimenovano\u{201d} is not a known genre."
+            merge_target("en", "ZZ Test Renamed").unwrap_err(),
+            "\u{201c}ZZ Test Renamed\u{201d} is not a known genre."
         );
     }
 
@@ -2403,12 +2403,12 @@ mod tests {
         assert_eq!(file_location(&s, 9, None, "x.mp3").path, "x.mp3");
         // Windows folders.
         let w = Settings {
-            libraries: vec![library(2, local(r"D:\Glazba\"))],
+            libraries: vec![library(2, local(r"D:\Music\"))],
             ..Settings::default()
         };
         let l = file_location(&w, 2, None, "Rock/a b.mp3");
-        assert_eq!(l.path, r"D:\Glazba\Rock\a b.mp3");
-        assert_eq!(l.url, "file:///D:/Glazba/Rock/a%20b.mp3");
+        assert_eq!(l.path, r"D:\Music\Rock\a b.mp3");
+        assert_eq!(l.url, "file:///D:/Music/Rock/a%20b.mp3");
     }
 
     #[test]

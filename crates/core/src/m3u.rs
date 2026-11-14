@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn unicode_commas_and_quotes_pass_through_unknown_length_is_minus_one() {
         let got = export(&[M3uTrack {
-            rel_path: "Domaće/Đorđe Balašević/Ćaletova \"pjesma\", 1.mp3",
+            rel_path: "Local/Đorđe Balašević/Ćaletova \"song\", 1.mp3",
             artist: Some("Đorđe Balašević"),
             title: Some("Ne lomite mi bagrenje, \"live\""),
             duration_ms: None,
@@ -145,7 +145,7 @@ mod tests {
             got,
             "#EXTM3U\r\n\
              #EXTINF:-1,Đorđe Balašević - Ne lomite mi bagrenje, \"live\"\r\n\
-             Domaće/Đorđe Balašević/Ćaletova \"pjesma\", 1.mp3\r\n"
+             Local/Đorđe Balašević/Ćaletova \"song\", 1.mp3\r\n"
         );
         assert!(!got.starts_with('\u{feff}'), "no byte order mark");
     }

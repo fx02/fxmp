@@ -667,7 +667,7 @@ mod tests {
             default_library_name: "NAS".into(),
             default_library_enabled: false,
             libraries: vec![
-                local(2, "/Volumes/Glazba čćž 🎵"),
+                local(2, "/Volumes/Music čćž 🎵"),
                 Library {
                     id: 5,
                     name: "Office".into(),
@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(back.all_libraries()[0].name, "NAS");
         assert_eq!(back.disabled_libraries(), [1, 5]);
         assert_eq!(back.next_library_id(), 6);
-        assert_eq!(back.library(2).unwrap(), local(2, "/Volumes/Glazba čćž 🎵"));
+        assert_eq!(back.library(2).unwrap(), local(2, "/Volumes/Music čćž 🎵"));
         assert!(back.library(3).is_none());
         let json = std::fs::read_to_string(&path).unwrap();
         assert!(json.contains(r#""type": "local""#), "{json}");
