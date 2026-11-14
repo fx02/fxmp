@@ -155,6 +155,7 @@ fn main() {
             commands::playlist_facets,
             commands::playlist_jump,
             commands::playlist_add,
+            commands::playlist_add_genres,
             commands::playlist_add_album,
             commands::playlist_remove,
             commands::playlist_move,

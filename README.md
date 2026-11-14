@@ -241,7 +241,11 @@ server's address), an **On** switch and (except the main one) **Remove**:
 ## Usage
 
 - **Genres** tab: clicking a genre plays only that genre. Tick several genres and
-  use "Play selected (n)". **All** plays the whole library.
+  use "Play selected (n)". **All** plays the whole library. **Add to playlist
+  (n)** (or right-click a genre → Add to playlist) mixes the genres into the
+  playlist that is playing, without stopping it: their tracks land at random
+  places among the ones still to come, tracks already in it are not added
+  twice, and later reshuffles keep them.
   Only genres from Wikipedia's
   [List of ID3v1 genres](https://en.wikipedia.org/wiki/List_of_ID3v1_genres)
   are listed, with its names: the list has 192 codes (0–191), and 190 of them

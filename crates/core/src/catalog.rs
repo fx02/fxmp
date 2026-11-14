@@ -2693,14 +2693,9 @@ mod tests {
     fn rule_to_an_unknown_name_is_ignored() {
         let c = Catalog::open_in_memory().unwrap();
         add(&c, "a.mp3", Some("Chillout"));
-        c.add_genre_rule("chillout", "ZZ Test Renamed")
-            .unwrap();
+        c.add_genre_rule("chillout", "ZZ Test Renamed").unwrap();
         assert_eq!(count_of(&c, "chillout"), Some(1));
-        assert!(c
-            .genres()
-            .unwrap()
-            .iter()
-            .all(|g| g.key != "zztestrenamed"));
+        assert!(c.genres().unwrap().iter().all(|g| g.key != "zztestrenamed"));
     }
 
     #[test]

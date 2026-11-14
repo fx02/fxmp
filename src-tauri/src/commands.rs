@@ -1085,6 +1085,41 @@ pub async fn playlist_add(app: AppHandle, ids: Vec<TrackId>, at: AddAt) -> CmdRe
     run(app, move |app, st| add_to_playlist(app, st, ids, at)).await
 }
 
+/// Adds the tracks of genres `keys` to the playing playlist (see
+/// [`Queue::add_tracks`](fxmp_core::queue::Queue::add_tracks)), without stopping
+/// what plays; a genre selection then includes them. Returns how many were added.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_add_genres(app: AppHandle, keys: Vec<String>) -> CmdResult<usize> {
+    run(app, move |app, st| {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let ids = lock(&st.query).playable_tracks(&keys).map_err(db_err)?;
+        let mut selection = None;
+        let added = edit_playlist(app, st, |l| {
+            let added = l.queue.add_tracks(&ids);
+            if let Selection::Genres { keys: have } = &mut l.selection {
+                // "All" has every genre already.
+                if !have.is_empty() {
+                    for k in &keys {
+                        if !have.contains(k) {
+                            have.push(k.clone());
+                        }
+                    }
+                    selection = Some(have.clone());
+                }
+            }
+            Ok(added)
+        })?;
+        if let Some(keys) = selection {
+            st.settings.update(|s| s.last_selection = keys, |_| {});
+            tray::refresh_genres(app);
+        }
+        Ok(added)
+    })
+    .await
+}
+
 /// Adds an album's tracks in order, as [`playlist_add`].
 #[tauri::command(rename_all = "snake_case")]
 pub async fn playlist_add_album(

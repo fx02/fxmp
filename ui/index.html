@@ -54,6 +54,7 @@
     <div class="toolbar">
       <input id="genre-filter" type="search" data-i18n-placeholder="genres.filter" autocomplete="off" spellcheck="false">
       <button id="btn-play-selected" disabled></button>
+      <button id="btn-add-selected" disabled data-i18n-title="genres.add_selected_title"></button>
       <button id="btn-play-all" data-i18n="genres.all"></button>
     </div>
     <div id="genre-scan" class="note" hidden></div>
@@ -282,6 +283,7 @@
 </main>
 
 <div id="menu" class="menu" hidden>
+  <button data-action="add" data-i18n="genres.add_to_playlist"></button>
   <button data-action="merge" data-i18n="genres.merge_into"></button>
 </div>
 

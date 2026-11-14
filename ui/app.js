@@ -974,6 +974,16 @@ function renderSelection() {
   const b = $("btn-play-selected");
   b.disabled = n === 0;
   b.textContent = n ? t("genres.play_selected_n", { n }) : t("genres.play_selected");
+  const add = $("btn-add-selected");
+  add.disabled = n === 0;
+  add.textContent = n ? t("genres.add_selected_n", { n }) : t("genres.add_selected");
+}
+
+/** Adds the genres' tracks to the playing playlist, without stopping it. */
+async function addGenres(keys) {
+  if (!keys.length) return;
+  const n = await run("playlist_add_genres", { keys });
+  if (n !== undefined) toast(t("playlist.added", { n }));
 }
 
 function playGenres(keys) {
@@ -987,6 +997,8 @@ function genreOf(key) {
 function openMenu(key, x, y) {
   const menu = $("menu");
   menu.dataset.key = key;
+  // "Unknown" cannot be merged, only added.
+  menu.querySelector('[data-action="merge"]').hidden = key === UNKNOWN_KEY;
   menu.hidden = false;
   const w = menu.offsetWidth;
   const h = menu.offsetHeight;
@@ -1049,6 +1061,7 @@ async function onMenuAction(action) {
   const menu = $("menu");
   menu.hidden = true;
   const g = genreOf(menu.dataset.key);
+  if (g && action === "add") return addGenres([g.key]);
   if (!g || action !== "merge") return;
   const into = await askMergeTarget(g, await knownGenres());
   if (!into) return;
@@ -2086,6 +2099,7 @@ function wire() {
   $("genre-filter").addEventListener("input", debounce(renderGenres, 80));
   $("btn-play-selected").addEventListener("click", () => playGenres([...state.selected]));
   $("btn-play-all").addEventListener("click", () => playGenres([]));
+  $("btn-add-selected").addEventListener("click", () => addGenres([...state.selected]));
   const list = $("genre-list");
   list.addEventListener("click", (e) => {
     const li = e.target.closest("li");
@@ -2108,7 +2122,7 @@ function wire() {
     const li = e.target.closest("li");
     if (!li) return;
     e.preventDefault();
-    if (li.dataset.key !== UNKNOWN_KEY) openMenu(li.dataset.key, e.clientX, e.clientY);
+    openMenu(li.dataset.key, e.clientX, e.clientY);
   });
   $("menu").addEventListener("click", (e) => {
     const action = e.target.dataset.action;

@@ -18,6 +18,7 @@
 
 use std::collections::VecDeque;
 
+use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::shuffle::shuffled_pass;
@@ -328,6 +329,49 @@ impl<R: Rng> Queue<R> {
     }
 
     /// Adds `ids` (manual entries) at the end of the order.
+    /// Adds `ids` that are not in the playlist yet (genres added to a playing
+    /// one). A shuffle mixes them at random places among the tracks still to come,
+    /// keeping their order, and keeps them in later passes; a fixed order plays
+    /// them at the end. Returns how many were added.
+    pub fn add_tracks(&mut self, ids: &[TrackId]) -> usize {
+        let mut have: std::collections::HashSet<TrackId> =
+            self.order.iter().map(|e| e.id).collect();
+        let mut new: Vec<Entry> = ids
+            .iter()
+            .copied()
+            .filter(|id| have.insert(*id))
+            .map(Entry::new)
+            .collect();
+        let added = new.len();
+        if added == 0 {
+            return 0;
+        }
+        if self.shuffle {
+            new.shuffle(&mut self.rng);
+            let start = self.cursor.map_or(0, |c| c + 1);
+            let upcoming = self.order.split_off(start);
+            let total = upcoming.len() + added;
+            // Which of the merged places the new tracks take, chosen at random.
+            let mut theirs = vec![false; total];
+            for i in rand::seq::index::sample(&mut self.rng, total, added) {
+                theirs[i] = true;
+            }
+            let (mut old, mut new) = (upcoming.into_iter(), new.into_iter());
+            self.order.extend(theirs.into_iter().filter_map(|t| {
+                if t {
+                    new.next()
+                } else {
+                    old.next()
+                }
+            }));
+        } else {
+            self.order.extend(new);
+        }
+        self.next_pass = None;
+        self.changed();
+        added
+    }
+
     pub fn append(&mut self, ids: &[TrackId]) {
         if ids.is_empty() {
             return;
@@ -635,6 +679,42 @@ mod tests {
         assert!(q.started(9), "forward through the history");
         q.restart();
         assert!(q.started(9), "a restart");
+    }
+
+    #[test]
+    fn added_tracks_mix_into_what_is_still_to_come() {
+        let mut q = Queue::shuffled(&[1, 2, 3, 4, 5], None, rng());
+        let first = play(&mut q).unwrap();
+        let before: Vec<_> = ids(q.upcoming());
+        assert_eq!(q.add_tracks(&[10, 11, 12, 13, 3]), 4, "3 is already there");
+        assert_eq!(q.current(), Some(first), "the playing track stays");
+        let after = ids(q.upcoming());
+        assert_eq!(after.len(), before.len() + 4);
+        let old: Vec<_> = after.iter().copied().filter(|id| *id < 10).collect();
+        assert_eq!(old, before, "the tracks to come keep their order");
+        assert!(after.iter().filter(|id| **id >= 10).count() == 4);
+        assert!(
+            q.order().iter().all(|e| !e.manual),
+            "part of the shuffle, not hand-added"
+        );
+        // Every track plays once, then the next pass has all nine again.
+        let rest: Vec<_> = (0..8).filter_map(|_| play(&mut q)).collect();
+        let mut seen: Vec<_> = rest.iter().copied().chain([first]).collect();
+        seen.sort();
+        assert_eq!(seen, [1, 2, 3, 4, 5, 10, 11, 12, 13]);
+        let mut pass: Vec<_> = (0..9).filter_map(|_| play(&mut q)).collect();
+        pass.sort();
+        assert_eq!(pass, [1, 2, 3, 4, 5, 10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn added_tracks_go_to_the_end_of_a_fixed_order() {
+        let mut q = Queue::fixed(&[1, 2], rng());
+        play(&mut q);
+        assert_eq!(q.add_tracks(&[7, 1, 8]), 2);
+        let rest: Vec<_> = std::iter::from_fn(|| play(&mut q)).collect();
+        assert_eq!(rest, [2, 7, 8]);
+        assert_eq!(q.add_tracks(&[7]), 0);
     }
 
     #[test]
