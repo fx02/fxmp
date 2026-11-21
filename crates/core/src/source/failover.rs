@@ -92,10 +92,18 @@ impl MusicSource for FailoverSource {
     /// by the secondary is reported as [`WalkReport::from_backup`].
     /// On failure the primary's error is returned if the secondary fails too.
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
+        self.walk_until(on_entry, &|| false)
+    }
+
+    fn walk_until(
+        &self,
+        on_entry: &mut dyn FnMut(FileEntry),
+        stop: &dyn Fn() -> bool,
+    ) -> Result<WalkReport, SourceError> {
         let err = match &self.primary {
             Some(primary) => {
                 let mut buf = Vec::new();
-                match primary.walk(&mut |e| buf.push(e)) {
+                match primary.walk_until(&mut |e| buf.push(e), stop) {
                     Ok(report) => {
                         self.prefer(Which::Primary);
                         buf.into_iter().for_each(on_entry);
@@ -112,7 +120,7 @@ impl MusicSource for FailoverSource {
             _ => return Err(err.unwrap_or(SourceError::Unreachable)),
         };
         let mut buf = Vec::new();
-        let report = match secondary.walk(&mut |e| buf.push(e)) {
+        let report = match secondary.walk_until(&mut |e| buf.push(e), stop) {
             Ok(report) => report,
             Err(e) => return Err(err.unwrap_or(e)),
         };

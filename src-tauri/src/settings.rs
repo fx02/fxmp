@@ -234,6 +234,21 @@ impl Settings {
         self.last_library_id = self.last_library_id.max(id);
     }
 
+    /// These settings with the libraries (and the first library's servers) of
+    /// `from`: a library change saved over settings that changed meanwhile
+    /// (the volume, a genre selection) keeps those changes.
+    pub fn with_libraries_of(&self, from: &Settings) -> Self {
+        Settings {
+            primary: from.primary.clone(),
+            secondary: from.secondary.clone(),
+            default_library_name: from.default_library_name.clone(),
+            default_library_enabled: from.default_library_enabled,
+            libraries: from.libraries.clone(),
+            last_library_id: self.last_library_id.max(from.last_library_id),
+            ..self.clone()
+        }
+    }
+
     /// "Reset settings to defaults": every setting back to its default except the
     /// language, and the servers and libraries unless `forget_servers`.
     pub fn reset(&self, forget_servers: bool) -> Self {
@@ -425,6 +440,25 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_library_change_keeps_other_settings() {
+        let now = Settings {
+            volume: 0.3,
+            last_selection: vec!["jazz".into()],
+            ..Settings::default()
+        };
+        let from = Settings {
+            default_library_name: "Music".into(),
+            last_library_id: 4,
+            ..Settings::default()
+        };
+        let merged = now.with_libraries_of(&from);
+        assert_eq!(merged.volume, 0.3);
+        assert_eq!(merged.last_selection, ["jazz"]);
+        assert_eq!(merged.default_library_name, "Music");
+        assert_eq!(merged.last_library_id, 4);
+    }
 
     #[test]
     fn settings_defaults_match_spec() {

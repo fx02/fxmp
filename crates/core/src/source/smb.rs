@@ -679,10 +679,18 @@ impl Drop for SmbReader {
 
 impl MusicSource for SmbSource {
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
+        self.walk_until(on_entry, &|| false)
+    }
+
+    fn walk_until(
+        &self,
+        on_entry: &mut dyn FnMut(FileEntry),
+        stop: &dyn Fn() -> bool,
+    ) -> Result<WalkReport, SourceError> {
         let mut skipped_dirs = Vec::new();
         self.walk_dir(&mut skipped_dirs, &mut |e| {
             on_entry(e);
-            true
+            !stop()
         })?;
         Ok(WalkReport {
             skipped_dirs,

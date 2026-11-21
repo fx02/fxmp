@@ -75,6 +75,16 @@ pub trait MusicSource: Send + Sync {
     /// skipping hidden files and directories. A subfolder that cannot be listed is
     /// skipped and reported; failing to list the root is an error.
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError>;
+    /// [`walk`](Self::walk) that a slow lister (a network share) cuts short
+    /// once `stop` says so: a cancelled scan does not wait for the whole tree.
+    fn walk_until(
+        &self,
+        on_entry: &mut dyn FnMut(FileEntry),
+        stop: &dyn Fn() -> bool,
+    ) -> Result<WalkReport, SourceError> {
+        let _ = stop;
+        self.walk(on_entry)
+    }
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError>;
     /// Opens `rel_path` of library `library`. A source of one library (every
     /// source but the app's, which holds them all) ignores `library`.

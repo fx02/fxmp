@@ -639,7 +639,7 @@ pub async fn save_library(
             (primary_password.as_deref(), secondary_password.as_deref()),
             || {
                 st.settings
-                    .replace_and_save(new, |_, _| {})
+                    .change_and_save(|now| now.with_libraries_of(&new), |_, _| {})
                     .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))
             },
         )?;
@@ -664,7 +664,7 @@ pub async fn set_library_enabled(app: AppHandle, id: LibraryId, enabled: bool) -
             save_library_settings(&old, Library { enabled, ..library }, (false, false))?;
         let new = st
             .settings
-            .replace_and_save(new, |_, _| {})
+            .change_and_save(|now| now.with_libraries_of(&new), |_, _| {})
             .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
         st.forget_or_reconnect(app, &new);
         library_changed(app, st);

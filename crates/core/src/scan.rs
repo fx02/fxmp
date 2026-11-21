@@ -121,11 +121,14 @@ pub fn scan_with(
 ) -> Result<ScanReport> {
     // Walk first: tracks are only marked unseen once the listing has succeeded.
     let mut entries: Vec<FileEntry> = Vec::new();
-    let walk = source.walk(&mut |e| {
-        if !cancel.load(Ordering::Relaxed) {
-            entries.push(e);
-        }
-    })?;
+    let walk = source.walk_until(
+        &mut |e| {
+            if !cancel.load(Ordering::Relaxed) {
+                entries.push(e);
+            }
+        },
+        &|| cancel.load(Ordering::Relaxed),
+    )?;
     if !walk.skipped_dirs.is_empty() {
         log::warn!(
             "scan: {} folder(s) could not be listed; their tracks are kept: {:?}",
@@ -994,6 +997,61 @@ mod tests {
                 .collect();
             assert_eq!(codes, ["tag", "tag"]);
         }
+    }
+
+    /// Lists until told to stop; cancels the scan on its third entry.
+    struct StoppableSource<'a> {
+        cancel: &'a AtomicBool,
+        listed: AtomicUsize,
+    }
+
+    impl MusicSource for StoppableSource<'_> {
+        fn walk(
+            &self,
+            on_entry: &mut dyn FnMut(FileEntry),
+        ) -> std::result::Result<WalkReport, SourceError> {
+            self.walk_until(on_entry, &|| false)
+        }
+        fn walk_until(
+            &self,
+            on_entry: &mut dyn FnMut(FileEntry),
+            stop: &dyn Fn() -> bool,
+        ) -> std::result::Result<WalkReport, SourceError> {
+            for i in 0..1000 {
+                if stop() {
+                    break;
+                }
+                self.listed.fetch_add(1, Ordering::SeqCst);
+                if i == 2 {
+                    self.cancel.store(true, Ordering::SeqCst);
+                }
+                on_entry(FileEntry {
+                    rel_path: format!("f{i}.mp3"),
+                    size: 1,
+                    mtime: 1,
+                });
+            }
+            Ok(WalkReport::default())
+        }
+        fn open(&self, _: &str) -> std::result::Result<Box<dyn ReadSeek>, SourceError> {
+            Err(SourceError::NotFound)
+        }
+        fn describe(&self) -> String {
+            "stoppable".into()
+        }
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_the_listing() {
+        let cancel = AtomicBool::new(false);
+        let src = StoppableSource {
+            cancel: &cancel,
+            listed: AtomicUsize::new(0),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open(&tmp.path().join("catalog.db")).unwrap();
+        let _ = scan(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &cancel);
+        assert_eq!(src.listed.load(Ordering::SeqCst), 3);
     }
 
     /// In-memory source of `files` tone MP3s that sets `cancel` when file

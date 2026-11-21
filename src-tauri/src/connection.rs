@@ -357,6 +357,14 @@ impl MusicSource for LazySmb {
         self.get()?.walk(on_entry)
     }
 
+    fn walk_until(
+        &self,
+        on_entry: &mut dyn FnMut(FileEntry),
+        stop: &dyn Fn() -> bool,
+    ) -> Result<WalkReport, SourceError> {
+        self.get()?.walk_until(on_entry, stop)
+    }
+
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {
         self.get()?.open(rel_path)
     }
@@ -853,6 +861,16 @@ impl MusicSource for AppSource {
     /// The first library's (the scanner walks each library itself).
     fn walk(&self, on_entry: &mut dyn FnMut(FileEntry)) -> Result<WalkReport, SourceError> {
         self.library(DEFAULT_LIBRARY)?.source().walk(on_entry)
+    }
+
+    fn walk_until(
+        &self,
+        on_entry: &mut dyn FnMut(FileEntry),
+        stop: &dyn Fn() -> bool,
+    ) -> Result<WalkReport, SourceError> {
+        self.library(DEFAULT_LIBRARY)?
+            .source()
+            .walk_until(on_entry, stop)
     }
 
     fn open(&self, rel_path: &str) -> Result<Box<dyn ReadSeek>, SourceError> {

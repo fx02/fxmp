@@ -1327,11 +1327,16 @@ pub fn remove_library(app: &AppHandle, id: LibraryId) -> Result<(), String> {
         CLEAR_SCAN_WAIT,
     )
     .ok_or_else(|| i18n::t("err.remove_busy"))?;
-    let mut new = st.settings.get();
-    new.libraries.retain(|l| l.id != id);
     let saved = st
         .settings
-        .replace_and_save(new, |_, _| {})
+        .change_and_save(
+            |now| {
+                let mut new = now.clone();
+                new.libraries.retain(|l| l.id != id);
+                new
+            },
+            |_, _| {},
+        )
         .map_err(|e| i18n::tf("err.save_settings", &[("error", &e.to_string())]))?;
     st.forget_or_reconnect(app, &saved);
     let removed = st.writer.call(move |c| c.remove_library(id));
