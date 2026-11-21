@@ -48,6 +48,24 @@ const BAN_CONFIRM_MS = 3000;
 
 const $ = (id) => document.getElementById(id);
 
+/** Line icons for the player buttons (paths from Lucide, ISC licence). */
+const ICONS = {
+  prev: '<path d="M19 20 9 12l10-8z"/><path d="M5 19V5"/>',
+  next: '<path d="m5 4 10 8-10 8z"/><path d="M19 5v14"/>',
+  play: '<path d="M6 3l14 9-14 9z"/>',
+  pause: '<rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/>',
+  ban: '<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>',
+  shrink: '<path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="m14 10 7-7"/><path d="m3 21 7-7"/>',
+  expand: '<path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="m21 3-7 7"/><path d="m3 21 7-7"/>',
+  locate: '<path d="M2 12h3M19 12h3M12 2v3M12 19v3"/><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/>',
+};
+function setIcon(button, name) {
+  button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+}
+for (const [id, name] of [["btn-prev", "prev"], ["btn-pause", "pause"], ["btn-next", "next"], ["btn-ban", "ban"], ["btn-mini", "shrink"], ["pl-current", "locate"]]) {
+  setIcon($(id), name);
+}
+
 // Translation: `t(key, params)` in the current language (see lib.mjs, locales/).
 let t = (key) => key;
 
@@ -190,6 +208,7 @@ function renderNowPlaying(np) {
   chip.title = chip.textContent;
   chip.hidden = !chip.textContent;
   $("btn-pause").title = np && np.paused ? t("player.resume") : t("player.pause");
+  setIcon($("btn-pause"), np && !np.paused ? "pause" : "play");
   $("btn-ban").disabled = !np;
   // A pending ban confirmation was for the previous track.
   if (changed) resetBan();
@@ -245,7 +264,7 @@ function onPosition(p) {
 /** The mini player (only the now-playing bar) on or off; the window follows. */
 async function setMini(on) {
   document.body.classList.toggle("mini", on);
-  $("btn-mini").textContent = on ? "⤢" : "▭";
+  setIcon($("btn-mini"), on ? "expand" : "shrink");
   if (state.settings) state.settings.mini = on;
   if (on) await fitMini();
   else await run("set_mini", { on: false, height: 0 });
@@ -282,7 +301,7 @@ function resetBan() {
   clearTimeout(banTimer);
   const b = $("btn-ban");
   b.classList.remove("confirm");
-  b.textContent = "🚫";
+  setIcon(b, "ban");
 }
 
 async function onBan() {

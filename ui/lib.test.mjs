@@ -272,8 +272,8 @@ test("scanDoneText covers success, cancel and error", () => {
     scanDoneText({ ok: true, cancelled: false, total: 1, read: 0, failed: 0, removed: 0, skipped_dirs: 1 }, hr),
     "Katalog osvježen: 1 datoteka. Novo ili promijenjeno: 0, nečitljivo: 0, uklonjeno: 0. 1 mapa nije se mogla pročitati; njezine pjesme su zadržane.",
   );
-  assert.equal(scanDoneText({ ok: true, cancelled: true, cancel_reason: null }, en), "Scan cancelled.");
-  assert.equal(scanDoneText({ ok: true, cancelled: true, cancel_reason: null }, hr), "Skeniranje je prekinuto.");
+  assert.equal(scanDoneText({ ok: true, cancelled: true, cancel_reason: null }, en), "Scan cancelled");
+  assert.equal(scanDoneText({ ok: true, cancelled: true, cancel_reason: null }, hr), "Skeniranje je prekinuto");
   assert.equal(
     scanDoneText({ ok: false, cancelled: true, cancel_reason: "The server settings changed." }, en),
     "The server settings changed.",
