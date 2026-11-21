@@ -1029,7 +1029,18 @@ impl Catalog {
                 .map(split_genres)
                 .unwrap_or_default()
                 .iter()
-                .filter_map(|name| resolve(name))
+                .flat_map(|name| match resolve(name) {
+                    Some(g) => vec![g],
+                    // "General Trance" is Trance; "Dance & House" its parts, when
+                    // the whole is no genre ("Drum & bass" is one).
+                    None => match name.strip_prefix("General ").and_then(resolve) {
+                        Some(g) => vec![g],
+                        None => name
+                            .split(" & ")
+                            .filter_map(|p| resolve(p.trim()))
+                            .collect(),
+                    },
+                })
                 .collect();
             if found.is_empty() {
                 // Folder fallback: the first path component, if it names a known genre.
@@ -2727,6 +2738,9 @@ mod tests {
         let zz2 = add(&c, "b.mp3", Some("zz test renamed"));
         let two = add(&c, "c.mp3", Some("Klapa; Etno-Jazz"));
         let other = add(&c, "d.mp3", Some("Other"));
+        let placeholder = add(&c, "g.mp3", Some("Genre"));
+        let parts = add(&c, "h.mp3", Some("Dance & House, Deep Stuff"));
+        let general = add(&c, "i.mp3", Some("General Trance"));
         let num = add(&c, "e.mp3", Some("(250)"));
         let none = add(&c, "f.mp3", None);
         c.rebuild_genres().unwrap();
@@ -2737,11 +2751,16 @@ mod tests {
         both.sort();
         assert_eq!(both, vec!["Etno-Jazz", "Klapa"]);
         // Nothing to tell: no tag, an unknown code, the "Other" placeholder.
-        assert_eq!(count_of(&c, "_none"), Some(3));
-        for id in [other, num, none] {
+        assert_eq!(count_of(&c, "_none"), Some(4));
+        for id in [other, num, none, placeholder] {
             assert_eq!(c.track_genres(id).unwrap(), vec!["Unknown"]);
         }
-        // A known genre in the tag wins; an unsupported one merges like any other.
+        // "Dance & House" is no genre, its parts are; a known genre wins.
+        let mut found = c.track_genres(parts).unwrap();
+        found.sort();
+        assert_eq!(found, vec!["Dance", "House"]);
+        assert_eq!(c.track_genres(general).unwrap(), vec!["Trance"]);
+        // An unsupported genre merges like any other.
         c.add_genre_rule("_tag:klapa", "Folk").unwrap();
         assert_eq!(c.track_genres(two).unwrap(), vec!["Folk"]);
     }

@@ -239,7 +239,7 @@ const SUBGENRE_PARENTS: &[(&str, &str)] = &[
 
 /// Split a raw genre tag value into individual genre names.
 ///
-/// Separators: `;`, `/`, NUL and ` | `. Parts are trimmed and empty ones dropped.
+/// Separators: `;`, `/`, `,`, NUL and ` | `. Parts are trimmed and empty ones dropped.
 /// Because `/` separates genres, a name with a slash in it ("Rap/Hip-Hop") becomes
 /// two names; only the code of "Pop/funk" (62) yields that name whole.
 /// ID3 code references are mapped to their names from [`ID3V1_GENRES`]: a bare `N`,
@@ -247,7 +247,7 @@ const SUBGENRE_PARENTS: &[(&str, &str)] = &[
 /// when it is not just the code's name again), and `((text` for a literal `(text`.
 pub fn split_genres(raw: &str) -> Vec<String> {
     raw.replace(" | ", ";")
-        .split([';', '/', '\0'])
+        .split([';', '/', ',', '\0'])
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .flat_map(expand_codes)
@@ -323,6 +323,21 @@ pub const UNKNOWN_KEY: &str = "_none";
 /// Display name of [`UNKNOWN_KEY`].
 pub const UNKNOWN_DISPLAY: &str = "Unknown";
 
+/// Tag names (keys) that say no more than "a genre": their tracks stay in Unknown.
+const PLACEHOLDERS: &[&str] = &[
+    "genre",
+    "genres",
+    "unknown",
+    "unknowngenre",
+    "none",
+    "others",
+    "misc",
+    "miscellaneous",
+    "various",
+    "variousartists",
+    "music",
+];
+
 /// Key prefix of a genre that tags name but that is not a known genre (the
 /// "Unsupported genres" section): `_tag:` and the name's [`genre_key`].
 pub const TAG_PREFIX: &str = "_tag:";
@@ -334,6 +349,7 @@ pub fn tag_genre(name: &str) -> Option<(String, String)> {
     let key = genre_key(name);
     let tells_nothing = key.is_empty()
         || key.bytes().all(|b| b.is_ascii_digit())
+        || PLACEHOLDERS.contains(&key.as_str())
         || EXCLUDED_CODES
             .iter()
             .any(|&code| genre_key(ID3V1_GENRES[code]) == key);
@@ -414,6 +430,10 @@ mod tests {
         );
         assert_eq!(split_genres("Jazz\0Blues"), vec!["Jazz", "Blues"]);
         assert_eq!(split_genres("Rock | Pop"), vec!["Rock", "Pop"]);
+        assert_eq!(
+            split_genres("House, Tech House, Funk"),
+            vec!["House", "Tech House", "Funk"]
+        );
         assert_eq!(split_genres("(31)"), vec!["Trance"]);
         assert_eq!(split_genres("31"), vec!["Trance"]);
         assert_eq!(split_genres("9999"), vec!["9999"]);
