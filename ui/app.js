@@ -1,6 +1,7 @@
 // UI wiring: Tauri commands/events <-> DOM. Pure helpers live in lib.mjs.
 import {
   formatCount,
+  genreSections,
   trackLabel,
   filterGenres,
   limitMatches,
@@ -47,6 +48,9 @@ const UNKNOWN_KEY = "_none";
 const BAN_CONFIRM_MS = 3000;
 
 const $ = (id) => document.getElementById(id);
+
+// Android hides what only the desktop has (see style.css).
+if (/Android/i.test(navigator.userAgent)) document.body.classList.add("mobile");
 
 /** Line icons for the player buttons (paths from Lucide, ISC licence). */
 const ICONS = {
@@ -955,8 +959,16 @@ function genreView() {
 
 function renderGenres() {
   const shown = filterGenres(genreView(), $("genre-filter").value);
+  const { known, unsupported, unknown } = genreSections(shown);
   const frag = document.createDocumentFragment();
-  for (const g of shown) {
+  for (const g of [...known, null, ...unsupported, ...unknown]) {
+    // The "Unsupported genres" heading: names from the tags, and Unknown.
+    if (g === null) {
+      if (unsupported.length + unknown.length && known.length) {
+        frag.append(el("li", { className: "group-head", textContent: t("genres.unsupported") }));
+      }
+      continue;
+    }
     const li = el(
       "li",
       {},
@@ -2139,7 +2151,7 @@ function wire() {
   });
   list.addEventListener("contextmenu", (e) => {
     const li = e.target.closest("li");
-    if (!li) return;
+    if (!li || !li.dataset.key) return;
     e.preventDefault();
     openMenu(li.dataset.key, e.clientX, e.clientY);
   });

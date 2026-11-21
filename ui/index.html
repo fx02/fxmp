@@ -31,7 +31,7 @@
     <button id="btn-pause" class="icon" data-i18n-title="player.pause_resume" data-i18n-aria-label="player.pause_resume"></button>
     <button id="btn-next" class="icon" data-i18n-title="player.next" data-i18n-aria-label="player.next"></button>
     <button id="btn-ban" class="icon ban" data-i18n-title="player.ban" data-i18n-aria-label="player.ban_label"></button>
-    <button id="btn-mini" class="icon" data-i18n-title="player.mini" data-i18n-aria-label="player.mini"></button>
+    <button id="btn-mini" class="icon" data-desktop data-i18n-title="player.mini" data-i18n-aria-label="player.mini"></button>
     <input id="volume" class="volume" type="range" min="0" max="100" step="1" value="70" data-i18n-title="player.volume" data-i18n-aria-label="player.volume">
   </div>
 </header>
@@ -147,8 +147,8 @@
         </div>
       </fieldset>
 
-      <label class="check"><input id="notify" type="checkbox"> <span data-i18n="settings.notify"></span></label>
-      <label class="check"><input id="autostart" type="checkbox"> <span data-i18n="settings.autostart"></span></label>
+      <label class="check" data-desktop><input id="notify" type="checkbox"> <span data-i18n="settings.notify"></span></label>
+      <label class="check" data-desktop><input id="autostart" type="checkbox"> <span data-i18n="settings.autostart"></span></label>
 
       <div class="row">
         <button type="submit" class="primary" data-i18n="settings.save"></button>
@@ -161,7 +161,7 @@
     <ul id="libraries-list" class="list libraries"></ul>
     <div class="row">
       <button id="btn-add-smb" type="button" data-i18n="libraries.add_smb"></button>
-      <button id="btn-add-local" type="button" data-i18n="libraries.add_local"></button>
+      <button id="btn-add-local" type="button" data-desktop data-i18n="libraries.add_local"></button>
     </div>
     <form id="library-form" class="library-form" autocomplete="off" hidden>
       <h4 id="library-form-title"></h4>
@@ -219,7 +219,7 @@
     </form>
 
     <h3 data-i18n="settings.playback"></h3>
-    <label class="field"><span data-i18n="settings.device"></span>
+    <label class="field" data-desktop><span data-i18n="settings.device"></span>
       <select id="device"></select>
     </label>
     <label class="check"><input id="crossfade-on" type="checkbox"> <span data-i18n="settings.crossfade"></span></label>
@@ -228,9 +228,9 @@
       <span id="crossfade-label"></span>
     </label>
     <label class="check"><input id="normalize" type="checkbox"> <span data-i18n="settings.normalize"></span></label>
-    <label class="check"><input id="fill-speakers" type="checkbox"> <span data-i18n="settings.fill_speakers"></span></label>
+    <label class="check" data-desktop><input id="fill-speakers" type="checkbox"> <span data-i18n="settings.fill_speakers"></span></label>
     <label class="check"><input id="resume-autoplay" type="checkbox"> <span data-i18n="settings.resume_autoplay"></span></label>
-    <label class="field"><span data-i18n="settings.mic_duck"></span>
+    <label class="field" data-desktop><span data-i18n="settings.mic_duck"></span>
       <select id="mic-duck">
         <option value="off" data-i18n="settings.mic_off"></option>
         <option value="ask" data-i18n="settings.mic_ask"></option>
@@ -238,13 +238,13 @@
         <option value="pause" data-i18n="settings.mic_pause"></option>
       </select>
     </label>
-    <label class="field"><span id="mic-level-label"></span>
+    <label class="field" data-desktop><span id="mic-level-label"></span>
       <input id="mic-level" type="range" min="0" max="80" step="5">
     </label>
-    <label class="field"><span data-i18n="settings.mic_apps"></span>
+    <label class="field" data-desktop><span data-i18n="settings.mic_apps"></span>
       <input id="mic-apps" data-i18n-placeholder="settings.mic_apps_example" spellcheck="false">
     </label>
-    <label class="check"><input id="close-to-tray" type="checkbox"> <span data-i18n="settings.close_to_tray"></span></label>
+    <label class="check" data-desktop><input id="close-to-tray" type="checkbox"> <span data-i18n="settings.close_to_tray"></span></label>
     <label class="field"><span data-i18n="settings.lookup_service"></span>
       <select id="lookup-service"></select>
     </label>

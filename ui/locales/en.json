@@ -32,6 +32,7 @@
   "genres.add_to_playlist": "Add to playlist",
   "genres.all": "All",
   "genres.unknown": "Unknown",
+  "genres.unsupported": "Unsupported genres",
   "genres.select": "Select",
   "genres.play": "Play: {name}",
   "genres.merge_into": "Merge into…",

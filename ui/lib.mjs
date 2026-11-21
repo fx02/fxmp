@@ -218,6 +218,21 @@ export function statusTooltip(payload, t, known = []) {
 }
 
 const UNKNOWN_KEY = "_none";
+/** Key prefix of a genre that tags name but that is not a known genre. */
+export const TAG_PREFIX = "_tag:";
+
+/**
+ * The genre list in its sections, each in the given order: the known genres, then
+ * "Unsupported genres" (names from the tags), then Unknown (no usable name).
+ */
+export function genreSections(genres) {
+  const tag = (g) => g.key.startsWith(TAG_PREFIX);
+  return {
+    known: genres.filter((g) => g.key !== UNKNOWN_KEY && !tag(g)),
+    unsupported: genres.filter(tag),
+    unknown: genres.filter((g) => g.key === UNKNOWN_KEY),
+  };
+}
 
 /**
  * Genres that genre `fromKey` can be merged into, matching `query`: first the genres
@@ -228,7 +243,8 @@ export function mergeChoices(knownNames, genres, fromKey, query) {
   const q = foldForSearch(query);
   const matches = (n) => !q || foldForSearch(n).includes(q);
   const byName = (a, b) => a.localeCompare(b, "en", { sensitivity: "base" });
-  const present = genres.filter((g) => g.key !== UNKNOWN_KEY).map((g) => g.display);
+  // Only known genres take a merge (tag names are no target).
+  const present = genres.filter((g) => g.key !== UNKNOWN_KEY && !g.key.startsWith(TAG_PREFIX)).map((g) => g.display);
   const from = genres.find((g) => g.key === fromKey);
   const withTracks = present.filter((n) => (!from || n !== from.display) && matches(n)).sort(byName);
   if (!q) return withTracks;

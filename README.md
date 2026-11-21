@@ -255,9 +255,12 @@ server's address), an **On** switch and (except the main one) **Remove**:
   are read as their names. A few common subgenres go to their parent, e.g.
   "Deep House" to "House" (see `crates/core/src/genre.rs`). Tag values are split
   at `;`, `/` and ` | `, so "Rap/Hip-Hop" counts as Rap and Hip-hop.
-  A track whose tag has no known genre (no genre, "Other", or only unknown
-  names) takes the genre its top folder is named after, if that is a known
-  genre (e.g. `DnB/…` gives Drum & bass); otherwise it is under **Unknown**.
+  A track whose tag has no known genre takes the genre its top folder is named
+  after, if that is a known genre (e.g. `DnB/…` gives Drum & bass). Otherwise
+  the names in its tag are listed as they are, below the known genres under
+  **Unsupported genres** (e.g. "Klapa"), so even those tracks show what kind of
+  music they are; they play, add and merge like any genre. Only tracks with no
+  genre, "Other" or an unknown code number are under **Unknown**.
   Right-click (or ⋯) on a genre: "Merge into…" lists the genres that have
   tracks; typing in its search field also finds the other known genres.
   Merging a genre also moves the subgenres filed under it.

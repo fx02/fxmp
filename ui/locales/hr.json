@@ -32,6 +32,7 @@
   "genres.add_to_playlist": "Dodaj u playlistu",
   "genres.all": "Sve",
   "genres.unknown": "Nepoznato",
+  "genres.unsupported": "Nepodržane kategorije",
   "genres.select": "Odaberi",
   "genres.play": "Pusti: {name}",
   "genres.merge_into": "Spoji u…",

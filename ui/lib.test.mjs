@@ -18,6 +18,7 @@ import {
   missingUsername,
   passwordRequired,
   mergeChoices,
+  genreSections,
   pluralCategory,
   PLURAL_CATEGORIES,
   makeT,
@@ -550,4 +551,20 @@ test("seekTarget maps the slider onto the track", () => {
   assert.equal(seekTarget(SEEK_STEPS + 5, 200_000), 200_000);
   assert.equal(seekTarget(-1, 200_000), 0);
   assert.equal(seekTarget(500, null), 0);
+});
+
+test("genre sections: known, then names from the tags, then Unknown", () => {
+  const g = (key) => ({ key, display: key, count: 1 });
+  const s = genreSections([g("_tag:klapa"), g("rock"), g("_none"), g("jazz")]);
+  assert.deepEqual(s.known.map((x) => x.key), ["rock", "jazz"]);
+  assert.deepEqual(s.unsupported.map((x) => x.key), ["_tag:klapa"]);
+  assert.deepEqual(s.unknown.map((x) => x.key), ["_none"]);
+});
+
+test("a tag name is no merge target", () => {
+  const genres = [
+    { key: "rock", display: "Rock", count: 1 },
+    { key: "_tag:klapa", display: "Klapa", count: 1 },
+  ];
+  assert.deepEqual(mergeChoices([], genres, "_tag:klapa", ""), ["Rock"]);
 });

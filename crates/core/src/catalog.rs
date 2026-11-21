@@ -9,15 +9,15 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::failure::Failure;
 use crate::genre::{
-    current_key, genre_key, known_genre, migrate_selection, split_genres, KnownGenre,
-    UNKNOWN_DISPLAY, UNKNOWN_KEY,
+    current_key, genre_key, known_genre, migrate_selection, split_genres, tag_genre, KnownGenre,
+    TAG_PREFIX, UNKNOWN_DISPLAY, UNKNOWN_KEY,
 };
 use crate::queue::Entry;
 use crate::source::Which;
 use crate::{LibraryId, Result, TrackId};
 
 /// Catalog version, kept in `PRAGMA user_version`; see [`MIGRATIONS`].
-const CATALOG_VERSION: i64 = 5;
+const CATALOG_VERSION: i64 = 6;
 /// Consecutive failures after which a track leaves the shuffle until the next scan.
 const MAX_FAILS: i64 = 3;
 
@@ -289,6 +289,11 @@ const MIGRATIONS: &[Migration] = &[
     (5, "a path is unique within its library", |c| {
         c.rebuild_tracks_table()
     }),
+    (
+        6,
+        "genres re-derived: tag names that are no known genre get their own",
+        |c| c.rebuild_genres(),
+    ),
 ];
 
 /// Catalog files (and the version) whose migration step failed in this run: the
@@ -987,9 +992,10 @@ impl Catalog {
 
     /// Recompute `genres` and `track_genres` from `raw_genre`, folder names and rules.
     ///
-    /// Only known genres (see [`known_genre`]) are kept. A track with no known genre
+    /// Known genres (see [`known_genre`]) come first. A track with no known genre
     /// in its tag takes the genre its top folder is named after, if that is a known
-    /// genre, and otherwise goes to [`UNKNOWN_KEY`]. A rule whose target is not a
+    /// genre, else the names its tag has anyway ([`tag_genre`], the "Unsupported
+    /// genres"), and otherwise goes to [`UNKNOWN_KEY`]. A rule whose target is not a
     /// known genre is ignored.
     pub fn rebuild_genres(&self) -> Result<()> {
         let rules: HashMap<String, String> = self
@@ -1038,6 +1044,20 @@ impl Catalog {
                 if !keys.contains(&g.key) {
                     keys.push(g.key.clone());
                     displays.entry(g.key).or_insert(g.display);
+                }
+            }
+            if keys.is_empty() {
+                for (key, display) in raw
+                    .as_deref()
+                    .map(split_genres)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|name| tag_genre(name))
+                {
+                    if !keys.contains(&key) {
+                        keys.push(key.clone());
+                        displays.entry(key).or_insert(display);
+                    }
                 }
             }
             if keys.is_empty() {
@@ -1484,6 +1504,8 @@ impl Catalog {
 
     /// Merge/rename: tracks of genre `from_key` move to `to_display` (key derived from it).
     pub fn add_genre_rule(&self, from_key: &str, to_display: &str) -> Result<()> {
+        // A tag's name is ruled by its own key (see `rebuild_genres`).
+        let from_key = from_key.strip_prefix(TAG_PREFIX).unwrap_or(from_key);
         self.conn.execute(
             "INSERT OR REPLACE INTO genre_rules(from_key, to_display) VALUES(?1, ?2)",
             params![from_key, to_display],
@@ -1930,8 +1952,8 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(rules, vec![("jazz".to_string(), "Blues".to_string())]);
-        // Genres were not touched by this migration (v3 genres stay as they were).
-        assert_eq!(c.track_genres(3).unwrap(), vec!["Jazz"]);
+        // Genres are derived again (version 6), the merge rule applied.
+        assert_eq!(c.track_genres(3).unwrap(), vec!["Blues"]);
         // Every track is re-read on the next scan, so it gets its year.
         for (path, size, mtime) in [("Rock/a.mp3", 10, 100), ("Rock/b.mp3", 20, 200)] {
             assert!(
@@ -2699,22 +2721,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tag_genres_go_to_unknown() {
+    fn tag_names_that_are_no_known_genre_get_their_own() {
         let c = Catalog::open_in_memory().unwrap();
         let zz = add(&c, "a.mp3", Some("ZZ Test Renamed"));
-        let other = add(&c, "b.mp3", Some("Other"));
-        let num = add(&c, "c.mp3", Some("(250)"));
+        let zz2 = add(&c, "b.mp3", Some("zz test renamed"));
+        let two = add(&c, "c.mp3", Some("Klapa; Etno-Jazz"));
+        let other = add(&c, "d.mp3", Some("Other"));
+        let num = add(&c, "e.mp3", Some("(250)"));
+        let none = add(&c, "f.mp3", None);
         c.rebuild_genres().unwrap();
-        let g = c.genres().unwrap();
-        assert_eq!(g.len(), 1, "{g:?}");
-        assert_eq!(
-            (g[0].key.as_str(), g[0].display.as_str()),
-            ("_none", "Unknown")
-        );
-        assert_eq!(g[0].count, 3);
-        for id in [zz, other, num] {
+        assert_eq!(count_of(&c, "_tag:zztestrenamed"), Some(2));
+        assert_eq!(c.track_genres(zz).unwrap(), vec!["ZZ Test Renamed"]);
+        assert_eq!(c.track_genres(zz2).unwrap(), vec!["ZZ Test Renamed"]);
+        let mut both = c.track_genres(two).unwrap();
+        both.sort();
+        assert_eq!(both, vec!["Etno-Jazz", "Klapa"]);
+        // Nothing to tell: no tag, an unknown code, the "Other" placeholder.
+        assert_eq!(count_of(&c, "_none"), Some(3));
+        for id in [other, num, none] {
             assert_eq!(c.track_genres(id).unwrap(), vec!["Unknown"]);
         }
+        // A known genre in the tag wins; an unsupported one merges like any other.
+        c.add_genre_rule("_tag:klapa", "Folk").unwrap();
+        assert_eq!(c.track_genres(two).unwrap(), vec!["Folk"]);
     }
 
     #[test]
@@ -2771,8 +2800,15 @@ mod tests {
             .iter()
             .map(|g| (g.key.as_str(), g.display.as_str(), g.count))
             .collect();
-        assert_eq!(shown, vec![("rock", "Rock", 1), ("_none", "Unknown", 2)]);
-        assert_eq!(c.track_genres(zz).unwrap(), vec!["Unknown"]);
+        assert_eq!(
+            shown,
+            vec![
+                ("rock", "Rock", 1),
+                ("_none", "Unknown", 1),
+                ("_tag:zztestrenamed", "ZZ Test Renamed", 1)
+            ]
+        );
+        assert_eq!(c.track_genres(zz).unwrap(), vec!["ZZ Test Renamed"]);
         assert_eq!(c.track_genres(rock).unwrap(), vec!["Rock"]);
         // Ignored rules are kept, not deleted.
         let rules: i64 = c

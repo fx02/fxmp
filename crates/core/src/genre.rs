@@ -323,6 +323,23 @@ pub const UNKNOWN_KEY: &str = "_none";
 /// Display name of [`UNKNOWN_KEY`].
 pub const UNKNOWN_DISPLAY: &str = "Unknown";
 
+/// Key prefix of a genre that tags name but that is not a known genre (the
+/// "Unsupported genres" section): `_tag:` and the name's [`genre_key`].
+pub const TAG_PREFIX: &str = "_tag:";
+
+/// The unsupported genre a tag's `name` stands for, as (key, display), or `None`
+/// when the name tells nothing (empty, an unknown code number, "Other"): those
+/// tracks stay in Unknown.
+pub fn tag_genre(name: &str) -> Option<(String, String)> {
+    let key = genre_key(name);
+    let tells_nothing = key.is_empty()
+        || key.bytes().all(|b| b.is_ascii_digit())
+        || EXCLUDED_CODES
+            .iter()
+            .any(|&code| genre_key(ID3V1_GENRES[code]) == key);
+    (!tells_nothing).then(|| (format!("{TAG_PREFIX}{key}"), name.trim().to_string()))
+}
+
 /// A known genre: its normalized key and canonical display name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownGenre {
@@ -357,7 +374,7 @@ pub fn known_genre(name: &str) -> Option<KnownGenre> {
 /// (`randb`, `goa`, …) and no parent genres (`deephouse`); keys that are not known
 /// genres, and [`UNKNOWN_KEY`], stay as they are.
 pub fn current_key(old: &str) -> String {
-    if old == UNKNOWN_KEY {
+    if old == UNKNOWN_KEY || old.starts_with(TAG_PREFIX) {
         return old.to_string();
     }
     known_genre(old).map_or_else(|| old.to_string(), |g| g.key)

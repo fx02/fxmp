@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use fxmp_core::audio::output::list_output_devices;
 use fxmp_core::audio::player::Command;
 use fxmp_core::catalog::GenreCount;
-use fxmp_core::genre::UNKNOWN_KEY;
+use fxmp_core::genre::{TAG_PREFIX, UNKNOWN_KEY};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -545,11 +545,17 @@ pub fn genre_entries(
         id: ALL_GENRES_ID.into(),
         label: tr(lang, "genres.all"),
     }];
-    entries.extend(by_count.iter().take(TOP_GENRES).map(|g| entry(g)));
+    // Unsupported genres (tag names) only when selected: the menu keeps to
+    // the known ones.
+    let (known, tags): (Vec<&GenreCount>, Vec<&GenreCount>) = by_count
+        .into_iter()
+        .partition(|g| !g.key.starts_with(TAG_PREFIX));
+    entries.extend(known.iter().take(TOP_GENRES).map(|g| entry(g)));
     entries.extend(
-        by_count
+        known
             .iter()
             .skip(TOP_GENRES)
+            .chain(&tags)
             .filter(|g| last_selection.contains(&g.key))
             .map(|g| entry(g)),
     );
