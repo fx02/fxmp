@@ -47,6 +47,26 @@ up in `target/universal-apple-darwin/release/bundle/dmg/`. The Rust version is
 pinned in `rust-toolchain.toml`. The icons are generated with
 `src-tauri/icons/gen_app_icon.py` + `cargo tauri icon`.
 
+## Android (8.0 and later, test builds)
+
+`fxmp_<version>_android.apk` runs on 64-bit and 32-bit ARM phones. Copy it to
+the phone, open it and allow the install from that source. It does what the
+desktop app does with SMB libraries; what only a desktop has is left out (tray,
+mini player, start at login, microphone, output device, local folders).
+
+- **Playing with the screen off:** a notification with previous / play-pause /
+  next stays while music plays; it keeps the phone and its Wi-Fi awake for the
+  music. On Android 13+ allow notifications when asked, or the controls do not
+  show.
+- **Passwords** are sealed with a key in the Android Keystore that never leaves
+  the phone, and kept in the app's private data.
+- The share must be reachable from the phone (same network or VPN).
+
+Building: JDK 17, the Android SDK with NDK 27 and the Rust Android targets
+(`cargo tauri android init` installs them), then `scripts/build-android.sh`. It
+signs with a key kept outside the repository (`FXMP_ANDROID_KEYS`, see the
+script); an update must be signed with the same key.
+
 ## Moving from SMB Music Player
 
 fxmp was called SMB Music Player before. Quit SMB Music Player (menu bar menu →
