@@ -1256,10 +1256,13 @@ pub fn prune_playlist(app: &AppHandle, st: &AppState) -> fxmp_core::Result<()> {
             .map(|r| r.id)
             .collect()
     };
+    // Only what was checked goes: tracks added while the query ran stay.
+    let gone: std::collections::HashSet<TrackId> =
+        ids.into_iter().filter(|id| !keep.contains(id)).collect();
     let due_changed = {
         let mut l = lock(&st.playlist);
         let before = l.queue.successor();
-        l.queue.forget_where(|id| !keep.contains(&id));
+        l.queue.forget_where(|id| gone.contains(&id));
         l.queue.successor() != before
     };
     if due_changed {

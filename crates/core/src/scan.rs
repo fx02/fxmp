@@ -17,6 +17,9 @@ const CHUNK: usize = 500;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Longest wait for tagged files before committing what has arrived.
 const BATCH_WINDOW: Duration = Duration::from_millis(100);
+/// This many network failures in a row mean the server is gone, not a few
+/// files: the scan stops instead of waiting out a timeout on every file left.
+const MAX_TRANSIENT_RUN: usize = 20;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanProgress {
@@ -321,6 +324,7 @@ fn read_parallel(
         let _stop_on_exit = SetOnDrop(&stop);
 
         let mut finished = false;
+        let mut transient_run = 0;
         let mut since_rebuild = 0;
         let mut last_rebuild = Instant::now();
         let mut batch: Vec<ReadResult> = Vec::with_capacity(CHUNK);
@@ -351,6 +355,15 @@ fn read_parallel(
                     if matches!(&r.meta, Err(f) if !f.code.is_transient()) && !source.available() {
                         log::warn!("scan: library {library} went away mid-scan; stopping");
                         return Err(Error::Source(crate::source::SourceError::Unreachable));
+                    }
+                    if matches!(&r.meta, Err(f) if f.code.is_transient()) {
+                        transient_run += 1;
+                        if transient_run >= MAX_TRANSIENT_RUN {
+                            log::warn!("scan: library {library} stopped answering; stopping");
+                            return Err(Error::Source(crate::source::SourceError::Unreachable));
+                        }
+                    } else {
+                        transient_run = 0;
                     }
                     match &r.meta {
                         Ok(meta) => c.upsert_track(library, &e.rel_path, e.size, e.mtime, meta)?,
@@ -561,6 +574,28 @@ mod tests {
         fn describe(&self) -> String {
             "flaky".into()
         }
+    }
+
+    #[test]
+    fn scan_stops_when_the_server_stops_answering() {
+        let entry = |i: usize| FileEntry {
+            rel_path: format!("{i}.mp3"),
+            size: 1000,
+            mtime: 1_700_000_000,
+        };
+        let src = FlakySource(
+            (0..MAX_TRANSIENT_RUN + 5)
+                .map(|i| (entry(i), Behaviour::OpenFails(SourceError::Timeout)))
+                .collect(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open(&tmp.path().join("catalog.db")).unwrap();
+        let no = AtomicBool::new(false);
+        let r = scan(DEFAULT_LIBRARY, &src, &mut cat, &mut |_| {}, &no);
+        assert!(
+            matches!(r, Err(Error::Source(SourceError::Unreachable))),
+            "{r:?}"
+        );
     }
 
     #[test]

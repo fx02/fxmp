@@ -126,6 +126,10 @@ impl Drop for Conn {
 struct Session {
     generation: u64,
     conn: Arc<Conn>,
+    /// A reconnect was refused for the password: never log in with it again
+    /// (a scan's workers would otherwise lock the account). Settings changes
+    /// build a new source.
+    auth_failed: bool,
 }
 
 struct Shared {
@@ -160,6 +164,7 @@ impl SmbSource {
             session: Mutex::new(Session {
                 generation: 0,
                 conn: Arc::new(conn),
+                auth_failed: false,
             }),
         });
         let src = Self { shared };
@@ -362,9 +367,15 @@ impl Shared {
     /// Replaces the connection unless someone already did since `seen_generation`.
     fn reconnect(&self, seen_generation: u64) -> Result<(u64, Arc<Conn>), SourceError> {
         let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if s.auth_failed {
+            return Err(SourceError::Auth);
+        }
         if s.generation == seen_generation {
             log::warn!("SMB: connection to {} lost, reconnecting", self.cfg.host);
-            s.conn = Arc::new(open_conn(&self.cfg, &self.share)?);
+            let conn = open_conn(&self.cfg, &self.share).inspect_err(|e| {
+                s.auth_failed = matches!(e, SourceError::Auth);
+            })?;
+            s.conn = Arc::new(conn);
             s.generation += 1;
         }
         Ok((s.generation, s.conn.clone()))

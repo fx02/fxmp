@@ -328,7 +328,6 @@ impl<R: Rng> Queue<R> {
         self.changed();
     }
 
-    /// Adds `ids` (manual entries) at the end of the order.
     /// Adds `ids` that are not in the playlist yet (genres added to a playing
     /// one). A shuffle mixes them at random places among the tracks still to come,
     /// keeping their order, and keeps them in later passes; a fixed order plays
@@ -372,6 +371,7 @@ impl<R: Rng> Queue<R> {
         added
     }
 
+    /// Adds `ids` (manual entries) at the end of the order.
     pub fn append(&mut self, ids: &[TrackId]) {
         if ids.is_empty() {
             return;

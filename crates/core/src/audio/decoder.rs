@@ -87,10 +87,11 @@ impl Downmix {
         let left_side = Channels::SIDE_LEFT | Channels::REAR_LEFT;
         let right_side = Channels::SIDE_RIGHT | Channels::REAR_RIGHT;
         let center = has(Channels::FRONT_CENTRE);
-        let surround = flags.iter().any(|c| left_side.contains(*c));
+        // Surround channels feeding one side (7.1 has a side and a rear pair).
+        let count = |side: Channels| flags.iter().filter(|c| side.contains(**c)).count();
+        let surround = count(left_side).max(count(right_side)) as f32;
         // Normalise by the largest possible sum so the downmix cannot clip.
-        let norm =
-            1.0 + if center { CENTER_GAIN } else { 0.0 } + if surround { CENTER_GAIN } else { 0.0 };
+        let norm = 1.0 + if center { CENTER_GAIN } else { 0.0 } + surround * CENTER_GAIN;
         let gains = flags
             .iter()
             .map(|&c| {
@@ -926,15 +927,18 @@ mod tests {
             | Channels::LFE1
             | Channels::SIDE_LEFT
             | Channels::SIDE_RIGHT;
-        let dm = Downmix::new(l51);
-        let (sl, sr) = dm
-            .gains
-            .iter()
-            .fold((0.0, 0.0), |a, g| (a.0 + g.0, a.1 + g.1));
-        assert!(sl <= 1.0001 && sr <= 1.0001, "{sl} {sr}");
-        assert!(
-            sl > 0.99,
-            "full-scale input should reach about full scale: {sl}"
-        );
+        let l71 = l51 | Channels::REAR_LEFT | Channels::REAR_RIGHT;
+        for layout in [l51, l71] {
+            let dm = Downmix::new(layout);
+            let (sl, sr) = dm
+                .gains
+                .iter()
+                .fold((0.0, 0.0), |a, g| (a.0 + g.0, a.1 + g.1));
+            assert!(sl <= 1.0001 && sr <= 1.0001, "{layout:?}: {sl} {sr}");
+            assert!(
+                sl > 0.99,
+                "full-scale input should reach about full scale: {sl}"
+            );
+        }
     }
 }

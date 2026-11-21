@@ -785,7 +785,9 @@ impl Engine {
             return s.buffered as u64;
         }
         match s.duration_ms {
-            Some(ms) => (ms * self.rate as u64 / 1000).saturating_sub(deck.played),
+            // `played` counts from where the deck started (a seek or a resume).
+            Some(ms) => (ms.saturating_sub(s.start_ms) * self.rate as u64 / 1000)
+                .saturating_sub(deck.played),
             None => 0,
         }
     }
