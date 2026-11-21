@@ -8,6 +8,36 @@ What the owner asked for that is not done yet. The order is not a priority.
 - **A web version** hosted on Debian.
 - **Android:** local folders on the phone; a release build in CI.
 
+## Planned: Linux (Fedora, Arch, Debian, RHEL)
+
+Tauri builds for Linux as is; the work is packaging and the desktop parts.
+- **Packages:** `.deb` (Debian, Ubuntu), `.rpm` (Fedora, RHEL), an AppImage
+  (any distribution, also Arch), and a `PKGBUILD` for the AUR. CI builds them
+  on an Ubuntu runner.
+- **Needs on the system:** WebKitGTK 4.1, a Secret Service keyring (GNOME
+  Keyring or KWallet) for the passwords, ALSA/PipeWire for sound,
+  libayatana-appindicator for the tray icon. RHEL may lack a recent WebKitGTK:
+  there the AppImage is the way.
+- **Code:** `keyring` with its Linux backend; media keys through MPRIS
+  (souvlaki already does it); "lower or pause for calls" through PipeWire
+  (later, off until then); start at login through an XDG autostart file
+  (tauri-plugin-autostart).
+- **Checks:** start, tray, media keys, keyring and playback on Fedora, Debian
+  and Arch (virtual machines).
+
+## Planned: iOS (iPhone, iPad)
+
+Tauri builds for iOS; the Android work (`src/mobile`) is the model.
+- **Needs:** a Mac with Xcode and an Apple Developer Program membership
+  (99 USD a year) to put the app on a phone for longer than 7 days.
+- **Code:** background playback (the `audio` background mode and an
+  AVAudioSession in a small Swift plugin), Now Playing and the lock-screen
+  controls (MPNowPlayingInfoCenter, MPRemoteCommandCenter), the Keychain for
+  the passwords, and the local network permission text for SMB.
+- **Distribution:** TestFlight first (up to 10,000 testers, a build lasts 90
+  days, light review), then the App Store (full review: the reviewer needs a
+  way to hear music, e.g. a demo share).
+
 ## Done
 - **Android app** (2026-11-21): test APK for Android 8+ (arm64, armv7), playback with the screen off, passwords in the Android Keystore.
 - **Unsupported genres** (2026-11-21): tag names that are no known genre get their own section instead of Unknown.
