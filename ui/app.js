@@ -170,6 +170,48 @@ function el(tag, props = {}, ...children) {
 
 // ---------- tabs ----------
 
+// ---------- look: slider style, player skin (this device only) ----------
+
+const LOOK_KEY = "fxmp.look";
+
+function readLook() {
+  try {
+    return JSON.parse(localStorage.getItem(LOOK_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+
+/** Puts the slider style and (Android) the player skin on the page. */
+function applyLook(look) {
+  const body = document.body;
+  for (const c of [...body.classList]) if (c.startsWith("sl-") || c.startsWith("skin-")) body.classList.remove(c);
+  const sliders = look.sliders || "classic";
+  const skin = look.skin || "classic";
+  body.classList.add(`sl-${sliders}`, `skin-${skin}`);
+  $("slider-style").value = sliders;
+  $("player-skin").value = skin;
+  fill($("np-seek"));
+  fill($("volume"));
+}
+
+function setLook(change) {
+  const look = { ...readLook(), ...change };
+  try {
+    localStorage.setItem(LOOK_KEY, JSON.stringify(look));
+  } catch {
+    // Not kept (private storage off): the look still applies until restart.
+  }
+  applyLook(look);
+}
+
+/** How far a styled slider is filled (its colour up to the knob). */
+function fill(input) {
+  const min = Number(input.min) || 0;
+  const max = Number(input.max) || 100;
+  input.style.setProperty("--fill", `${((Number(input.value) - min) / (max - min || 1)) * 100}%`);
+}
+
 /** Android: the tabs are a menu behind the gear (only Genres stays in view). */
 function setTabMenu(open) {
   document.body.classList.toggle("tab-menu", open);
@@ -259,6 +301,7 @@ function renderPosition() {
   $("np-time").textContent = positionText(ms, total);
   $("np-time").title = total ? "" : t("player.no_length");
   slider.value = Math.round((f === null ? 0 : f) * SEEK_STEPS);
+  fill(slider);
 }
 
 /** The length of the playing track, if known. */
@@ -355,7 +398,10 @@ const sendVolume = debounce((v) => run("set_volume", { v }), 60);
 /** The volume or the output device changed (the tray, or this window). */
 function onAudioChanged({ volume, device }) {
   if (state.settings) Object.assign(state.settings, { volume, device });
-  if (sliderFollows(state.volumeTouched, Date.now())) $("volume").value = Math.round(volume * 100);
+  if (sliderFollows(state.volumeTouched, Date.now())) {
+    $("volume").value = Math.round(volume * 100);
+    fill($("volume"));
+  }
   if (state.tab === "settings") {
     const sel = $("device");
     const want = device || "";
@@ -1619,6 +1665,7 @@ function renderSettings(s) {
   $("mic-apps").value = s.mic_apps || "";
   renderLookupServices();
   $("volume").value = Math.round(s.volume * 100);
+  fill($("volume"));
 }
 
 function renderLookupServices() {
@@ -2133,6 +2180,10 @@ async function onLanguage(e) {
 function wire() {
   for (const b of document.querySelectorAll(".tab")) b.addEventListener("click", () => showTab(b.dataset.tab));
   $("btn-more").addEventListener("click", () => setTabMenu(!document.body.classList.contains("tab-menu")));
+  $("slider-style").addEventListener("change", (e) => setLook({ sliders: e.target.value }));
+  $("player-skin").addEventListener("change", (e) => setLook({ skin: e.target.value }));
+  for (const id of ["np-seek", "volume"]) $(id).addEventListener("input", (e) => fill(e.target));
+  applyLook(readLook());
   // Android Back: from a view (or the open menu) back to the player.
   window.addEventListener("popstate", () => {
     overPlayer = false;

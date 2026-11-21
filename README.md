@@ -327,6 +327,11 @@ server's address), an **On** switch and (except the main one) **Remove**:
   Clicking the title in the now-playing bar looks it up on the default service
   (Settings → "Default lookup service", Last.fm unless changed); with "None"
   a click opens nothing (the "Look up on" menus still work).
+- **Look** (Settings → Playback, kept per device): **Sliders** picks how the
+  position and volume sliders look (Classic, Thin with a ring, Thick bar, Split
+  bar, Pill volume), each in its own colour; **Player look** colours the player
+  bar (Classic, Light, Night, Tonal). On Android the look also sizes the
+  full-screen player.
 - The year is shown with the track wherever it appears: "Artist – Title (1991)"
   in the window, the menu bar menu and its tooltip. A track without a year in
   its tags shows none. The year comes from the date/year tag (the first

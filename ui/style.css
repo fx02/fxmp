@@ -478,3 +478,85 @@ body.mobile .list li { min-height: 40px; }
 body.mobile .list .more, body.mobile .row-actions,
 body.mobile .albums li.album .tracks, body.mobile .albums li.album .add,
 body.mobile .album-tracks .more { visibility: visible; }
+
+/* ---------- Slider styles (Settings → Sliders; this device only) ----------
+   Position and volume each have their own colour. --fill (set by app.js) is
+   how far the slider is filled: the colour up to the knob, the track after. */
+:root { --seek-c: var(--accent); --vol-c: #d08419; --track: var(--border); }
+@media (prefers-color-scheme: dark) { :root { --vol-c: #e3a64e; } }
+input.seek { --c: var(--seek-c); }
+input.volume { --c: var(--vol-c); }
+body:not(.sl-classic) input.seek, body:not(.sl-classic) input.volume {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 24px;
+  background: transparent;
+  --th: 6px;
+}
+body:not(.sl-classic) input.seek::-webkit-slider-runnable-track,
+body:not(.sl-classic) input.volume::-webkit-slider-runnable-track {
+  height: var(--th);
+  border-radius: calc(var(--th) / 2);
+  background: linear-gradient(to right, var(--c) var(--fill, 0%), var(--track) var(--fill, 0%));
+}
+body:not(.sl-classic) input.seek::-webkit-slider-thumb,
+body:not(.sl-classic) input.volume::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  margin-top: calc((var(--th) - 18px) / 2);
+  border-radius: 50%;
+  background: var(--surface);
+  border: 3px solid var(--c);
+}
+/* Thick: a bar, the knob only while dragging. */
+body.sl-thick input.seek, body.sl-thick input.volume,
+body.sl-pill input.seek { --th: 10px; }
+body.sl-thick input.seek::-webkit-slider-thumb, body.sl-thick input.volume::-webkit-slider-thumb,
+body.sl-pill input.seek::-webkit-slider-thumb { opacity: 0; background: var(--c); border: none; }
+body.sl-thick input.seek:active::-webkit-slider-thumb, body.sl-thick input.volume:active::-webkit-slider-thumb,
+body.sl-pill input.seek:active::-webkit-slider-thumb { opacity: 1; }
+/* Split (Material 3): a gap at the knob, which is a short upright bar. */
+body.sl-split input.seek, body.sl-split input.volume { --th: 12px; }
+body.sl-split input.seek::-webkit-slider-runnable-track,
+body.sl-split input.volume::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, var(--c) calc(var(--fill, 0%) - 5px), transparent calc(var(--fill, 0%) - 5px), transparent calc(var(--fill, 0%) + 5px), var(--track) calc(var(--fill, 0%) + 5px));
+}
+body.sl-split input.seek::-webkit-slider-thumb, body.sl-split input.volume::-webkit-slider-thumb {
+  width: 4px;
+  height: 22px;
+  margin-top: -5px;
+  border: none;
+  border-radius: 2px;
+  background: var(--c);
+}
+/* Pill: the volume is one big rounded bar you slide along. */
+body.sl-pill input.volume { height: 32px; --th: 32px; }
+body.sl-pill input.volume::-webkit-slider-thumb { width: 2px; height: 32px; margin-top: 0; border: none; border-radius: 0; background: transparent; }
+
+/* ---------- Player skins (Settings → Player look; this device only) ----------
+   Colours on the player bar everywhere; the big buttons only on a phone. */
+body.skin-light header.now { background: #f6f6f4; color: #1d1d1f; --seek-c: #2f7d6d; --vol-c: #d08419; --track: #e2e2df; --surface: #ffffff; }
+body.skin-light #btn-pause { border-radius: 50%; border-color: #2f7d6d; background: #2f7d6d; color: #ffffff; }
+body.skin-light .now-controls button.icon:not(#btn-pause) { border-color: transparent; background: none; color: #1d1d1f; }
+body.mobile.home.skin-light #btn-pause { width: 80px; height: 80px; }
+
+body.skin-night header.now { background: #121214; color: #f2f2f4; --seek-c: #ff7a59; --vol-c: #5cb8a4; --track: #2a2a2e; --surface: #121214; }
+body.mobile.home.skin-night { background: #121214; }
+body.skin-night .np-time, body.mobile.home.skin-night .status-row { color: #9a9aa0; }
+body.skin-night .chip { background: transparent; border: 1px solid #3a3a40; color: #ff7a59; }
+body.skin-night .now-controls button.icon { border: 1px solid #2c2c30; background: #1c1c1f; color: #f2f2f4; border-radius: 12px; }
+body.skin-night #btn-pause { background: #f2f2f4; color: #121214; border-color: #f2f2f4; }
+body.mobile.home.skin-night .now-controls button.icon { border-radius: 16px; }
+
+body.skin-tonal header.now { background: #f3f6fb; color: #1a1c1e; --seek-c: #3b5ba9; --vol-c: #c2410c; --track: #d6dbe5; --surface: #ffffff; }
+body.mobile.home.skin-tonal { background: #f3f6fb; }
+body.skin-tonal .now-text { padding: 8px 12px; border-radius: 14px; background: #3b5ba9; color: #ffffff; }
+body.skin-tonal .chip { background: rgba(255, 255, 255, 0.75); color: #1a1c1e; }
+body.skin-tonal .now-controls button.icon { border-color: transparent; background: #dde3ee; color: #1a1c1e; border-radius: 16px; }
+body.skin-tonal #btn-pause { background: #3b5ba9; border-color: #3b5ba9; color: #ffffff; }
+body.mobile.home.skin-tonal .now-text { padding: 24px; border-radius: 28px; }
+body.mobile.home.skin-tonal .now-controls button.icon { border-radius: 28px; }
+body.mobile.home.skin-tonal #btn-pause { width: 88px; border-radius: 24px; }
