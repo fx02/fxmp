@@ -371,7 +371,11 @@ mod tests {
     #[test]
     fn prefetches_ahead() {
         let (_r, _, c) = reader(2);
-        std::thread::sleep(Duration::from_millis(50));
+        // Up to 2 s for the background reads (a slow CI runner); nothing reads here.
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while c.load(Ordering::SeqCst) < 1024 * 1024 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             c.load(Ordering::SeqCst) >= 1024 * 1024,
             "got {}",

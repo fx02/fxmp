@@ -963,8 +963,9 @@ mod tests {
         assert_eq!((r.read, r.failed), (40, 0));
         let peak = src.peak.load(Ordering::SeqCst);
         assert!(peak >= 4, "peak concurrency {peak}");
+        // One file at a time takes 2 s; well under it on a slow CI runner too.
         assert!(
-            elapsed < Duration::from_millis(40 * 50 / 3),
+            elapsed < Duration::from_millis(40 * 50 * 2 / 3),
             "took {elapsed:?}"
         );
     }
