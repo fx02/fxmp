@@ -176,8 +176,23 @@ function setTabMenu(open) {
   $("btn-more").setAttribute("aria-expanded", String(open));
 }
 
+const MOBILE = document.body.classList.contains("mobile");
+/** Android: whether a view was opened over the player (Back closes it). */
+let overPlayer = false;
+
 function showTab(name) {
+  // Android: "home" is the player alone, full screen; a view opened from the
+  // gear menu sits over it, and the phone's Back button returns to it.
+  if (MOBILE && name === "home" && overPlayer) {
+    history.back();
+    return;
+  }
+  if (MOBILE && name !== "home" && state.tab === "home") {
+    history.pushState({ view: name }, "");
+    overPlayer = true;
+  }
   state.tab = name;
+  document.body.classList.toggle("home", name === "home");
   setTabMenu(false);
   for (const b of document.querySelectorAll(".tab")) {
     const active = b.dataset.tab === name;
@@ -2115,6 +2130,11 @@ async function onLanguage(e) {
 function wire() {
   for (const b of document.querySelectorAll(".tab")) b.addEventListener("click", () => showTab(b.dataset.tab));
   $("btn-more").addEventListener("click", () => setTabMenu(!document.body.classList.contains("tab-menu")));
+  // Android Back: from a view (or the open menu) back to the player.
+  window.addEventListener("popstate", () => {
+    overPlayer = false;
+    showTab("home");
+  });
 
   $("btn-prev").addEventListener("click", () => run("previous"));
   $("btn-pause").addEventListener("click", () => run("toggle_pause"));
@@ -2365,7 +2385,7 @@ async function init() {
   }
   await loadLibraries();
   // A tab the user already picked while starting up stays.
-  if (!state.tab) showTab(state.configured ? "genres" : "settings");
+  if (!state.tab) showTab(state.configured ? (MOBILE ? "home" : "genres") : "settings");
 
   const [status, scan, np, position] = await Promise.all([
     run("get_connection_status"),

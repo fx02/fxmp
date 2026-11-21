@@ -452,6 +452,25 @@ body.mobile.tab-menu .tab {
 }
 body.mobile.tab-menu .tab.active { border-left-color: var(--accent); }
 body.mobile.tab-menu main { display: none; }
+
+/* Android's home: the player alone, over the whole screen. */
+body.mobile.home main { display: none; }
+body.mobile.home header.now {
+  flex: 1;
+  justify-content: center;
+  gap: 24px;
+  padding: 24px 20px;
+  border-bottom: none;
+}
+body.mobile.tab-menu.home header.now { flex: none; }
+body.mobile.home .now-text { flex-direction: column; align-items: flex-start; gap: 12px; }
+body.mobile.home .np-label { font-size: 22px; line-height: 1.3; white-space: normal; }
+body.mobile.home .chip { max-width: 100%; font-size: 13px; padding: 4px 12px; }
+body.mobile.home .np-time { font-size: 13px; }
+body.mobile.home .now-controls { flex-wrap: wrap; justify-content: center; gap: 12px; }
+body.mobile.home button.icon { width: 56px; height: 56px; }
+body.mobile.home button.icon svg { width: 24px; height: 24px; }
+body.mobile.home .volume { flex: 1 0 100%; margin: 16px 0 0; }
 body.mobile button.icon { width: 40px; height: 36px; }
 body.mobile .list li { min-height: 40px; }
 /* No hover on a touch screen: the row actions always show. */

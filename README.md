@@ -53,8 +53,9 @@ pinned in `rust-toolchain.toml`. The icons are generated with
 the phone, open it and allow the install from that source. It does what the
 desktop app does with SMB libraries; what only a desktop has is left out (tray,
 mini player, start at login, microphone, output device, local folders).
-The phone shows the player and the genres; the gear next to the player
-buttons opens the other views (Playlist, Artists, Unreadable, Settings, About).
+The phone shows the player alone, over the whole screen; the gear next to the
+player buttons opens the other views (Genres, Playlist, Artists, Unreadable,
+Settings, About), and the phone's Back button returns to the player.
 
 - **Playing with the screen off:** a notification with previous / play-pause /
   next stays while music plays; it keeps the phone and its Wi-Fi awake for the
