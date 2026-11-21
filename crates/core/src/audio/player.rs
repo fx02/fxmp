@@ -235,6 +235,12 @@ struct Engine {
     loops: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Frames left in a `duration_ms` track whose deck started at `start_ms` (a
+/// seek or a resume) and has played `played` frames since.
+fn frames_left(duration_ms: u64, start_ms: u64, played: u64, rate: u32) -> u64 {
+    (duration_ms.saturating_sub(start_ms) * rate as u64 / 1000).saturating_sub(played)
+}
+
 impl Engine {
     fn new(
         rx: Receiver<Msg>,
@@ -785,9 +791,7 @@ impl Engine {
             return s.buffered as u64;
         }
         match s.duration_ms {
-            // `played` counts from where the deck started (a seek or a resume).
-            Some(ms) => (ms.saturating_sub(s.start_ms) * self.rate as u64 / 1000)
-                .saturating_sub(deck.played),
+            Some(ms) => frames_left(ms, s.start_ms, deck.played, self.rate),
             None => 0,
         }
     }

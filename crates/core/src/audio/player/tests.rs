@@ -1469,3 +1469,14 @@ fn a_seek_while_paused_stays_paused() {
         |e| matches!(e, Event::Position { id: 1, ms, .. } if (8_100..9_000).contains(ms)),
     );
 }
+
+#[test]
+fn time_left_counts_from_the_seek() {
+    // A 4:00 track sought to 3:30 that has played 5 s since: 25 s left.
+    assert_eq!(
+        super::frames_left(240_000, 210_000, 5 * 48_000, 48_000),
+        25 * 48_000
+    );
+    assert_eq!(super::frames_left(240_000, 0, 0, 48_000), 240 * 48_000);
+    assert_eq!(super::frames_left(1_000, 5_000, 10, 48_000), 0);
+}

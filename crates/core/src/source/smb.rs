@@ -181,12 +181,16 @@ impl SmbSource {
     ) -> Result<Vec<FileEntry>, SourceError> {
         let mut out = Vec::new();
         if max > 0 {
-            self.walk_dir(&mut Vec::new(), &mut |e| {
-                if keep(&e) {
-                    out.push(e);
-                }
-                out.len() < max
-            })?;
+            self.walk_dir(
+                &mut Vec::new(),
+                &mut |e| {
+                    if keep(&e) {
+                        out.push(e);
+                    }
+                    out.len() < max
+                },
+                &|| false,
+            )?;
         }
         Ok(out)
     }
@@ -195,12 +199,14 @@ impl SmbSource {
         &self,
         skipped: &mut Vec<String>,
         on_entry: &mut dyn FnMut(FileEntry) -> bool,
+        stop: &dyn Fn() -> bool,
     ) -> Result<bool, SourceError> {
         walk_tree(
             &|rel| self.list_dir(rel),
             WALK_CONCURRENCY,
             skipped,
             on_entry,
+            stop,
         )
     }
 
@@ -257,7 +263,8 @@ impl From<FileFullDirectoryInformation> for DirItem {
 }
 
 /// Concurrent walk: root first, then every listed subfolder as it is found.
-/// `on_entry` returns `false` to stop the walk; returns `Ok(false)` once stopped.
+/// `on_entry` returning `false`, or `stop` (checked before each folder) returning
+/// `true`, stops the walk; returns `Ok(false)` once stopped.
 /// Up to `workers` folders are listed at once, each on its own thread; entries
 /// are emitted on the calling thread, in no particular order.
 ///
@@ -271,6 +278,7 @@ fn walk_tree(
     workers: usize,
     skipped: &mut Vec<String>,
     on_entry: &mut dyn FnMut(FileEntry) -> bool,
+    stop_walk: &dyn Fn() -> bool,
 ) -> Result<bool, SourceError> {
     let (job_tx, job_rx) = mpsc::channel::<String>();
     let job_rx = Mutex::new(job_rx);
@@ -306,6 +314,9 @@ fn walk_tree(
             job_tx.send(String::new()).expect("workers alive");
             let mut pending = 1usize;
             while pending > 0 {
+                if stop_walk() {
+                    return Ok(false);
+                }
                 let (rel, items) = done_rx.recv().expect("a worker owes a result");
                 pending -= 1;
                 let items = match items.unwrap_or_else(|p| std::panic::resume_unwind(p)) {
@@ -688,10 +699,14 @@ impl MusicSource for SmbSource {
         stop: &dyn Fn() -> bool,
     ) -> Result<WalkReport, SourceError> {
         let mut skipped_dirs = Vec::new();
-        self.walk_dir(&mut skipped_dirs, &mut |e| {
-            on_entry(e);
-            !stop()
-        })?;
+        self.walk_dir(
+            &mut skipped_dirs,
+            &mut |e| {
+                on_entry(e);
+                !stop()
+            },
+            stop,
+        )?;
         Ok(WalkReport {
             skipped_dirs,
             from_backup: false,
@@ -844,10 +859,16 @@ mod tests {
     ) -> (Result<bool, SourceError>, Vec<String>, Vec<String>) {
         let mut seen = Vec::new();
         let mut skipped = Vec::new();
-        let res = walk_tree(list, workers, &mut skipped, &mut |e| {
-            seen.push(e.rel_path);
-            true
-        });
+        let res = walk_tree(
+            list,
+            workers,
+            &mut skipped,
+            &mut |e| {
+                seen.push(e.rel_path);
+                true
+            },
+            &|| false,
+        );
         seen.sort();
         (res, seen, skipped)
     }
@@ -979,9 +1000,32 @@ mod tests {
                 n += 1;
                 n < 5
             },
+            &|| false,
         );
         assert_eq!(res, Ok(false));
         assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn walk_stops_between_folders_when_asked() {
+        let listed = AtomicUsize::new(0);
+        let list = |_: &str| {
+            listed.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![DirItem {
+                name: "photos".into(),
+                is_dir: true,
+                size: 0,
+                mtime: 0,
+            }])
+        };
+        let res = walk_tree(&list, 1, &mut Vec::new(), &mut |_| true, &|| {
+            listed.load(Ordering::SeqCst) >= 3
+        });
+        assert_eq!(res, Ok(false));
+        assert!(
+            listed.load(Ordering::SeqCst) <= 4,
+            "a folder tree without music still stops"
+        );
     }
 
     #[test]
@@ -999,7 +1043,7 @@ mod tests {
             }
         };
         let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            walk_tree(&list, 2, &mut Vec::new(), &mut |_| true)
+            walk_tree(&list, 2, &mut Vec::new(), &mut |_| true, &|| false)
         }));
         assert!(res.is_err(), "panic must propagate");
         // Root + d0 + at most the folders in hand / just picked up; not all 50.
