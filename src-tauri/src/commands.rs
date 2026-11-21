@@ -1175,6 +1175,18 @@ pub async fn playlist_move(app: AppHandle, from: usize, to: usize, id: TrackId) 
     .await
 }
 
+/// "RND": the tracks still to come in a new random order; the playing one plays on.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn playlist_randomize(app: AppHandle) -> CmdResult<()> {
+    run(app, |app, st| {
+        edit_playlist(app, st, |l| {
+            l.queue.shuffle_upcoming();
+            Ok(())
+        })
+    })
+    .await
+}
+
 /// "New empty playlist": the playing track plays on, then nothing until tracks are
 /// added by hand.
 #[tauri::command(rename_all = "snake_case")]

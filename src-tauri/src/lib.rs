@@ -180,6 +180,7 @@ pub fn run() {
             commands::playlist_remove,
             commands::playlist_move,
             commands::playlist_new,
+            commands::playlist_randomize,
             commands::playlist_play_filtered,
             commands::playlist_export_hint,
             commands::list_album_tracks,

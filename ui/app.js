@@ -59,6 +59,7 @@ const ICONS = {
   play: '<path d="M6 3l14 9-14 9z"/>',
   pause: '<rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/>',
   ban: '<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>',
+  gear: '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
   shrink: '<path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="m14 10 7-7"/><path d="m3 21 7-7"/>',
   expand: '<path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="m21 3-7 7"/><path d="m3 21 7-7"/>',
   locate: '<path d="M2 12h3M19 12h3M12 2v3M12 19v3"/><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3"/>',
@@ -66,7 +67,7 @@ const ICONS = {
 function setIcon(button, name) {
   button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 }
-for (const [id, name] of [["btn-prev", "prev"], ["btn-pause", "pause"], ["btn-next", "next"], ["btn-ban", "ban"], ["btn-mini", "shrink"], ["pl-current", "locate"]]) {
+for (const [id, name] of [["btn-prev", "prev"], ["btn-pause", "pause"], ["btn-next", "next"], ["btn-ban", "ban"], ["btn-mini", "shrink"], ["pl-current", "locate"], ["btn-more", "gear"]]) {
   setIcon($(id), name);
 }
 
@@ -169,8 +170,15 @@ function el(tag, props = {}, ...children) {
 
 // ---------- tabs ----------
 
+/** Android: the tabs are a menu behind the gear (only Genres stays in view). */
+function setTabMenu(open) {
+  document.body.classList.toggle("tab-menu", open);
+  $("btn-more").setAttribute("aria-expanded", String(open));
+}
+
 function showTab(name) {
   state.tab = name;
+  setTabMenu(false);
   for (const b of document.querySelectorAll(".tab")) {
     const active = b.dataset.tab === name;
     b.classList.toggle("active", active);
@@ -2106,6 +2114,7 @@ async function onLanguage(e) {
 
 function wire() {
   for (const b of document.querySelectorAll(".tab")) b.addEventListener("click", () => showTab(b.dataset.tab));
+  $("btn-more").addEventListener("click", () => setTabMenu(!document.body.classList.contains("tab-menu")));
 
   $("btn-prev").addEventListener("click", () => run("previous"));
   $("btn-pause").addEventListener("click", () => run("toggle_pause"));
@@ -2196,6 +2205,7 @@ function wire() {
   $("pl-list").addEventListener("contextmenu", onPlaylistMenu);
   $("pl-play-filtered").addEventListener("click", onPlayFiltered);
   $("pl-new").addEventListener("click", onNewPlaylist);
+  $("pl-randomize").addEventListener("click", () => run("playlist_randomize"));
   $("pl-export").addEventListener("click", onExport);
 
   // Artists
@@ -2262,9 +2272,6 @@ function wire() {
     renderNowPlaying(state.nowPlaying);
   });
   $("btn-github").addEventListener("click", () => run("open_project_page"));
-  $("btn-copy-version").addEventListener("click", () => {
-    if (state.about) copyAndTell(state.about.text);
-  });
   $("btn-scan").addEventListener("click", startScan);
   $("btn-empty-scan").addEventListener("click", startScan);
 

@@ -433,3 +433,28 @@ body.mini { overflow: hidden; }
 
 /* Android: no tray, mini player, start at login, microphone or local folders. */
 body.mobile [data-desktop] { display: none !important; }
+body:not(.mobile) [data-mobile] { display: none !important; }
+
+/* Android: the tabs are a menu that the gear opens; buttons are for fingers. */
+body.mobile .tabs { display: none; }
+body.mobile.tab-menu .tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 4px 0;
+  background: var(--surface);
+}
+body.mobile.tab-menu .tab {
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: none;
+  border-left: 2px solid transparent;
+}
+body.mobile.tab-menu .tab.active { border-left-color: var(--accent); }
+body.mobile.tab-menu main { display: none; }
+body.mobile button.icon { width: 40px; height: 36px; }
+body.mobile .list li { min-height: 40px; }
+/* No hover on a touch screen: the row actions always show. */
+body.mobile .list .more, body.mobile .row-actions,
+body.mobile .albums li.album .tracks, body.mobile .albums li.album .add,
+body.mobile .album-tracks .more { visibility: visible; }

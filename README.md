@@ -53,6 +53,8 @@ pinned in `rust-toolchain.toml`. The icons are generated with
 the phone, open it and allow the install from that source. It does what the
 desktop app does with SMB libraries; what only a desktop has is left out (tray,
 mini player, start at login, microphone, output device, local folders).
+The phone shows the player and the genres; the gear next to the player
+buttons opens the other views (Playlist, Artists, Unreadable, Settings, About).
 
 - **Playing with the screen off:** a notification with previous / play-pause /
   next stays while music plays; it keeps the phone and its Wi-Fi awake for the
@@ -298,6 +300,8 @@ server's address), an **On** switch and (except the main one) **Remove**:
   - Tracks added by hand (marked +) play once per pass: when a shuffle starts
     its next pass, they are not in it. "New empty playlist" starts a hand-made
     list (the playing track plays on).
+  - **RND** puts the tracks still to come in a new random order; what played
+    and the playing track stay where they are.
   - **Export…** saves the playlist (or, with "Export only filtered (N)", just the
     filtered rows) as an `.m3u8` file (UTF-8 Extended M3U, which Winamp,
     foobar2000, VLC, Music/iTunes, Kodi, Android players and most others read).
@@ -423,12 +427,10 @@ server's address), an **On** switch and (except the main one) **Remove**:
   it: the music plays on and the Dock and menu bar icons stay. A click on the
   Dock icon brings the window back. Minimizing (yellow button) puts the window
   in the Dock as usual. **Cmd+Q** (or Quit in the menu bar menu) quits.
-- **Version**: Settings → **About** (at the bottom) shows the version, the
-  commit it was built from and the build date, with a link to the source code
-  on GitHub (https://github.com/fx02/fxmp) and **Copy version**,
-  which copies e.g. "fxmp 0.1.0 (abc1234, 2026-10-25)" for bug
-  reports. The same line is the last (greyed-out) item of the menu bar menu. A
-  build without git (a source tarball) shows "unknown" as the commit.
+- **Version**: the **About** tab (the last one) shows the version, the commit
+  it was built from and the build date, with a link to the source code on
+  GitHub (https://github.com/fx02/fxmp). A build without git (a source tarball)
+  shows "unknown" as the commit.
 
 ## Translations
 
@@ -544,9 +546,8 @@ These cannot be checked automatically (they need listening or clicking):
       Settings device list follows.
 - [ ] Menu bar menu → Previous, Look up current song (opens the browser) and
       Copy current song (paste it somewhere); the greyed-out version line at the
-      bottom matches Settings → About.
-- [ ] Settings → About: the GitHub link opens the browser on the project page;
-      Copy version puts the version line on the clipboard.
+      bottom matches the About tab.
+- [ ] About tab: the GitHub link opens the browser on the project page.
 - [ ] The new app icon (play triangle over "fxmp", no sound arcs) in the Dock,
       Finder, the app switcher (Cmd+Tab) and the notification picture; "fxmp" is
       readable in small sizes (Finder list view).

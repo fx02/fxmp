@@ -396,6 +396,17 @@ impl<R: Rng> Queue<R> {
         Some(e)
     }
 
+    /// "RND": puts the tracks still to come (after the playing one) in a new
+    /// random order; what played and the playing track stay where they are.
+    pub fn shuffle_upcoming(&mut self) {
+        let start = self.cursor.map_or(0, |c| c + 1);
+        if let Some(upcoming) = self.order.get_mut(start..) {
+            upcoming.shuffle(&mut self.rng);
+        }
+        self.next_pass = None;
+        self.changed();
+    }
+
     /// Moves the entry at `from` to `to` (its index afterwards).
     pub fn move_entry(&mut self, from: usize, to: usize) -> bool {
         let len = self.order.len();
@@ -705,6 +716,23 @@ mod tests {
         let mut pass: Vec<_> = (0..9).filter_map(|_| play(&mut q)).collect();
         pass.sort();
         assert_eq!(pass, [1, 2, 3, 4, 5, 10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn rnd_shuffles_only_what_is_still_to_come() {
+        let ids: Vec<TrackId> = (1..=50).collect();
+        let mut q = Queue::fixed(&ids, rng());
+        q.jump(9);
+        assert_eq!(play(&mut q), Some(10));
+        let before: Vec<TrackId> = q.order().iter().map(|e| e.id).collect();
+        q.shuffle_upcoming();
+        let after: Vec<TrackId> = q.order().iter().map(|e| e.id).collect();
+        assert_eq!(after[..10], before[..10], "played and playing stay");
+        assert_eq!(q.cursor(), Some(9));
+        assert_ne!(after[10..], before[10..], "the rest is in a new order");
+        let mut rest = after[10..].to_vec();
+        rest.sort();
+        assert_eq!(rest, before[10..]);
     }
 
     #[test]
