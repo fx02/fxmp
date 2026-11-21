@@ -279,9 +279,15 @@ impl AppState {
         };
         let playback_db = Catalog::open(&catalog_path)?;
         let writer = CatalogWriter::spawn(Catalog::open(&catalog_path)?)?;
+        #[cfg(desktop)]
         let creds: Arc<dyn CredentialStore> = Arc::new(Keychain {
             service: devdata::keychain_service(dev_dir.is_some()),
         });
+        #[cfg(mobile)]
+        let creds: Arc<dyn CredentialStore> = Arc::new(crate::mobile::native::KeystoreStore::new(
+            app,
+            data_dir.join("passwords.json"),
+        ));
 
         // Libraries are set once their passwords are read (see below).
         let source = Arc::new(AppSource::default());

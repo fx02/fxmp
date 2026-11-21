@@ -26,6 +26,7 @@ pub fn data_dir_override(debug: bool, value: Option<OsString>) -> Option<PathBuf
 }
 
 /// The keychain service: a separate one when the data folder is overridden.
+#[cfg_attr(mobile, allow(dead_code))]
 pub fn keychain_service(overridden: bool) -> &'static str {
     if overridden {
         DEV_SERVICE

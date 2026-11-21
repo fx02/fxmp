@@ -11,6 +11,7 @@ use fxmp_core::{LibraryId, DEFAULT_LIBRARY};
 
 use crate::settings::{ServerConfig, Settings};
 
+#[cfg_attr(mobile, allow(dead_code))]
 pub const SERVICE: &str = "fxmp";
 
 /// The keychain account of server `host`/`username` of library `library`. The
@@ -181,10 +182,12 @@ impl CredentialStore for Remembered<'_> {
 }
 
 /// The OS keychain via `keyring`, under keychain service `service`.
+#[cfg(desktop)]
 pub struct Keychain {
     pub service: &'static str,
 }
 
+#[cfg(desktop)]
 impl CredentialStore for Keychain {
     /// The stored password, or `None` if there is none (or the keychain cannot be read).
     fn get(&self, account: &str) -> Option<String> {
@@ -220,6 +223,28 @@ impl CredentialStore for Keychain {
                 &[("error", &e.to_string())],
             )),
         }
+    }
+}
+
+/// Android has no old app's keychain to read: the old app's entries (see
+/// `migrate.rs`) are never there.
+#[cfg(mobile)]
+pub struct Keychain {
+    pub service: &'static str,
+}
+
+#[cfg(mobile)]
+impl CredentialStore for Keychain {
+    fn get(&self, _account: &str) -> Option<String> {
+        None
+    }
+
+    fn set(&self, _account: &str, _password: &str) -> Result<(), String> {
+        Err(format!("no {} keychain on this system", self.service))
+    }
+
+    fn delete(&self, _account: &str) -> Result<(), String> {
+        Ok(())
     }
 }
 

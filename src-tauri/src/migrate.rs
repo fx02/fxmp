@@ -597,6 +597,7 @@ pub fn tell_failed(app: &tauri::AppHandle, language: &str) {
 /// Removes the old app's login item (a LaunchAgent named after it on macOS, a
 /// `Run` value on Windows), so it does not start beside fxmp; fxmp's own is set
 /// from the copied `autostart` setting. Nothing to do if there is none.
+#[cfg(desktop)]
 pub fn remove_old_login_item() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut builder = auto_launch::AutoLaunchBuilder::new();
@@ -608,6 +609,12 @@ pub fn remove_old_login_item() -> Result<(), String> {
         .build()
         .and_then(|launcher| launcher.disable())
         .map_err(|e| e.to_string())
+}
+
+/// No login items on Android.
+#[cfg(mobile)]
+pub fn remove_old_login_item() -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(test)]

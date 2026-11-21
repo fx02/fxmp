@@ -6,6 +6,11 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[lib]
+# A library too: Android loads the app as a shared library.
+name = "fxmp_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [dependencies]
 fxmp-core = { path = "../crates/core" }
 tauri = { version = "2", features = ["image-png", "tray-icon"] }
@@ -16,14 +21,17 @@ env_logger = "0.11"
 rand = "0.8"
 tokio = { version = "1", features = ["sync"] }
 tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+
+# Desktop only: the tray, start at login, one instance, media keys.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-autostart = "2"
 # The old app's login item is removed after the migration (see migrate.rs).
 auto-launch = "0.6"
 tauri-plugin-single-instance = "2"
 souvlaki = "0.8.3"
-tauri-plugin-opener = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-clipboard-manager = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
@@ -39,7 +47,7 @@ windows-sys = { version = "0.60", features = ["Win32_UI_Input_KeyboardAndMouse"]
 # The microphone consent store (mic.rs).
 winreg = "0.56"
 
-[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 keyring = "3"
 
 [dev-dependencies]

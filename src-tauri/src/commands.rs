@@ -533,25 +533,34 @@ pub async fn test_folder(app: AppHandle, path: String) -> CmdResult<ConnStatus> 
 /// "Choose folder…": the system's folder picker; `None` when cancelled.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn pick_folder(app: AppHandle, start: Option<String>) -> CmdResult<Option<String>> {
-    use tauri_plugin_dialog::DialogExt;
-    run(app, move |app, _| {
-        let mut dialog = app
-            .dialog()
-            .file()
-            .set_title(i18n::t("libraries.choose_folder_title"));
-        if let Some(dir) = start.filter(|d| std::path::Path::new(d).is_dir()) {
-            dialog = dialog.set_directory(dir);
-        }
-        // Blocks this command thread only; the dialog itself runs on the main thread.
-        let Some(chosen) = dialog.blocking_pick_folder() else {
-            return Ok(None);
-        };
-        let path = chosen
-            .into_path()
-            .map_err(|e| i18n::tf("err.folder", &[("error", &e.to_string())]))?;
-        Ok(Some(path.display().to_string()))
-    })
-    .await
+    // Android has no folder picker: the folder is typed in.
+    #[cfg(mobile)]
+    {
+        let _ = (app, start);
+        Ok(None)
+    }
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_dialog::DialogExt;
+        run(app, move |app, _| {
+            let mut dialog = app
+                .dialog()
+                .file()
+                .set_title(i18n::t("libraries.choose_folder_title"));
+            if let Some(dir) = start.filter(|d| std::path::Path::new(d).is_dir()) {
+                dialog = dialog.set_directory(dir);
+            }
+            // Blocks this command thread only; the dialog itself runs on the main thread.
+            let Some(chosen) = dialog.blocking_pick_folder() else {
+                return Ok(None);
+            };
+            let path = chosen
+                .into_path()
+                .map_err(|e| i18n::tf("err.folder", &[("error", &e.to_string())]))?;
+            Ok(Some(path.display().to_string()))
+        })
+        .await
+    }
 }
 
 /// A library for the Libraries list.
