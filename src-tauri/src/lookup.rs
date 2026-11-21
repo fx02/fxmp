@@ -21,6 +21,9 @@ pub enum Service {
     Wikipedia,
     Youtube,
     Genius,
+    /// No default site: a click on the playing track opens nothing. Not a site,
+    /// so not in [`Service::ALL`] (the "Look up on" menus).
+    None,
 }
 
 impl Service {
@@ -43,6 +46,7 @@ impl Service {
             Service::Wikipedia => "Wikipedia",
             Service::Youtube => "YouTube",
             Service::Genius => "Genius",
+            Service::None => "None",
         }
     }
 }
@@ -100,6 +104,7 @@ pub fn track_url(service: Service, artist: &str, title: &str) -> String {
         Service::Wikipedia => format!("https://en.wikipedia.org/w/index.php?search={q}"),
         Service::Youtube => format!("https://www.youtube.com/results?search_query={q}"),
         Service::Genius => format!("https://genius.com/search?q={q}"),
+        Service::None => String::new(),
     }
 }
 
@@ -113,6 +118,7 @@ pub fn artist_url(service: Service, artist: &str) -> String {
         Service::Wikipedia => format!("https://en.wikipedia.org/w/index.php?search={q}"),
         Service::Youtube => format!("https://www.youtube.com/results?search_query={q}"),
         Service::Genius => format!("https://genius.com/search?q={q}"),
+        Service::None => String::new(),
     }
 }
 
@@ -157,6 +163,10 @@ pub fn open(
     title: Option<&str>,
 ) -> Result<(), String> {
     let service = service.unwrap_or(st.settings.get().lookup_service);
+    // "None" as the default: looking up is switched off.
+    if service == Service::None {
+        return Ok(());
+    }
     if artist.trim().is_empty() && title.is_none_or(|t| t.trim().is_empty()) {
         return Err(i18n::t("err.lookup_nothing"));
     }
@@ -195,6 +205,18 @@ mod tests {
     const TRICKY: &str = "AC/DC & Friends #1 + \"Hi\" 'yo' ž?=%";
     const TRICKY_ENC: &str =
         "AC%2FDC%20%26%20Friends%20%231%20%2B%20%22Hi%22%20%27yo%27%20%C5%BE%3F%3D%25";
+
+    #[test]
+    fn none_is_saved_but_is_no_site() {
+        assert_eq!(serde_json::to_string(&Service::None).unwrap(), "\"none\"");
+        assert_eq!(
+            serde_json::from_str::<Service>("\"none\"").unwrap(),
+            Service::None
+        );
+        assert!(!Service::ALL.contains(&Service::None));
+        assert!(!is_allowed(&track_url(Service::None, "A", "B")));
+        assert!(!is_allowed(&artist_url(Service::None, "A")));
+    }
 
     #[test]
     fn queries_are_percent_encoded() {

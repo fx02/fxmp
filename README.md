@@ -325,7 +325,8 @@ server's address), an **On** switch and (except the main one) **Remove**:
   where they apply "Play next", "Add to end", "Remove from playlist", "Never
   play again" and "Copy path". Only the artist and title are sent to the site.
   Clicking the title in the now-playing bar looks it up on the default service
-  (Settings → "Default lookup service", Last.fm unless changed).
+  (Settings → "Default lookup service", Last.fm unless changed); with "None"
+  a click opens nothing (the "Look up on" menus still work).
 - The year is shown with the track wherever it appears: "Artist – Title (1991)"
   in the window, the menu bar menu and its tooltip. A track without a year in
   its tags shows none. The year comes from the date/year tag (the first

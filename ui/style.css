@@ -112,6 +112,7 @@ input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
   border-radius: 0;
 }
 button.np-label:hover:not(:disabled) { background: none; color: var(--accent); }
+button.np-label.no-lookup:hover:not(:disabled) { color: inherit; }
 button.np-label:disabled { opacity: 1; }
 
 .np-progress { display: flex; align-items: center; gap: 8px; }

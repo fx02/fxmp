@@ -267,6 +267,7 @@
   "albums.tracks": "Prikaži pjesme",
   "albums.more": "Dodaj na popis…",
   "settings.lookup_service": "Zadana usluga za traženje",
+  "settings.lookup_none": "Ništa (klik ne otvara ništa)",
   "tray.volume": "Glasnoća",
   "tray.volume_step": "{n} %",
   "tray.output": "Izlaz",

@@ -8,6 +8,17 @@ What the owner asked for that is not done yet. The order is not a priority.
 - **A web version** hosted on Debian.
 - **Android:** local folders on the phone; a release build in CI.
 
+## Idea: visualization (MilkDrop style)
+
+Below the player, where the views are, a visualization; a double click (a
+double tap on Android) takes it to the full screen. Butterchurn (MilkDrop in
+WebGL, MIT licence) with its presets, bundled with the app (the page loads
+nothing from outside). The music plays in Rust, not in the WebView, so the
+player sends the sound it plays (a few thousand samples, about 30 times a
+second, over a Tauri channel) and the page feeds them to Butterchurn; a
+simpler built-in visualization (spectrum bars) could come first. Costs some
+CPU and GPU while shown, nothing when hidden.
+
 ## Planned: Linux (Fedora, Arch, Debian, RHEL)
 
 Tauri builds for Linux as is; the work is packaging and the desktop parts.

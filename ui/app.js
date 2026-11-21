@@ -224,10 +224,10 @@ function renderNowPlaying(np) {
   const label = $("np-label");
   label.textContent = trackLabel(np);
   label.disabled = !np;
-  const service = lookupServiceName(state.settings && state.settings.lookup_service);
-  label.title = np
-    ? [trackLabel(np), np.album, t("player.lookup_hint", { service })].filter(Boolean).join(" · ")
-    : "";
+  const id = state.settings && state.settings.lookup_service;
+  const hint = id === "none" ? "" : t("player.lookup_hint", { service: lookupServiceName(id) });
+  label.title = np ? [trackLabel(np), np.album, hint].filter(Boolean).join(" · ") : "";
+  label.classList.toggle("no-lookup", id === "none");
   label.classList.toggle("paused", Boolean(np && np.paused));
   renderPosition();
   const chip = $("np-genre");
@@ -1623,7 +1623,10 @@ function renderSettings(s) {
 
 function renderLookupServices() {
   const sel = $("lookup-service");
-  sel.replaceChildren(...state.lookupServices.map((s) => el("option", { value: s.id, textContent: s.name })));
+  sel.replaceChildren(
+    ...state.lookupServices.map((s) => el("option", { value: s.id, textContent: s.name })),
+    el("option", { value: "none", textContent: t("settings.lookup_none") }),
+  );
   if (state.settings) sel.value = state.settings.lookup_service || "lastfm";
 }
 
@@ -2139,7 +2142,7 @@ function wire() {
   $("btn-prev").addEventListener("click", () => run("previous"));
   $("btn-pause").addEventListener("click", () => run("toggle_pause"));
   $("np-label").addEventListener("click", () => {
-    if (state.nowPlaying) run("lookup_current");
+    if (state.nowPlaying && !(state.settings && state.settings.lookup_service === "none")) run("lookup_current");
   });
   document.querySelector(".now").addEventListener("contextmenu", (e) => {
     if (e.target.closest("input")) return;
