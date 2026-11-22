@@ -8,6 +8,16 @@ What the owner asked for that is not done yet. The order is not a priority.
 - **A web version** hosted on Debian.
 - **Android:** local folders on the phone; a release build in CI.
 
+## To do: a plain "cannot connect" message with Retry
+
+When a share cannot be reached, the app says "The music share is unreachable.
+Is WireGuard/VPN on?". It should say only that the connection failed and to
+which server and share (e.g. "Cannot connect to \\\\10.0.0.5\\Music"), with no
+guess about a VPN, and offer a **Retry** button next to it that tests the
+connection again (and resumes the library and playback when it answers).
+Applies to the status line, the scan result and the library list, on the
+desktop and Android, in both languages.
+
 ## Idea: visualization (MilkDrop style)
 
 Below the player, where the views are, a visualization; a double click (a
