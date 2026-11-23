@@ -1256,7 +1256,7 @@ mod tests {
         assert_eq!(text(ConnStatus::Auth, "en"), "Wrong username or password");
         assert_eq!(
             text(ConnStatus::Unreachable, "hr"),
-            "Disk nije dostupan. Je li uključen WireGuard/VPN?"
+            "Povezivanje s diskom nije uspjelo"
         );
     }
 

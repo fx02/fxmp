@@ -224,7 +224,9 @@ server's address), an **On** switch and (except the main one) **Remove**:
 - The status dot shows the worst state of the libraries in use; its tooltip
   lists each one ("USB: Music folder not found. Is the disk connected?"). A
   library that is down is checked again every 15 s, so a disk plugged back in
-  (or a VPN coming up) recovers on its own.
+  (or a VPN coming up) recovers on its own. A share that does not answer is
+  named in the status line ("Cannot connect to smb://10.0.0.5/Music"), with a
+  **Retry** button that connects again at once.
 - On start, the saved playlist resumes once the library of its current track
   answers: an SMB server that does not answer yet (a VPN that comes up later
   at login) is waited for, with the saved track and position. It does not wait

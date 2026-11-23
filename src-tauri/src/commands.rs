@@ -694,6 +694,17 @@ pub async fn remove_library(app: AppHandle, id: LibraryId) -> CmdResult<()> {
     .await
 }
 
+/// "Retry" next to a failed connection: fresh connections to every library,
+/// checked again now (the status follows as usual).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn retry_connection(app: AppHandle) -> CmdResult<()> {
+    run(app, |_, st| {
+        st.reconnect(&st.settings.get());
+        Ok(())
+    })
+    .await
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_connection_status(app: AppHandle) -> CmdResult<Option<StatusPayload>> {
     run(app, |_, st| Ok(lock(&st.status).clone())).await

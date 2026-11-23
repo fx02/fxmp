@@ -150,6 +150,7 @@ button.ban.confirm { width: auto; padding: 0 8px; background: var(--danger); bor
 .dot.secondary { background: var(--warn); opacity: 1; }
 .dot.unreachable, .dot.auth, .dot.missing { background: var(--bad); opacity: 1; }
 .conn-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.status-row .retry { flex: none; padding: 0 4px; font-size: 12px; }
 
 /* Tabs */
 .tabs { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid var(--border); }

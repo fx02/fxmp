@@ -134,6 +134,7 @@ pub fn run() {
             commands::pick_folder,
             commands::test_connection,
             commands::get_connection_status,
+            commands::retry_connection,
             commands::start_scan,
             commands::cancel_scan,
             commands::get_scan_status,

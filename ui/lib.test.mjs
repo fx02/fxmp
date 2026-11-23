@@ -18,6 +18,7 @@ import {
   missingUsername,
   passwordRequired,
   mergeChoices,
+  connStatusText,
   genreSections,
   pluralCategory,
   PLURAL_CATEGORIES,
@@ -288,7 +289,7 @@ test("scanDoneText covers success, cancel and error", () => {
 test("connMessage maps statuses to the locale's text", () => {
   assert.equal(connMessage("ok", en), "Connected");
   assert.equal(connMessage("auth", en), "Wrong username or password");
-  assert.equal(connMessage("unreachable", en), "The music share is unreachable. Is WireGuard/VPN on?");
+  assert.equal(connMessage("unreachable", en), "Cannot connect to the music share");
   assert.equal(connMessage("secondary", en), "Connected to the backup server");
   assert.equal(connMessage("auth", hr), "Pogrešno korisničko ime ili lozinka");
   assert.equal(connMessage("nope", en), "");
@@ -567,4 +568,18 @@ test("a tag name is no merge target", () => {
     { key: "_tag:klapa", display: "Klapa", count: 1 },
   ];
   assert.deepEqual(mergeChoices([], genres, "_tag:klapa", ""), ["Rock"]);
+});
+
+test("an unreachable share is named in the status, with no guess why", () => {
+  const payload = {
+    status: "unreachable",
+    libraries: [
+      { id: 1, name: "", status: "unreachable" },
+      { id: 2, name: "USB", status: "ok" },
+    ],
+  };
+  const known = [{ id: 1, name: "", location: "smb://10.0.0.5/Music", source: { type: "smb" } }];
+  assert.equal(connStatusText(payload, en, known), "Cannot connect to smb://10.0.0.5/Music");
+  assert.equal(connStatusText({ status: "unreachable", libraries: [] }, en), "Cannot connect to the music share");
+  assert.equal(connStatusText({ status: "ok", libraries: [] }, en), "Connected");
 });

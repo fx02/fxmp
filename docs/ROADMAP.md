@@ -8,16 +8,6 @@ What the owner asked for that is not done yet. The order is not a priority.
 - **A web version** hosted on Debian.
 - **Android:** local folders on the phone; a release build in CI.
 
-## To do: a plain "cannot connect" message with Retry
-
-When a share cannot be reached, the app says "The music share is unreachable.
-Is WireGuard/VPN on?". It should say only that the connection failed and to
-which server and share (e.g. "Cannot connect to \\\\10.0.0.5\\Music"), with no
-guess about a VPN, and offer a **Retry** button next to it that tests the
-connection again (and resumes the library and playback when it answers).
-Applies to the status line, the scan result and the library list, on the
-desktop and Android, in both languages.
-
 ## Idea: visualization (MilkDrop style)
 
 Below the player, where the views are, a visualization; a double click (a
@@ -60,6 +50,7 @@ Tauri builds for iOS; the Android work (`src/mobile`) is the model.
   way to hear music, e.g. a demo share).
 
 ## Done
+- **"Cannot connect" with Retry** (2026-11-23): the status names the share that did not answer, with no VPN guess, and a Retry button reconnects at once.
 - **Android app** (2026-11-21): test APK for Android 8+ (arm64, armv7), playback with the screen off, passwords in the Android Keystore.
 - **Unsupported genres** (2026-11-21): tag names that are no known genre get their own section instead of Unknown.
 - **App icon** (2026-11-17): smaller, regular-weight "fxmp" text and a larger, centred play triangle (`src-tauri/icons/gen_app_icon.py`).

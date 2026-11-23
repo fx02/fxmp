@@ -1,6 +1,7 @@
 // UI wiring: Tauri commands/events <-> DOM. Pure helpers live in lib.mjs.
 import {
   formatCount,
+  connStatusText,
   genreSections,
   trackLabel,
   filterGenres,
@@ -935,7 +936,7 @@ function renderStatus(payload, checking = false) {
   const dot = $("conn-dot");
   dot.className = "dot" + (payload ? ` ${payload.status}` : "");
   $("conn-text").textContent = payload
-    ? connMessage(payload.status, t)
+    ? connStatusText(payload, t, state.libraries)
     : state.configured || checking
       ? t("conn.checking")
       : t("conn.not_set_up");
@@ -943,7 +944,17 @@ function renderStatus(payload, checking = false) {
   const tip = statusTooltip(payload, t, state.libraries);
   dot.title = tip;
   $("conn-text").title = tip;
+  // A share that did not answer (or a disk that is not there) can be tried again.
+  $("btn-retry").hidden = !payload || !["unreachable", "missing"].includes(payload.status);
   if (state.libraries.length) renderLibraries();
+}
+
+/** "Retry": fresh connections to every library, checked again now. */
+async function retryConnection() {
+  $("btn-retry").hidden = true;
+  $("conn-text").textContent = t("conn.checking");
+  $("conn-dot").className = "dot";
+  await run("retry_connection");
 }
 
 // ---------- scan ----------
@@ -1784,10 +1795,8 @@ async function loadLibraries() {
   if (!libs) return;
   state.libraries = libs;
   renderLibraries();
-  // Unnamed libraries in the status tooltip are named from the list.
-  const tip = statusTooltip(state.status, t, state.libraries);
-  $("conn-dot").title = tip;
-  $("conn-text").title = tip;
+  // The status names unnamed libraries (and unreachable shares) from the list.
+  renderStatus(state.status, state.statusChecking);
 }
 
 function libraryStatus(id) {
@@ -2180,6 +2189,7 @@ async function onLanguage(e) {
 function wire() {
   for (const b of document.querySelectorAll(".tab")) b.addEventListener("click", () => showTab(b.dataset.tab));
   $("btn-more").addEventListener("click", () => setTabMenu(!document.body.classList.contains("tab-menu")));
+  $("btn-retry").addEventListener("click", retryConnection);
   $("slider-style").addEventListener("change", (e) => setLook({ sliders: e.target.value }));
   $("player-skin").addEventListener("change", (e) => setLook({ skin: e.target.value }));
   for (const id of ["np-seek", "volume"]) $(id).addEventListener("input", (e) => fill(e.target));

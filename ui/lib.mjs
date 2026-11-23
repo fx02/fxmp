@@ -217,6 +217,24 @@ export function statusTooltip(payload, t, known = []) {
     .join("\n");
 }
 
+/**
+ * The status line: for an unreachable share it names where it could not connect
+ * (each such library's location, e.g. "smb://10.0.0.5/Music"); otherwise the
+ * status's own text.
+ */
+export function connStatusText(payload, t, known = []) {
+  if (!payload) return "";
+  if (payload.status !== "unreachable") return connMessage(payload.status, t);
+  const where = (payload.libraries || [])
+    .filter((l) => l.status === "unreachable")
+    .map((l) => {
+      const full = known.find((k) => k.id === l.id);
+      return (full && full.location) || libraryName(l.name || !full ? l : full, t);
+    })
+    .filter(Boolean);
+  return where.length ? t("conn.unreachable_to", { where: where.join(", ") }) : connMessage("unreachable", t);
+}
+
 const UNKNOWN_KEY = "_none";
 /** Key prefix of a genre that tags name but that is not a known genre. */
 export const TAG_PREFIX = "_tag:";
