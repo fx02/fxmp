@@ -2,6 +2,8 @@
 
 How to install and use fxmp. What it does in short: [README](../README.md).
 
+fxmp plays MP3, FLAC and OGG Vorbis files.
+
 ## Installation
 
 ### macOS 12+ (Apple Silicon and Intel)

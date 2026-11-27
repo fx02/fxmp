@@ -85,8 +85,8 @@ job may fail without failing the run until its first green build.
 `=0.12.1`, in **async** mode, driven from a private tokio runtime
 (`crates/core/src/source/smb.rs`). `libsmb2` over FFI was not needed.
 
-**Spike (24 Oct 2026)** against both real servers (Windows 10 `10.111.100.2`
-and Unraid/Samba `10.111.0.2`, share `F`, path `MP3`):
+**Spike (24 Oct 2026)** against both real servers (a Windows 10 PC
+and an Unraid (Samba) NAS, one share with the music folder):
 
 | Criterion | Windows 10 | Samba |
 |---|---|---|
@@ -112,7 +112,7 @@ Three problems found in the crate along the way, and how they were solved:
    stream in `smb` 0.12.1 loses a wake-up (`notify_waiters` instead of
    `notify_one` in `poll_next`), so it does not send the final query and waits
    until the timeout, followed by a reconnect and a retry. On Samba
-   (`10.111.0.2`) a full walk (~59,400 files) ended with a `Timeout` error
+   a full walk (~59,400 files) ended with a `Timeout` error
    because of this. `smb` 0.12.1 is therefore vendored in `vendor/smb` with that
    one change, see `vendor/smb/SMP-PATCH.md`. Full Samba walk: `Timeout` after
    130 s without the patch, ~38 s without errors with it.
@@ -134,7 +134,7 @@ Other notes:
   apply the same way.
 - The scanner (`scan`) opens new/changed files and reads their tags on 8
   parallel threads (`ScanOptions { workers }`); only the calling thread writes
-  to the library, in transactions of 500. Measured on `10.111.100.2`, a first
+  to the library, in transactions of 500. Measured on the Windows server, a first
   scan of 500 files: 28.0 s with one thread, 9.8 s with eight (2.8×).
   During a scan the genres are rebuilt after every 5000 new files or every
   30 s, whichever comes first, so the library is usable before the first scan

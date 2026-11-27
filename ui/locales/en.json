@@ -283,7 +283,6 @@
   "migrate.failed": "Couldn't copy your library and settings from SMB Music Player. Quit SMB Music Player, then quit fxmp and start it again: it tries again on every start until the copy works. Until then fxmp starts empty, and what you set up now is not kept.",
   "about.version": "Version {version}",
   "about.build": "Build {commit}, {date}",
-  "about.vibe": "Vibe coded with Claude",
   "about.github": "Source code on GitHub",
   "conn.missing": "Music folder not found. Is the disk connected?",
   "scan.library_progress": "{library} ({index}/{count}): {text}",
